@@ -108,7 +108,7 @@ class ResponseFunction(object):
             egrid, cross_section = cs_model.nonel(mother)
 
         # note that cumtrapz works also for 2d-arrays and will integrate along axis = 1
-        integral = integrate.cumtrapz(egrid * cross_section, x=egrid)
+        integral = integrate.cumulative_trapezoid(egrid * cross_section, x=egrid)
         ygrid = egrid[1:] / 2.0
 
         return ygrid, integral / (2 * ygrid**2)
@@ -167,7 +167,7 @@ class ResponseFunction(object):
                 self.xcenters, ygr, rfunc, self.cross_section.xbins
             )
 
-            from scipy.integrate import cumtrapz
+            from scipy.integrate import cumulative_trapezoid as cumtrapz
 
             integral = cumtrapz(rfunc, ygr, axis=1, initial=0)
             integral = cumtrapz(integral, self.xcenters, axis=0, initial=0)

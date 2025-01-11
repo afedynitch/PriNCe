@@ -116,16 +116,21 @@ class PrinceDB(object):
         return db_entry
 
     def ebl_spline(self, model_tag, subset="base"):
-        from scipy.interpolate import interp2d
+        from scipy.interpolate import RegularGridInterpolator
 
         info(10, "Reading EBL field splines. tag={0}".format(model_tag))
         with h5py.File(self.prince_db_fname, "r") as prince_db:
             self._check_subgroup_exists(prince_db["EBL_models"], model_tag)
             self._check_subgroup_exists(prince_db["EBL_models"][model_tag], subset)
             spl_gr = prince_db["EBL_models"][model_tag][subset]
+            print(len(spl_gr["x"]), len(spl_gr["y"]), len(spl_gr["z"]))
 
-            return interp2d(
-                spl_gr["x"], spl_gr["y"], spl_gr["z"], fill_value=0.0, kind="linear"
+            return RegularGridInterpolator(
+                (spl_gr["x"], spl_gr["y"]),
+                spl_gr["z"][:].T,
+                fill_value=0.0,
+                method="linear",
+                bounds_error=False,
             )
 
 

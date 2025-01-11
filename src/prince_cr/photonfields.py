@@ -148,13 +148,13 @@ class EBLSplined2D(PhotonField):
         # pylint:disable=not-callable
         if self.simple_scaling:
             Ered = E / (1.0 + z)
-            nlocal = self.int2d(Ered, 0.0, assume_sorted=True)
-            nz = self.int2d(Ered, z, assume_sorted=True)
+            nlocal = self.int2d((Ered, 0.0))
+            nz = self.int2d((Ered, z))
             scale = trapz(nz, Ered) / trapz(nlocal, Ered) / (1 + z) ** 3
             # print(scale)
             return (1.0 + z) ** 2 * nlocal * scale
         else:
-            return self.int2d(E, z, assume_sorted=True)
+            return self.int2d((E, z))
 
 
 class CIBFranceschini2D(EBLSplined2D):
@@ -344,7 +344,7 @@ class CIBFranceschiniZ0(PhotonField):
                 + "Redshift z > 0 not supported by this class"
             )
 
-        return self.spl_ngamma(E, assume_sorted=True)
+        return self.spl_ngamma(E)
 
 
 class CIBSteckerZ0(PhotonField):
@@ -558,7 +558,7 @@ class CIBSteckerZ0(PhotonField):
                 + "Redshift z > 0 not supported by this class"
             )
 
-        return self.spl_ngamma(E, assume_sorted=True)
+        return self.spl_ngamma(E)
 
 
 if __name__ == "__main__":
