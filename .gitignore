@@ -1,10 +1,11 @@
 #ignore large datafiles
-prince_cr/data/*.h5
+**/*.h5
 
 # ignore subfolders used for programm settings and caches
 .vscode
 .ipynb_checkpoints
 __pycache__
 /docs/_build
-prince_cr.egg-info
+*.egg-info
 sandbox_*
+build
