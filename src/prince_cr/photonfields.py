@@ -151,7 +151,6 @@ class EBLSplined2D(PhotonField):
             nlocal = self.int2d((Ered, 0.0))
             nz = self.int2d((Ered, z))
             scale = trapz(nz, Ered) / trapz(nlocal, Ered) / (1 + z) ** 3
-            # print(scale)
             return (1.0 + z) ** 2 * nlocal * scale
         else:
             return self.int2d((E, z))

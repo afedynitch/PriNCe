@@ -123,7 +123,6 @@ class PrinceDB(object):
             self._check_subgroup_exists(prince_db["EBL_models"], model_tag)
             self._check_subgroup_exists(prince_db["EBL_models"][model_tag], subset)
             spl_gr = prince_db["EBL_models"][model_tag][subset]
-            print(len(spl_gr["x"]), len(spl_gr["y"]), len(spl_gr["z"]))
 
             return RegularGridInterpolator(
                 (spl_gr["x"], spl_gr["y"]),
