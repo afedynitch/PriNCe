@@ -68,7 +68,7 @@ def bin_edges2D(bin_centers):
     # print bins_log.shape
     bins_log[: lcen.shape[0], ...] = lcen - 0.5 * steps
     bins_log[-1, ...] = lcen[-1, ...] + 0.5 * steps
-    return 10**bins_log
+    return 10 ** bins_log
 
 
 def bin_edges1D(bin_centers):
@@ -77,4 +77,4 @@ def bin_edges1D(bin_centers):
     bins_log = np.zeros(len(lcen) + 1)
     bins_log[: lcen.shape[0]] = lcen - 0.5 * steps
     bins_log[-1] = lcen[-1] + 0.5 * steps
-    return 10**bins_log
+    return 10 ** bins_log

@@ -63,7 +63,7 @@ class SophiaSuperposition(CrossSectionBase):
                 self.redist_neutron[da] = csgrid
             else:
                 raise Exception(
-                    f"Sophia model should only contain protons and neutrons, but has mother id {mo}"
+                    f"Sophia model only knows nucleons, but has mother id is {mo}"
                 )
 
         # set up inclusive differential channels for protons and neutron
@@ -92,7 +92,8 @@ class SophiaSuperposition(CrossSectionBase):
         incl_channels = []
         # return incl_channels
 
-        # This model is a Superposition of protons and neutrons, so we need all respective daughters
+        # This model is a Superposition of protons and neutrons.
+        # Collect all possible daughters:
         for idx in mo_indices:
             # if idx > 200:
             #     continue
@@ -205,20 +206,18 @@ class SophiaSuperposition(CrossSectionBase):
 
         _, Z, N = get_AZN(mother)
 
-        if daughter > 101:
-            raise Exception(
-                "Redistribution function requested for boost conserving particle"
-            )
+        assert daughter <= 101, "Redistribution functions not supported for nuclei."
+
         csec_diff = None
         # TODO: File shall contain the functions in .T directly
-        #   JH: I left it like this on purpose, since the raw data is ordered more consistently
-        #       i.e. redist.shape = cs_nonel.shape + xbins.shape
+        #   JH: I left it like this on purpose, since the raw data is ordered more
+        #       consistently i.e. redist.shape = cs_nonel.shape + xbins.shape
         #       The ordering should rather be changed in the rest of the code
         if daughter in self.redist_proton:
             csec_diff = self.redist_proton[daughter].T * Z
 
         if daughter in self.redist_neutron:
-            # cgrid = N * self.cs_neutron_grid ## AF: this is not used
+            # cgrid = N * self.cs_neutron_grid
             if np.any(csec_diff):
                 csec_diff += self.redist_neutron[daughter].T * N
             else:
@@ -449,7 +448,8 @@ class EmpiricalModel(SophiaSuperposition):
                 cs_diff_renormed, cs_diff, range(55, 95)
             )  # hardcoded index, found manually
 
-            # # additional correction to pion scaling high energies, after paper was corrected
+            # additional correction to pion scaling at high energies,
+            # after paper was corrected
             # def sigm(x, shift=0., gap=1, speed=1, base=0., rising=False):
             #     """Models a general sigmoid with multiple parameters.
 

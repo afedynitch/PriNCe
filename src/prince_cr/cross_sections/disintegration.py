@@ -1,3 +1,5 @@
+from os.path import join
+
 import numpy as np
 
 from prince_cr.util import info, get_AZN

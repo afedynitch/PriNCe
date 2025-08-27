@@ -1,5 +1,4 @@
 """Module inteded to contain some prince-specific data structures."""
-
 import pickle as pickle
 import os.path as path
 import numpy as np
@@ -49,6 +48,20 @@ UNITS_AND_CONVERSIONS_DEF = dict(
 
 # This is the immutable unit object to be imported throughout the code
 PRINCE_UNITS = convert_to_namedtuple(UNITS_AND_CONVERSIONS_DEF, "PriNCeUnits")
+
+
+class InterpolatorWrapper:
+    """Wrapper class to make RegularGridInterpolator behave like interp2d."""
+    
+    def __init__(self, rgi):
+        self.rgi = rgi
+    
+    def __call__(self, x, y):
+        import numpy as np
+        x, y = np.broadcast_arrays(x, y)
+        points = np.column_stack([x.ravel(), y.ravel()])
+        result = self.rgi(points)
+        return result.reshape(x.shape) if x.shape else result.item()
 
 
 class PrinceDB(object):
@@ -124,13 +137,24 @@ class PrinceDB(object):
             self._check_subgroup_exists(prince_db["EBL_models"][model_tag], subset)
             spl_gr = prince_db["EBL_models"][model_tag][subset]
 
-            return RegularGridInterpolator(
-                (spl_gr["x"], spl_gr["y"]),
-                spl_gr["z"][:].T,
-                fill_value=0.0,
-                method="linear",
-                bounds_error=False,
+            # Create RegularGridInterpolator which is the modern replacement for interp2d
+            x_coords = spl_gr["x"][:]
+            y_coords = spl_gr["y"][:]
+            z_values = spl_gr["z"][:]
+            
+            # RegularGridInterpolator expects z_values to have shape (len(x_coords), len(y_coords))
+            # If z_values needs transposing to match this requirement, do it
+            if z_values.shape != (len(x_coords), len(y_coords)):
+                z_values = z_values.T
+            
+            # Create the interpolator
+            rgi = RegularGridInterpolator(
+                (x_coords, y_coords), z_values, 
+                method="linear", bounds_error=False, fill_value=0.0
             )
+            
+            # Return wrapper that maintains interp2d interface and is picklable
+            return InterpolatorWrapper(rgi)
 
 
 #: db_handler is the HDF file interface

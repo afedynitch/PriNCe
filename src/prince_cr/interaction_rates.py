@@ -124,7 +124,7 @@ class PhotoNuclearInteractionRate(object):
 
         # values for x and y to cut on:
         x_cut = config.x_cut
-        # y_cut = config.y_cut ## AF: not used
+        y_cut = config.y_cut
         x_cut_proton = config.x_cut_proton
 
         ibatch = 0
@@ -132,7 +132,6 @@ class PhotoNuclearInteractionRate(object):
 
         spec_iter = itertools.product(known_species, known_species)
         for moid, daid in spec_iter:
-
             if moid < 100:
                 continue
             else:
@@ -146,7 +145,6 @@ class PhotoNuclearInteractionRate(object):
                 has_nonel
                 and (moid, daid) not in self.cross_sections.known_diff_channels
             ):
-
                 has_incl = (moid, daid) in resp.incl_intp
                 if has_incl:
                     intp_bc = resp.incl_intp[(moid, daid)].antiderivative()
@@ -190,18 +188,18 @@ class PhotoNuclearInteractionRate(object):
                 self._batch_cols.append(sp_id_ref[moid].lidx() + emo_idcs)
 
             elif (moid, daid) in self.cross_sections.known_diff_channels:
-
                 has_redist = (moid, daid) in resp.incl_diff_intp
                 if has_redist:
-                    # intp_diff = resp.incl_diff_intp[(moid, daid)] ## AF: not used
+                    intp_diff = resp.incl_diff_intp[(moid, daid)]
                     intp_diff_integral = resp.incl_diff_intp_integral[(moid, daid)]
                     intp_nonel = resp.nonel_intp[moid]
                     intp_nonel_antid = resp.nonel_intp[moid].antiderivative()
 
-                    # ymin = np.min(intp_diff.get_knots()[1]) ## AF: not used
+                    ymin = np.min(intp_diff.get_knots()[1])
                 else:
                     raise Exception("This should not occur.")
 
+                ibatch_bf = ibatch
                 # generate outer products using broadcasting
                 emo = ecr[:, None, None]
                 eda = ecr[None, :, None]
@@ -350,7 +348,7 @@ class PhotoNuclearInteractionRate(object):
 
             if using_cupy:
                 if isinstance(self._batch_matrix, np.ndarray):
-                    self._init_coupling_mat()
+                    self._init_coupling_mat(p)
                 cupy.dot(
                     self._batch_matrix,
                     cupy.array(self.photon_vector(z), dtype=np.float32),

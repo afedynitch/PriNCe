@@ -14,13 +14,9 @@ from prince_cr.config import mkl
 
 def mkl_matdescr():
     """Generate matdescr (matrix description) array required by BLAS calls."""
-    from ctypes import POINTER, byref
-
     ntrans = byref(c_char(b"n"))  # Non-trans
     trans = byref(c_char(b"t"))  # trans
-    npmatd = np.chararray(6)
-    npmatd[0] = b"G"  # General
-    npmatd[3] = b"C"  # C-ordering
+    npmatd = np.array([b"G", b"", b"", b"C", b"", b""], dtype="S1")
     return trans, ntrans, npmatd.ctypes.data_as(POINTER(c_char))
 
 

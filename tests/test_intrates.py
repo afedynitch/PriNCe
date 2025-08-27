@@ -1,9 +1,10 @@
 # Test whether cross section are correctly created.
-import unittest
-import numpy as np
 
+import unittest
+
+import numpy as np
 import prince_cr.config as config
-from prince_cr import cross_sections, photonfields, core
+from prince_cr import core, cross_sections, photonfields
 
 config.x_cut = 1e-4
 config.x_cut_proton = 1e-2
@@ -23,7 +24,6 @@ cs = cross_sections.CompositeCrossSection(
 
 
 class TestCsec(unittest.TestCase):
-
     def test_kernel_1(self):
         prince_run_talys = core.PriNCeRun(
             max_mass=4, photon_field=pf, cross_sections=cs

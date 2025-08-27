@@ -77,7 +77,7 @@ class UHECRPropagationResult(object):
         """Returns the spectrum scaled back to total energy"""
         spec = self.spec_man.ncoid2sref[nco_id]
         egrid = spec.A * self.egrid
-        return egrid, egrid**epow * self.state[spec.lidx() : spec.uidx()] / spec.A
+        return egrid, egrid ** epow * self.state[spec.lidx() : spec.uidx()] / spec.A
 
     def _check_id_grid(self, nco_ids, egrid):
         # Take egrid from first id ( doesn't cover the range for iron for example)
@@ -85,7 +85,7 @@ class UHECRPropagationResult(object):
         if egrid is None:
             max_mass = max([s.A for s in self.spec_man.species_refs])
             emin_log, emax_log, nbins = list(config.cosmic_ray_grid)
-            emax_log = np.log10(float(max_mass) * 10**emax_log)
+            emax_log = np.log10(max_mass * 10 ** emax_log)
             nbins *= 4
             com_egrid = EnergyGrid(emin_log, emax_log, nbins).grid
         else:
@@ -140,7 +140,8 @@ class UHECRPropagationResult(object):
         return com_egrid, spectrum
 
     def get_lnA(self, nco_ids, egrid=None):
-        """Return the average ln(A) as a function of total energy for all elements in the range"""
+        """Return the average ln(A) as a function of total energy for all
+        elements in the range"""
 
         nco_ids, com_egrid, spectra = self._collect_interpolated_spectra(
             nco_ids, 0, egrid
@@ -151,7 +152,7 @@ class UHECRPropagationResult(object):
         average = (lnA[:, np.newaxis] * spectra).sum(axis=0) / spectra.sum(axis=0)
         variance = (lnA[:, np.newaxis] ** 2 * spectra).sum(axis=0) / spectra.sum(
             axis=0
-        ) - average**2
+        ) - average ** 2
 
         return com_egrid, average, variance
 
@@ -185,6 +186,7 @@ class UHECRPropagationSolver(object):
         self.spec_man = prince_run.spec_man
         self.egrid = prince_run.cr_grid.grid
         self.ebins = prince_run.cr_grid.bins
+        self.widths = prince_run.cr_grid.widths
         # Flags to enable/disable different loss types
         self.enable_adiabatic_losses = enable_adiabatic_losses
         self.enable_pairprod_losses = enable_pairprod_losses
@@ -236,6 +238,15 @@ class UHECRPropagationSolver(object):
         if self.result is None:
             self.result = UHECRPropagationResult(self.state, self.egrid, self.spec_man)
         return self.result
+
+    def pre_step_hook(self, t):
+        """This function is called after initializing the solver
+        but before the first step."""
+        pass
+
+    def post_step_hook(self, t):
+        """This call-back like function is called after each successful step"""
+        pass
 
     def add_source_class(self, source_instance):
         self.list_of_sources.append(source_instance)
@@ -492,7 +503,6 @@ class UHECRPropagationSolver(object):
 
 
 class UHECRPropagationSolverBDF(UHECRPropagationSolver):
-
     def __init__(self, *args, **kwargs):
         self.atol = kwargs.pop("atol", 1e40)
         self.rtol = kwargs.pop("rtol", 1e-10)
@@ -549,6 +559,8 @@ class UHECRPropagationSolverBDF(UHECRPropagationSolver):
         self._init_solver(dz)
         info(2, "Solver initialized in {0} s".format(time() - start_time))
 
+        self.pre_step_hook(self.initial_z)
+
         info(2, "Starting integration.")
         with PrinceProgressBar(
             bar_type=progressbar, nsteps=-(self.initial_z - self.final_z) / dz
@@ -570,6 +582,8 @@ class UHECRPropagationSolverBDF(UHECRPropagationSolver):
                     print("LU decomp:", self.r.nlu)
                     print("current order:", self.r.dense_output().order)
                     print("---" * 20)
+
+                self.post_step_hook(self.r.t)
 
                 stepcount += 1
                 reset_counter += 1
@@ -616,6 +630,7 @@ class UHECRPropagationSolverEULER(UHECRPropagationSolver):
         self,
         dz=1e-3,
         verbose=True,
+        override_initial_state=None,
         extended_output=False,
         initial_inj=False,
         disable_inj=False,
@@ -636,6 +651,9 @@ class UHECRPropagationSolverEULER(UHECRPropagationSolver):
         else:
             initial_state = np.zeros((self.dim_states, 1))
         state = initial_state
+
+        self.pre_step_hook(self.initial_z)
+
         info(2, "Starting integration.")
         with PrinceProgressBar(
             bar_type=progressbar, nsteps=-(self.initial_z - self.final_z) / dz
@@ -681,6 +699,7 @@ class UHECRPropagationSolverEULER(UHECRPropagationSolver):
                     print("break at z =", curr_z)
                     break
                 curr_z += dz
+                self.post_step_hook(curr_z)
                 pbar.update()
 
         end_time = time()

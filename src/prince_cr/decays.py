@@ -155,6 +155,7 @@ def get_decay_matrix_bin_average(mo, da, x_lower, x_upper):
     x_grid = (x_upper + x_lower) / 2
 
     # remember shape, but only calculate for last column, as x repeats in each column
+    from scipy.integrate import trapezoid as trapz
 
     shape = x_grid.shape
 
@@ -267,7 +268,7 @@ def pion_to_numu(x):
 
     m_muon = spec_data[7]["mass"]
     m_pion = spec_data[2]["mass"]
-    r = m_muon**2 / m_pion**2
+    r = m_muon ** 2 / m_pion ** 2
     xmin = 0.0
     xmax = 1 - r
 
@@ -293,7 +294,7 @@ def pion_to_numu_avg(x_lower, x_upper):
 
     m_muon = spec_data[7]["mass"]
     m_pion = spec_data[2]["mass"]
-    r = m_muon**2 / m_pion**2
+    r = m_muon ** 2 / m_pion ** 2
     xmin = 0.0
     xmax = 1 - r
 
@@ -325,7 +326,7 @@ def pion_to_muon(x):
 
     m_muon = spec_data[7]["mass"]
     m_pion = spec_data[2]["mass"]
-    r = m_muon**2 / m_pion**2
+    r = m_muon ** 2 / m_pion ** 2
     xmin = r
     xmax = 1.0
 
@@ -351,7 +352,7 @@ def pion_to_muon_avg(x_lower, x_upper):
 
     m_muon = spec_data[7]["mass"]
     m_pion = spec_data[2]["mass"]
-    r = m_muon**2 / m_pion**2
+    r = m_muon ** 2 / m_pion ** 2
     xmin = r
     xmax = 1.0
 
@@ -384,7 +385,7 @@ def prob_muon_hel(x, h):
     m_muon = spec_data[7]["mass"]
     m_pion = spec_data[2]["mass"]
 
-    r = m_muon**2 / m_pion**2
+    r = m_muon ** 2 / m_pion ** 2
 
     # helicity expectation value
     hel = 2 * r / (1 - r) / x - (1 + r) / (1 - r)
@@ -532,10 +533,10 @@ def nu_from_beta_decay(x_grid, mother, daughter, Gamma=200, angle=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         res = (
-            E_mesh**2
-            / boost_mesh**5
+            E_mesh ** 2
+            / boost_mesh ** 5
             * (Emax - E_mesh)
-            * np.sqrt((E_mesh - Emax) ** 2 - boost_mesh**2 * mass_el**2)
+            * np.sqrt((E_mesh - Emax) ** 2 - boost_mesh ** 2 * mass_el ** 2)
         )
     res[E_mesh > Emax] = 0.0
     res = np.nan_to_num(res)
@@ -603,8 +604,8 @@ def nu_from_beta_decay_old(x_grid, mother, daughter):
         1.0
         / 60.0
         * (
-            np.sqrt(1.0 - ye**2) * (2 - 9 * ye**2 - 8 * ye**4)
-            + 15 * ye**4 * np.log(ye / (1 - np.sqrt(1 - ye**2)))
+            np.sqrt(1.0 - ye ** 2) * (2 - 9 * ye ** 2 - 8 * ye ** 4)
+            + 15 * ye ** 4 * np.log(ye / (1 - np.sqrt(1 - ye ** 2)))
         )
     )
 
@@ -618,7 +619,7 @@ def nu_from_beta_decay_old(x_grid, mother, daughter):
 
     # total formula
     result[cond] = (
-        subst / norm * yshort**2 * (1 - yshort) * np.sqrt((1 - yshort) ** 2 - ye**2)
+        subst / norm * yshort ** 2 * (1 - yshort) * np.sqrt((1 - yshort) ** 2 - ye ** 2)
     )
 
     result[x_grid > 1] *= 0.0

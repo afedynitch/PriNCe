@@ -41,9 +41,9 @@ def star_formation_rate(z, z_inhom=0.0):
     elif z <= 0.97:
         return (1.0 + z) ** 3.44
     elif 0.97 < z <= 4.48:
-        return 10.0**1.09 * (1.0 + z) ** -0.26
+        return 10.0 ** 1.09 * (1.0 + z) ** -0.26
     else:
-        return 10.0**6.66 * (1.0 + z) ** -7.8
+        return 10.0 ** 6.66 * (1.0 + z) ** -7.8
 
 
 def grb_rate(z, z_inhom=0.0):

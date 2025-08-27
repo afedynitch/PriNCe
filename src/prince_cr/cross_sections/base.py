@@ -1,6 +1,7 @@
 """The module contains everything to handle cross section interfaces."""
 
-from abc import ABCMeta
+from abc import ABCMeta, abstractmethod
+from os.path import isfile, join
 
 import numpy as np
 
@@ -373,7 +374,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                 info(
                     3,
                     dbg_indent(reclev),
-                    "daughter {0} unknown, forcing beta decay. Not Implemented yet!!".format(
+                    "daughter {0} unknown. Force beta decay not implemented!!".format(
                         da
                     ),
                 )
@@ -456,7 +457,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         # Only stable (interacting) mother particles are left
         self._update_indices()
 
-        for mother, daughter in self.incl_idcs:
+        for (mother, daughter) in self.incl_idcs:
 
             if mother not in self.nonel_idcs:
                 info(
@@ -476,7 +477,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
 
         self._update_indices()
 
-        for mother, daughter in self.incl_diff_idcs:
+        for (mother, daughter) in self.incl_diff_idcs:
 
             if mother not in self.nonel_idcs:
                 info(

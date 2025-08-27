@@ -241,7 +241,7 @@ class RigidityFlexSource(CosmicRaySource):
         spectral_index, rcut, alpha, relnorm = params
         inj_spec = self.spec_man.ncoid2sref[pid]
         A = float(inj_spec.A)
-        emax = rcut * inj_spec.Z**alpha
+        emax = rcut * inj_spec.Z ** alpha
         e_k = A * energy
         result = (
             relnorm

@@ -82,7 +82,7 @@ class TheInterpolator(object):
         #       print energy, cenbin, self.bins_ext[cenbin:cenbin+2]
         norm *= self.widths_ext[cenbin]
         for m in range(self.n_window):
-            self.b[self.n_window * cenbin + m] = norm * energy**m
+            self.b[self.n_window * cenbin + m] = norm * energy ** m
 
     def set_initial_spectrum(self, fx, fy):
         self.b *= 0.0
@@ -92,7 +92,7 @@ class TheInterpolator(object):
             if cenbin < 0:
                 continue
             for m in range(0, self.n_window):
-                self.b[self.n_window * cenbin + m] += fy[i] * x**m
+                self.b[self.n_window * cenbin + m] += fy[i] * x ** m
 
     def set_initial_spectrum2(self, fx, fy):
         self.b *= 0.0
@@ -101,7 +101,7 @@ class TheInterpolator(object):
                 self.n_ext * self.n_window
                 + m : -self.n_ext * self.n_window
                 + m : self.n_window
-            ] += (fy * fx**m)
+            ] += (fy * fx ** m)
 
     def get_solution(self):
         return self.sum_mat.dot(self.solver(self.b))[self.n_ext : -self.n_ext]
