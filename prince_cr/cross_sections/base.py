@@ -594,7 +594,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                            on self._egrid_tab
         """
 
-        from scipy.integrate import trapz
+        from scipy.integrate import trapezoid as trapz
 
         if (mother, daughter) in self._incl_diff_tab:
             # Return the integral of the differential for the inclusive

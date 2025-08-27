@@ -1,7 +1,7 @@
 """The module contains classes for computations of interaction rates"""
 
 import numpy as np
-from scipy.integrate import trapz
+from scipy.integrate import trapezoid as trapz
 
 from prince_cr.data import PRINCE_UNITS
 from prince_cr.util import info
@@ -11,6 +11,7 @@ using_cupy = False
 # Use GPU support
 if config.has_cupy and config.linear_algebra_backend.lower() == "cupy":
     import cupy
+
     using_cupy = True
 
 
@@ -85,13 +86,13 @@ class PhotoNuclearInteractionRate(object):
                     batch_dim += dcr
                 elif rtup in self.cross_sections.known_diff_channels:
                     # Only half of the elements can be non-zero (energy conservation)
-                    batch_dim += int(dcr ** 2 / 2) + 1
+                    batch_dim += int(dcr**2 / 2) + 1
 
         info(2, "Batch matrix dimensions are {0}x{1}".format(batch_dim, dph))
         self._batch_matrix = np.zeros((batch_dim, dph))
         self._batch_rows = []
         self._batch_cols = []
-        info(3, "Memory usage: {0} MB".format(self._batch_matrix.nbytes / 1024 ** 2))
+        info(3, "Memory usage: {0} MB".format(self._batch_matrix.nbytes / 1024**2))
 
     def _init_matrices(self):
         """A new take on filling the matrices"""
@@ -131,7 +132,6 @@ class PhotoNuclearInteractionRate(object):
 
         spec_iter = itertools.product(known_species, known_species)
         for moid, daid in spec_iter:
-
             if moid < 100:
                 continue
             else:
@@ -145,7 +145,6 @@ class PhotoNuclearInteractionRate(object):
                 has_nonel
                 and (moid, daid) not in self.cross_sections.known_diff_channels
             ):
-
                 has_incl = (moid, daid) in resp.incl_intp
                 if has_incl:
                     intp_bc = resp.incl_intp[(moid, daid)].antiderivative()
@@ -189,7 +188,6 @@ class PhotoNuclearInteractionRate(object):
                 self._batch_cols.append(sp_id_ref[moid].lidx() + emo_idcs)
 
             elif (moid, daid) in self.cross_sections.known_diff_channels:
-
                 has_redist = (moid, daid) in resp.incl_diff_intp
                 if has_redist:
                     intp_diff = resp.incl_diff_intp[(moid, daid)]
@@ -289,7 +287,7 @@ class PhotoNuclearInteractionRate(object):
             + self._batch_rows.nbytes
             + self._batch_cols.nbytes
             + self._batch_vec.nbytes
-        ) / 1024 ** 2
+        ) / 1024**2
         info(3, "Memory usage after initialization: {:} MB".format(memory))
 
     def _init_coupling_mat(self):
@@ -350,7 +348,7 @@ class PhotoNuclearInteractionRate(object):
 
             if using_cupy:
                 if isinstance(self._batch_matrix, np.ndarray):
-                    self._init_coupling_mat()
+                    self._init_coupling_mat(p)
                 cupy.dot(
                     self._batch_matrix,
                     cupy.array(self.photon_vector(z), dtype=np.float32),
@@ -477,7 +475,7 @@ class ContinuousPairProductionLossRate(object):
         self.xi = np.logspace(np.log10(2 + 1e-8), 16.0, xi_steps)
 
         # weights for integration
-        self.phi_xi2 = self._phi(self.xi) / (self.xi ** 2)
+        self.phi_xi2 = self._phi(self.xi) / (self.xi**2)
 
         # Scale vector containing the units and factors of Z**2 for nuclei
         self.scale_vec = self._init_scale_vec(energy)
@@ -517,9 +515,9 @@ class ContinuousPairProductionLossRate(object):
         Return value from cache if redshift value didn't change since last call.
         """
         photon_vector = np.zeros_like(self.photon_grid)
-        photon_vector.reshape(-1)[
-            self.pg_desort
-        ] = self.photon_field.get_photon_density(self.pg_sorted, z)
+        photon_vector.reshape(-1)[self.pg_desort] = (
+            self.photon_field.get_photon_density(self.pg_sorted, z)
+        )
 
         return photon_vector
 
@@ -529,8 +527,8 @@ class ContinuousPairProductionLossRate(object):
             scale_vec = np.zeros(self.dim_states)
             units = (
                 PRINCE_UNITS.fine_structure
-                * PRINCE_UNITS.r_electron ** 2
-                * PRINCE_UNITS.m_electron ** 2
+                * PRINCE_UNITS.r_electron**2
+                * PRINCE_UNITS.m_electron**2
             )
             for spec in self.spec_man.species_refs:
                 if not spec.is_nucleus:
@@ -545,8 +543,8 @@ class ContinuousPairProductionLossRate(object):
             scale_vec = np.zeros(self.dim_bins)
             units = (
                 PRINCE_UNITS.fine_structure
-                * PRINCE_UNITS.r_electron ** 2
-                * PRINCE_UNITS.m_electron ** 2
+                * PRINCE_UNITS.r_electron**2
+                * PRINCE_UNITS.m_electron**2
             )
             for spec in self.spec_man.species_refs:
                 if not spec.is_nucleus:

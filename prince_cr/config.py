@@ -3,7 +3,8 @@
 import os.path as path
 import platform
 import sys
-import warnings
+import importlib
+import pathlib
 
 import numpy as np
 
@@ -140,37 +141,60 @@ except ModuleNotFoundError:
         linear_algebra_backend = "MKL"
     has_cupy = False
 
+#: Autodetect best solver
 #: determine shared library extension and MKL path
 pf = platform.platform()
 
+prefix = pathlib.Path(sys.prefix)
 if "Linux" in pf:
-    mkl_path = path.join(sys.prefix, "lib", "libmkl_rt.so")
-elif "Darwin" in pf:
-    mkl_path = path.join(sys.prefix, "lib", "libmkl_rt.dylib")
+    mkl_libs = list((prefix / "lib").glob("libmkl_rt*"))
+    mkl_path = mkl_libs[0] if mkl_libs else prefix / "lib" / "libmkl_rt.so"
+elif "macOS" in pf:
+    mkl_path = prefix / "lib" / "libmkl_rt.dylib"
+    has_accelerate = True
 else:
-    # Windows case
-    mkl_path = path.join(sys.prefix, "Library", "bin", "mkl_rt.dll")
+    # Windows or unknown OS: search for mkl_rt*.dll in Library/bin and lib
+    mkl_path = None
+    mkl_dirs = [prefix / "Library" / "bin", prefix / "lib"]
+    mkl_candidates = []
+    for d in mkl_dirs:
+        if d.exists():
+            mkl_candidates.extend(d.glob("mkl_rt*.dll"))
+    if mkl_candidates:
+        mkl_path = mkl_candidates[0]
+    else:
+        # fallback to default path
+        mkl_path = prefix / "Library" / "bin" / "mkl_rt.dll"
 
 # mkl library handler
 mkl = None
 
-# Check if MKL library found
-if path.isfile(mkl_path):
-    has_mkl = True
+has_mkl = bool(mkl_path.is_file())
+
+# Look for cupy module
+has_cuda = importlib.util.find_spec("cupy") is not None
+
+# CUDA is usually fastest, then MKL. Fallback to numpy.
+if has_cuda:
+    kernel_config = "CUDA"
+elif has_mkl:
+    kernel_config = "MKL"
 else:
-    has_mkl = False
+    kernel_config = "numpy"
+if debug_level >= 2:
+    print(f"Auto-detected {kernel_config} solver.")
 
 
 def set_mkl_threads(nthreads):
-    global mkl, MKL_threads
-    from ctypes import cdll, byref, c_int
+    global MKL_threads, mkl
+    from ctypes import byref, c_int, cdll
 
     mkl = cdll.LoadLibrary(mkl_path)
     # Set number of threads
     MKL_threads = nthreads
     mkl.mkl_set_num_threads(byref(c_int(nthreads)))
     if debug_level >= 5:
-        print("MKL threads limited to {0}".format(nthreads))
+        print(f"MKL threads limited to {nthreads}")
 
 
 if has_mkl:

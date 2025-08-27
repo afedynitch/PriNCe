@@ -159,7 +159,7 @@ class SophiaSuperposition(CrossSectionBase):
         if daughter <= 101:
             # raise Exception('Boost conserving cross section called ' +
             #                 'for redistributed particle')
-            from scipy.integrate import trapz
+            from scipy.integrate import trapezoid as trapz
 
             _, cs_diff = self.incl_diff(mother, daughter)
             cs_incl = trapz(cs_diff, x=self.xcenters, dx=bin_widths(self.xbins), axis=0)
@@ -383,7 +383,7 @@ class EmpiricalModel(SophiaSuperposition):
         """Computes inclusive from nonel * M with M is
         multiplicity value stored in internal table
         """
-        from scipy.integrate import trapz
+        from scipy.integrate import trapezoid as trapz
 
         if daughter <= config.redist_threshold_ID:
             _, cs_diff = self.incl_diff(mother, daughter)
@@ -410,7 +410,7 @@ class EmpiricalModel(SophiaSuperposition):
         ):  # if it's a pion rescale to A^2/3
 
             def superposition_incl(mother, daughter):
-                from scipy.integrate import trapz
+                from scipy.integrate import trapezoid as trapz
 
                 _, Z, N = get_AZN(mother)
                 cs_diff = (

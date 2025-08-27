@@ -50,6 +50,20 @@ UNITS_AND_CONVERSIONS_DEF = dict(
 PRINCE_UNITS = convert_to_namedtuple(UNITS_AND_CONVERSIONS_DEF, "PriNCeUnits")
 
 
+class InterpolatorWrapper:
+    """Wrapper class to make RegularGridInterpolator behave like interp2d."""
+    
+    def __init__(self, rgi):
+        self.rgi = rgi
+    
+    def __call__(self, x, y):
+        import numpy as np
+        x, y = np.broadcast_arrays(x, y)
+        points = np.column_stack([x.ravel(), y.ravel()])
+        result = self.rgi(points)
+        return result.reshape(x.shape) if x.shape else result.item()
+
+
 class PrinceDB(object):
     """Provides access to data stored in an HDF5 file.
 
@@ -115,7 +129,7 @@ class PrinceDB(object):
         return db_entry
 
     def ebl_spline(self, model_tag, subset="base"):
-        from scipy.interpolate import interp2d
+        from scipy.interpolate import RegularGridInterpolator
 
         info(10, "Reading EBL field splines. tag={0}".format(model_tag))
         with h5py.File(self.prince_db_fname, "r") as prince_db:
@@ -123,9 +137,24 @@ class PrinceDB(object):
             self._check_subgroup_exists(prince_db["EBL_models"][model_tag], subset)
             spl_gr = prince_db["EBL_models"][model_tag][subset]
 
-            return interp2d(
-                spl_gr["x"], spl_gr["y"], spl_gr["z"], fill_value=0.0, kind="linear"
+            # Create RegularGridInterpolator which is the modern replacement for interp2d
+            x_coords = spl_gr["x"][:]
+            y_coords = spl_gr["y"][:]
+            z_values = spl_gr["z"][:]
+            
+            # RegularGridInterpolator expects z_values to have shape (len(x_coords), len(y_coords))
+            # If z_values needs transposing to match this requirement, do it
+            if z_values.shape != (len(x_coords), len(y_coords)):
+                z_values = z_values.T
+            
+            # Create the interpolator
+            rgi = RegularGridInterpolator(
+                (x_coords, y_coords), z_values, 
+                method="linear", bounds_error=False, fill_value=0.0
             )
+            
+            # Return wrapper that maintains interp2d interface and is picklable
+            return InterpolatorWrapper(rgi)
 
 
 #: db_handler is the HDF file interface

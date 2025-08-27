@@ -59,7 +59,7 @@ class CosmicRaySource(object, metaclass=ABCMeta):
         num_int = np.zeros_like(self.ncoids, dtype=np.float)
         lum_int = np.zeros_like(self.ncoids, dtype=np.float)
 
-        from scipy.integrate import trapz
+        from scipy.integrate import trapezoid as trapz
 
         for idx, pid in enumerate(self.ncoids):
             # get the inection for the species and subsitute back from E_A =  E / A to E
