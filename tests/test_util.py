@@ -5,9 +5,7 @@ import pytest
 
 import prince_cr.config as config
 
-config.debug_level = 0
-
-from prince_cr.util import (  # noqa: E402
+from prince_cr.util import (
     convert_to_namedtuple,
     get_interp_object,
     get_2Dinterp_object,

@@ -3,28 +3,7 @@
 import pytest
 
 import prince_cr.config as config
-
-config.debug_level = 0
-config.max_mass = 4
-
-from prince_cr import core, cross_sections, photonfields  # noqa: E402
-
-
-@pytest.fixture(scope="module")
-def pf():
-    return photonfields.CombinedPhotonField(
-        [photonfields.CMBPhotonSpectrum, photonfields.CIBGilmore2D]
-    )
-
-
-@pytest.fixture(scope="module")
-def cs():
-    return cross_sections.CompositeCrossSection(
-        [
-            (0.0, cross_sections.TabulatedCrossSection, ("CRP2_TALYS",)),
-            (0.14, cross_sections.SophiaSuperposition, ()),
-        ]
-    )
+from prince_cr import core, photonfields
 
 
 @pytest.fixture(scope="module")

@@ -3,11 +3,7 @@
 import numpy as np
 import pytest
 
-import prince_cr.config as config
-
-config.debug_level = 0
-
-from prince_cr.data import (  # noqa: E402
+from prince_cr.data import (
     EnergyGrid,
     SpeciesManager,
     PrinceSpecies,

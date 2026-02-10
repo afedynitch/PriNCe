@@ -3,36 +3,7 @@
 import numpy as np
 import pytest
 
-import prince_cr.config as config
-
-config.debug_level = 0
-config.x_cut = 1e-4
-config.x_cut_proton = 1e-2
-config.tau_dec_threshold = np.inf
-config.max_mass = 14
-
-from prince_cr import cross_sections  # noqa: E402
-from prince_cr.util import get_AZN  # noqa: E402
-
-
-@pytest.fixture(scope="module")
-def sophia():
-    return cross_sections.SophiaSuperposition()
-
-
-@pytest.fixture(scope="module")
-def talys():
-    return cross_sections.TabulatedCrossSection("CRP2_TALYS")
-
-
-@pytest.fixture(scope="module")
-def composite():
-    return cross_sections.CompositeCrossSection(
-        [
-            (0.0, cross_sections.TabulatedCrossSection, ("CRP2_TALYS",)),
-            (0.14, cross_sections.SophiaSuperposition, ()),
-        ]
-    )
+from prince_cr.util import get_AZN
 
 
 class TestSophiaSuperposition:

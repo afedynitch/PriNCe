@@ -2,7 +2,6 @@
 
 import numpy as np
 
-import prince_cr.config as config
 from prince_cr.cosmology import (
     H,
     star_formation_rate,
@@ -10,8 +9,7 @@ from prince_cr.cosmology import (
     grb_rate_wp,
     agn_rate,
 )
-
-config.debug_level = 0
+import prince_cr.config as config
 
 
 class TestExpansionRate:

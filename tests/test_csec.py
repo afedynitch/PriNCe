@@ -686,11 +686,7 @@ species_joined = {
     ],
 }
 
-config.x_cut = 1e-4
-config.x_cut_proton = 1e-2
-config.tau_dec_threshold = np.inf
-config.max_mass = 14
-config.debug_level = 0  # suppress into statements
+# Config is set in conftest.py
 
 
 class TestCsec(unittest.TestCase):

@@ -3,26 +3,10 @@
 import numpy as np
 import pytest
 
-import prince_cr.config as config
-
-config.debug_level = 0
-config.max_mass = 14
-
-from prince_cr import core, cross_sections, photonfields  # noqa: E402
-
 
 @pytest.fixture(scope="module")
-def prince_run():
-    pf = photonfields.CombinedPhotonField(
-        [photonfields.CMBPhotonSpectrum, photonfields.CIBGilmore2D]
-    )
-    cs = cross_sections.CompositeCrossSection(
-        [
-            (0.0, cross_sections.TabulatedCrossSection, ("CRP2_TALYS",)),
-            (0.14, cross_sections.SophiaSuperposition, ()),
-        ]
-    )
-    return core.PriNCeRun(max_mass=4, photon_field=pf, cross_sections=cs)
+def prince_run(prince_run_m4):
+    return prince_run_m4
 
 
 class TestPhotoNuclearInteractionRate:

@@ -30,7 +30,9 @@ class SophiaSuperposition(CrossSectionBase):
         from prince_cr.data import db_handler
 
         info(2, "Load tabulated cross sections")
-        photo_nuclear_tables = db_handler.photo_meson_db("SOPHIA")
+        photo_nuclear_tables = db_handler.photo_meson_db(
+            "SOPHIA", e_range=config.cross_section_e_range
+        )
         info(2, "Loading SOPHIA cross sections from file.")
 
         egrid = photo_nuclear_tables["energy_grid"]

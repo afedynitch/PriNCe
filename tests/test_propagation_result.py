@@ -4,28 +4,29 @@ import numpy as np
 import pytest
 
 import prince_cr.config as config
+from prince_cr.data import EnergyGrid, SpeciesManager
+from prince_cr.solvers.propagation import UHECRPropagationResult
 
-config.debug_level = 0
-config.max_mass = 14
-
-from prince_cr.data import EnergyGrid, SpeciesManager  # noqa: E402
-from prince_cr.solvers.propagation import UHECRPropagationResult  # noqa: E402
+# Use the same grid parameters as conftest
+_cr_lo, _cr_hi, _cr_bpd = config.cosmic_ray_grid
 
 
 @pytest.fixture
 def spec_man():
     species = [100, 101, 402]
-    return SpeciesManager(species, 88)
+    d = int((_cr_hi - _cr_lo) * _cr_bpd)
+    return SpeciesManager(species, d)
 
 
 @pytest.fixture
 def egrid():
-    return EnergyGrid(3, 14, 8).grid
+    return EnergyGrid(_cr_lo, _cr_hi, _cr_bpd).grid
 
 
 @pytest.fixture
 def result(spec_man, egrid):
-    state = np.random.rand(spec_man.nspec * 88) * 1e-20
+    d = spec_man.grid_dims["default"]
+    state = np.random.rand(spec_man.nspec * d) * 1e-20
     return UHECRPropagationResult(state, egrid, spec_man)
 
 
@@ -51,21 +52,24 @@ class TestUHECRPropagationResult:
         assert len(e) == len(result.egrid)
 
     def test_add(self, result, spec_man, egrid):
-        state2 = np.random.rand(spec_man.nspec * 88) * 1e-20
+        d = spec_man.grid_dims["default"]
+        state2 = np.random.rand(spec_man.nspec * d) * 1e-20
         result2 = UHECRPropagationResult(state2, egrid, spec_man)
         combined = result + result2
         np.testing.assert_allclose(combined.state, result.state + result2.state)
 
     def test_add_different_egrid_raises(self, result, spec_man):
-        state2 = np.random.rand(spec_man.nspec * 88) * 1e-20
-        egrid2 = EnergyGrid(4, 14, 8).grid
+        d = spec_man.grid_dims["default"]
+        state2 = np.random.rand(spec_man.nspec * d) * 1e-20
+        egrid2 = EnergyGrid(_cr_lo + 1, _cr_hi, _cr_bpd).grid
         result2 = UHECRPropagationResult(state2, egrid2, spec_man)
         with pytest.raises(Exception, match="different energy grids"):
             result + result2
 
     def test_add_different_species_raises(self, result, egrid):
-        sm2 = SpeciesManager([100, 101], 88)
-        state2 = np.random.rand(sm2.nspec * 88) * 1e-20
+        d = int((_cr_hi - _cr_lo) * _cr_bpd)
+        sm2 = SpeciesManager([100, 101], d)
+        state2 = np.random.rand(sm2.nspec * d) * 1e-20
         result2 = UHECRPropagationResult(state2, egrid, sm2)
         with pytest.raises((Exception, ValueError)):
             result + result2

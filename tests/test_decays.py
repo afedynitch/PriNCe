@@ -4,11 +4,7 @@ import numpy as np
 import pytest
 from scipy.integrate import trapezoid as trapz
 
-import prince_cr.config as config
-
-config.debug_level = 0
-
-from prince_cr.decays import (  # noqa: E402
+from prince_cr.decays import (
     get_particle_channels,
     get_decay_matrix,
     get_decay_matrix_bin_average,

@@ -28,7 +28,9 @@ class TabulatedCrossSection(CrossSectionBase):
 
         info(2, "Load tabulated cross sections")
         # The energy grid is given in MeV, so we convert to GeV
-        photo_nuclear_tables = db_handler.photo_nuclear_db(model_prefix)
+        photo_nuclear_tables = db_handler.photo_nuclear_db(
+            model_prefix, e_range=config.cross_section_e_range
+        )
 
         egrid = photo_nuclear_tables["energy_grid"]
         info(2, "Egrid loading finished")

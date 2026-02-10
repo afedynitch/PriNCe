@@ -3,13 +3,8 @@
 import numpy as np
 import pytest
 
-import prince_cr.config as config
-
-config.debug_level = 0
-config.max_mass = 14
-
-from prince_cr.data import EnergyGrid, SpeciesManager  # noqa: E402
-from prince_cr.cosmology import star_formation_rate, grb_rate_wp, agn_rate  # noqa: E402
+from prince_cr.data import EnergyGrid, SpeciesManager
+from prince_cr.cosmology import star_formation_rate, grb_rate_wp, agn_rate
 
 
 class MockPrinceRun:

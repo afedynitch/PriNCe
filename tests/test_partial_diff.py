@@ -3,12 +3,8 @@
 import numpy as np
 import pytest
 
-import prince_cr.config as config
-
-config.debug_level = 0
-
-from prince_cr.data import EnergyGrid  # noqa: E402
-from prince_cr.solvers.partial_diff import DifferentialOperator, SemiLagrangianSolver  # noqa: E402
+from prince_cr.data import EnergyGrid
+from prince_cr.solvers.partial_diff import DifferentialOperator, SemiLagrangianSolver
 
 
 @pytest.fixture

@@ -105,6 +105,12 @@ y_cut = np.inf
 # Build equation system up to a maximal nuclear mass of
 max_mass = np.inf
 
+# Limit energy range loaded from HDF5 cross section tables.
+# Set to (e_min, e_max) tuple to load only data within this range,
+# reducing memory usage. Units match the energy grid in the database.
+# None means load the full range.
+cross_section_e_range = None
+
 # Include secondaries like photons and neutrinos
 secondaries = True
 # List of specific particles to ignore

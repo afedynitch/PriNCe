@@ -95,37 +95,81 @@ class PrinceDB(object):
             info(0, "Choose from:\n", "\n".join(available_models))
             raise Exception("Unknown selections.")
 
-    def photo_nuclear_db(self, model_tag):
+    @staticmethod
+    def _energy_slice(egrid, e_range):
+        """Compute a contiguous slice for the energy axis.
+
+        Args:
+            egrid (numpy.array): Full energy grid from the database.
+            e_range (tuple or None): ``(e_min, e_max)`` bounds. ``None``
+                means use the full grid.
+
+        Returns:
+            slice: A contiguous slice object for indexing the energy axis.
+        """
+        if e_range is None:
+            return slice(None)
+        e_min, e_max = e_range
+        mask = (egrid >= e_min) & (egrid <= e_max)
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            raise ValueError(
+                "e_range ({}, {}) selects no points from the energy grid "
+                "[{}, {}]".format(e_min, e_max, egrid[0], egrid[-1])
+            )
+        return slice(int(idx[0]), int(idx[-1]) + 1)
+
+    def photo_nuclear_db(self, model_tag, e_range=None):
         info(10, "Reading photo-nuclear db. tag={0}".format(model_tag))
         db_entry = {}
         with h5py.File(self.prince_db_fname, "r") as prince_db:
             self._check_subgroup_exists(prince_db["photo_nuclear"], model_tag)
-            for entry in [
-                "energy_grid",
-                "fragment_yields",
-                "inel_mothers",
-                "inelastic_cross_sctions",
-                "mothers_daughters",
-            ]:
+            grp = prince_db["photo_nuclear"][model_tag]
+
+            # Read energy grid first to compute the slice
+            egrid_full = grp["energy_grid"][:]
+            sl = self._energy_slice(egrid_full, e_range)
+            db_entry["energy_grid"] = egrid_full[sl]
+
+            # Index arrays — no energy dimension
+            for entry in ["inel_mothers", "mothers_daughters"]:
                 info(10, "Reading entry {0} from db.".format(entry))
-                db_entry[entry] = prince_db["photo_nuclear"][model_tag][entry][:]
+                db_entry[entry] = grp[entry][:]
+
+            # Cross section arrays — energy is the last axis
+            for entry in ["inelastic_cross_sctions", "fragment_yields"]:
+                info(10, "Reading entry {0} from db.".format(entry))
+                db_entry[entry] = grp[entry][..., sl]
+
         return db_entry
 
-    def photo_meson_db(self, model_tag):
+    def photo_meson_db(self, model_tag, e_range=None):
         info(10, "Reading photo-nuclear db. tag={0}".format(model_tag))
         db_entry = {}
         with h5py.File(self.prince_db_fname, "r") as prince_db:
             self._check_subgroup_exists(prince_db["photo_nuclear"], model_tag)
-            for entry in [
-                "energy_grid",
-                "xbins",
-                "fragment_yields",
-                "inel_mothers",
-                "inelastic_cross_sctions",
-                "mothers_daughters",
-            ]:
+            grp = prince_db["photo_nuclear"][model_tag]
+
+            # Read energy grid first to compute the slice
+            egrid_full = grp["energy_grid"][:]
+            sl = self._energy_slice(egrid_full, e_range)
+            db_entry["energy_grid"] = egrid_full[sl]
+
+            # xbins and index arrays — no energy dimension
+            db_entry["xbins"] = grp["xbins"][:]
+            for entry in ["inel_mothers", "mothers_daughters"]:
                 info(10, "Reading entry {0} from db.".format(entry))
-                db_entry[entry] = prince_db["photo_nuclear"][model_tag][entry][:]
+                db_entry[entry] = grp[entry][:]
+
+            # inelastic_cross_sctions: shape (n_mothers, n_energy)
+            info(10, "Reading entry inelastic_cross_sctions from db.")
+            db_entry["inelastic_cross_sctions"] = grp["inelastic_cross_sctions"][:, sl]
+
+            # fragment_yields: shape (n_channels, n_energy, n_xbins)
+            # Energy is axis 1 (middle), not the last axis
+            info(10, "Reading entry fragment_yields from db.")
+            db_entry["fragment_yields"] = grp["fragment_yields"][:, sl, :]
+
         return db_entry
 
     def ebl_spline(self, model_tag, subset="base"):
