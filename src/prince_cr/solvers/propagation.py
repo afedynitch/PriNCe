@@ -408,7 +408,8 @@ class UHECRPropagationSolver(object):
         r = self.jacobian.dot(state)
 
         if self.enable_injection_jacobian:
-            r += self.injection(1.0, z)[:, np.newaxis]
+            inj = self.injection(1.0, z)
+            r += inj[:, np.newaxis] if state.ndim == 2 else inj
 
         if self.enable_partial_diff_jacobian:
             conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
@@ -416,7 +417,8 @@ class UHECRPropagationSolver(object):
                 conloss += self.adia_loss_rates_grid.loss_vector(z)
             if self.enable_pairprod_losses:
                 conloss += self.pair_loss_rates_grid.loss_vector(z)
-            r += self.dldz(z) * self.diff_operator.dot(conloss[:, np.newaxis] * state)
+            conloss_state = conloss[:, np.newaxis] * state if state.ndim == 2 else conloss * state
+            r += self.dldz(z) * self.diff_operator.dot(conloss_state)
         return r
 
     def eqn_deriv_cupy(self, z, state, *args):
@@ -435,23 +437,24 @@ class UHECRPropagationSolver(object):
 
         r = self.jacobian.dot(state)
         if self.enable_injection_jacobian:
-            r += cupy.array(self.injection(1.0, z))[:, np.newaxis]
+            inj = cupy.array(self.injection(1.0, z))
+            r += inj[:, np.newaxis] if state.ndim == 2 else inj
         if self.enable_partial_diff_jacobian:
             conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
             if self.enable_adiabatic_losses:
                 conloss += self.adia_loss_rates_grid.loss_vector(z)
             if self.enable_pairprod_losses:
                 conloss += self.pair_loss_rates_grid.loss_vector(z)
-            r += self.dldz(z) * self.diff_operator.dot(
-                cupy.array(conloss)[:, np.newaxis] * state
-            )
+            conloss_cu = cupy.array(conloss)
+            conloss_state = conloss_cu[:, np.newaxis] * state if state.ndim == 2 else conloss_cu * state
+            r += self.dldz(z) * self.diff_operator.dot(conloss_state)
 
         return cupy.asnumpy(r)
 
     def eqn_deriv_mkl(self, z, state, *args):
         from prince_cr.solvers.mkl_interface import csrmm, csrmv
 
-        if state.shape[1] > 1:
+        if state.ndim == 2 and state.shape[1] > 1:
             matrix_input = True
         else:
             matrix_input = False
@@ -474,7 +477,8 @@ class UHECRPropagationSolver(object):
             res = csrmv(1.0, self.jacobian, state, 0.0, res)
 
         if self.enable_injection_jacobian:
-            res += self.injection(1.0, z)[:, np.newaxis]
+            inj = self.injection(1.0, z)
+            res += inj[:, np.newaxis] if state.ndim == 2 else inj
 
         if self.enable_partial_diff_jacobian:
             conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
@@ -482,11 +486,12 @@ class UHECRPropagationSolver(object):
                 conloss += self.adia_loss_rates_grid.loss_vector(z)
             if self.enable_pairprod_losses:
                 conloss += self.pair_loss_rates_grid.loss_vector(z)
+            conloss_state = conloss[:, np.newaxis] * state if state.ndim == 2 else conloss * state
             if matrix_input:
                 res = csrmm(
                     self.dldz(z),
                     self.diff_operator,
-                    conloss[:, np.newaxis] * state,
+                    conloss_state,
                     1.0,
                     res,
                 )
@@ -494,7 +499,7 @@ class UHECRPropagationSolver(object):
                 res = csrmv(
                     self.dldz(z),
                     self.diff_operator,
-                    conloss[:, np.newaxis] * state,
+                    conloss_state,
                     1.0,
                     res,
                 )
@@ -646,10 +651,10 @@ class UHECRPropagationSolverEULER(UHECRPropagationSolver):
         start_time = time()
         curr_z = self.initial_z
         if initial_inj:
-            initial_state = np.atleast_2d(self.injection(dz, self.initial_z))
+            initial_state = self.injection(dz, self.initial_z)
             print(initial_state)
         else:
-            initial_state = np.zeros((self.dim_states, 1))
+            initial_state = np.zeros(self.dim_states)
         state = initial_state
 
         self.pre_step_hook(self.initial_z)

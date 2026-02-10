@@ -65,5 +65,29 @@ filterwarnings = ["error::FutureWarning", "error::DeprecationWarning"]
 line-length = 90
 extend-ignore = ["E203"]
 
+[tool.coverage.run]
+source = ["prince_cr"]
+omit = [
+  "src/prince_cr/_deprecated/*",
+  "src/prince_cr/cross_sections/_phenom_relations.py",
+]
+
+[tool.coverage.report]
+omit = [
+  "src/prince_cr/_deprecated/*",
+  "src/prince_cr/cross_sections/_phenom_relations.py",
+]
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  "if has_cupy:",
+  "if has_cuda:",
+  "import cupy",
+  "except ModuleNotFoundError:",
+  "@abc.abstractmethod",
+]
+
 [tool.pydocstyle]
 convention = "numpy"

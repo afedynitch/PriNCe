@@ -15,7 +15,7 @@ from numpy import array, exp, inf, linspace, sum
 
 from prince_cr.util import get_AZN
 from prince_cr.data import spec_data
-from prince_cr.config import config
+from prince_cr import config
 
 # JH: This file gave some linter errors for me, disabled for now
 # pylint: skip-file

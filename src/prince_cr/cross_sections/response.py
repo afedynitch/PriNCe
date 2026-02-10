@@ -59,8 +59,8 @@ class ResponseFunction(object):
             #    incl_diff_res = np.where(xgrid < 0.9, incl_diff_res, 0.)
             # res += incl_diff_res
             # if not(mother == daughter):
-            res += self.incl_diff_intp[(mother, daughter)].inteval(
-                xgrid, ygrid, grid=False
+            res += self.incl_diff_intp[(mother, daughter)].ev(
+                xgrid, ygrid
             )
 
         if mother == daughter and mother in self.nonel_intp:

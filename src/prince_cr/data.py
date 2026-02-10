@@ -271,7 +271,7 @@ class PrinceSpecies(object):
                 self.is_baryon = True
                 self.is_nucleus = True
                 self.A, self.Z, self.N = self.calc_AZN(ncoid)
-            elif ncoid not in [2, 3, 4, 50]:
+            elif ncoid in [2, 3, 4, 50]:
                 self.is_hadron = True
                 self.is_meson = True
             else:

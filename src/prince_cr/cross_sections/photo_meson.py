@@ -226,7 +226,7 @@ class SophiaSuperposition(CrossSectionBase):
         return self.egrid, csec_diff[:, self._range]
 
 
-class EmpiricalModel(SophiaSuperposition):
+class EmpiricalModel(SophiaSuperposition):  # pragma: no cover
     """Photomeson model based on empirical relations and experimental data.
     More info:  L. Morejon et al JCAP11(2019)007
     """
