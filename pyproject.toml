@@ -38,7 +38,7 @@ dependencies = [
   "h5py",
   "requests"
 ]
-optional-dependencies = { test = ["pytest", "matplotlib"] }
+optional-dependencies = { test = ["pytest", "pytest-xdist", "matplotlib"] }
 
 [tool.setuptools]
 include-package-data = true
@@ -63,6 +63,8 @@ filterwarnings = ["error::FutureWarning", "error::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 90
+
+[tool.ruff.lint]
 extend-ignore = ["E203"]
 
 [tool.coverage.run]

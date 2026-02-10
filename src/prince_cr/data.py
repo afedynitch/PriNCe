@@ -114,8 +114,9 @@ class PrinceDB(object):
         idx = np.where(mask)[0]
         if len(idx) == 0:
             raise ValueError(
-                "e_range ({}, {}) selects no points from the energy grid "
-                "[{}, {}]".format(e_min, e_max, egrid[0], egrid[-1])
+                "e_range ({}, {}) selects no points from the energy grid [{}, {}]".format(
+                    e_min, e_max, egrid[0], egrid[-1]
+                )
             )
         return slice(int(idx[0]), int(idx[-1]) + 1)
 

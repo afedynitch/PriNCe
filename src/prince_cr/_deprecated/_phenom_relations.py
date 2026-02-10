@@ -133,9 +133,12 @@ try:
         resmul = load(f, encoding="latin1")
 except FileNotFoundError:
     # Generate the pickle file if it doesn't exist
-    print(f"Generating {small_frags_relative_yields_filename} (this may take a few minutes)...")
+    print(
+        f"Generating {small_frags_relative_yields_filename} (this may take a few minutes)..."
+    )
     resmul = residual_multiplicities()
     from pickle import dump
+
     with open(small_frags_relative_yields_filename, "wb") as f:
         dump(resmul, f)
     print(f"Saved residual multiplicities to {small_frags_relative_yields_filename}")

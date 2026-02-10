@@ -1,6 +1,5 @@
 # Test whether cross section are correctly created.
 
-import numpy as np
 import pytest
 
 from prince_cr.solvers import UHECRPropagationSolverBDF

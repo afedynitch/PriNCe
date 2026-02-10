@@ -47,6 +47,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
+      - name: Cache PriNCe database
+        uses: actions/cache@v4
+        with:
+          path: src/prince_cr/data/prince_db_05.h5
+          key: prince-db-v0.5
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

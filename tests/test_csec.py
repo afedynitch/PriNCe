@@ -1,8 +1,6 @@
 # Test whether cross section are correctly created.
 import unittest
-import numpy as np
 
-import prince_cr.config as config
 from prince_cr import cross_sections
 
 species_talys = {

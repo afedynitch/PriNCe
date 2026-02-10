@@ -1,7 +1,5 @@
 # Test whether interaction rates are correctly created.
 
-import pytest
-
 from prince_cr import core
 
 
