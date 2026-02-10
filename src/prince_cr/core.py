@@ -19,7 +19,6 @@ class PriNCeRun(object):
     """
 
     def __init__(self, *args, **kwargs):
-
         if "max_mass" in kwargs:
             max_mass = kwargs.pop("max_mass", config.max_mass)
 
@@ -63,9 +62,7 @@ class PriNCeRun(object):
             )
         else:
             system_species = [
-                s
-                for s in self.cross_sections.known_species
-                if get_AZN(s)[0] <= max_mass
+                s for s in self.cross_sections.known_species if get_AZN(s)[0] <= max_mass
             ]
         # Disable photo-meson production
         if not config.secondaries:

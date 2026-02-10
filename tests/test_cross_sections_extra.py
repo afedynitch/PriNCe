@@ -11,9 +11,8 @@ config.x_cut_proton = 1e-2
 config.tau_dec_threshold = np.inf
 config.max_mass = 14
 
-from prince_cr import cross_sections
-from prince_cr.cross_sections.base import CrossSectionBase
-from prince_cr.util import get_AZN
+from prince_cr import cross_sections  # noqa: E402
+from prince_cr.util import get_AZN  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -256,5 +255,3 @@ class TestResponseFunction:
             xgr = 0.5 * np.ones_like(ygr)
             result = resp.get_full(mo, da, ygr, xgr)
             assert result.shape == ygr.shape
-
-

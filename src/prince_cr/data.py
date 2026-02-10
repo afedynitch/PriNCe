@@ -1,4 +1,5 @@
 """Module inteded to contain some prince-specific data structures."""
+
 import pickle as pickle
 import os.path as path
 import numpy as np
@@ -33,8 +34,7 @@ UNITS_AND_CONVERSIONS_DEF = dict(
     cm2Mpc=1.0 / (spc.parsec * spc.mega * 1e2),
     Mpc2cm=spc.mega * spc.parsec * 1e2,
     m_proton=spc.physical_constants["proton mass energy equivalent in MeV"][0] * 1e-3,
-    m_electron=spc.physical_constants["electron mass energy equivalent in MeV"][0]
-    * 1e-3,
+    m_electron=spc.physical_constants["electron mass energy equivalent in MeV"][0] * 1e-3,
     r_electron=spc.physical_constants["classical electron radius"][0] * 1e2,
     fine_structure=spc.fine_structure,
     GeV2erg=1.0 / 624.15,
@@ -52,12 +52,13 @@ PRINCE_UNITS = convert_to_namedtuple(UNITS_AND_CONVERSIONS_DEF, "PriNCeUnits")
 
 class InterpolatorWrapper:
     """Wrapper class to make RegularGridInterpolator behave like interp2d."""
-    
+
     def __init__(self, rgi):
         self.rgi = rgi
-    
+
     def __call__(self, x, y):
         import numpy as np
+
         x, y = np.broadcast_arrays(x, y)
         points = np.column_stack([x.ravel(), y.ravel()])
         result = self.rgi(points)
@@ -75,7 +76,6 @@ class PrinceDB(object):
     """
 
     def __init__(self):
-
         info(2, "Opening HDF5 file", config.db_fname)
         self.prince_db_fname = path.join(config.data_dir, config.db_fname)
         if not path.isfile(self.prince_db_fname):
@@ -141,18 +141,21 @@ class PrinceDB(object):
             x_coords = spl_gr["x"][:]
             y_coords = spl_gr["y"][:]
             z_values = spl_gr["z"][:]
-            
+
             # RegularGridInterpolator expects z_values to have shape (len(x_coords), len(y_coords))
             # If z_values needs transposing to match this requirement, do it
             if z_values.shape != (len(x_coords), len(y_coords)):
                 z_values = z_values.T
-            
+
             # Create the interpolator
             rgi = RegularGridInterpolator(
-                (x_coords, y_coords), z_values, 
-                method="linear", bounds_error=False, fill_value=0.0
+                (x_coords, y_coords),
+                z_values,
+                method="linear",
+                bounds_error=False,
+                fill_value=0.0,
             )
-            
+
             # Return wrapper that maintains interp2d interface and is picklable
             return InterpolatorWrapper(rgi)
 
@@ -211,7 +214,6 @@ class PrinceSpecies(object):
         return A, Z, A - Z
 
     def __init__(self, ncoid, princeidx, d):
-
         info(5, "Initializing new species", ncoid)
 
         #: Neucosma ID of particle

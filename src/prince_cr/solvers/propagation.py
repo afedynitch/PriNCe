@@ -77,7 +77,7 @@ class UHECRPropagationResult(object):
         """Returns the spectrum scaled back to total energy"""
         spec = self.spec_man.ncoid2sref[nco_id]
         egrid = spec.A * self.egrid
-        return egrid, egrid ** epow * self.state[spec.lidx() : spec.uidx()] / spec.A
+        return egrid, egrid**epow * self.state[spec.lidx() : spec.uidx()] / spec.A
 
     def _check_id_grid(self, nco_ids, egrid):
         # Take egrid from first id ( doesn't cover the range for iron for example)
@@ -152,7 +152,7 @@ class UHECRPropagationResult(object):
         average = (lnA[:, np.newaxis] * spectra).sum(axis=0) / spectra.sum(axis=0)
         variance = (lnA[:, np.newaxis] ** 2 * spectra).sum(axis=0) / spectra.sum(
             axis=0
-        ) - average ** 2
+        ) - average**2
 
         return com_egrid, average, variance
 
@@ -259,9 +259,7 @@ class UHECRPropagationSolver(object):
         at each redshift value z"""
         f = self.dldz(z) * dz * PRINCE_UNITS.cm2sec
         if len(self.list_of_sources) > 1:
-            return f * np.sum(
-                [s.injection_rate(z) for s in self.list_of_sources], axis=0
-            )
+            return f * np.sum([s.injection_rate(z) for s in self.list_of_sources], axis=0)
         else:
             return f * self.list_of_sources[0].injection_rate(z)
 
@@ -417,7 +415,9 @@ class UHECRPropagationSolver(object):
                 conloss += self.adia_loss_rates_grid.loss_vector(z)
             if self.enable_pairprod_losses:
                 conloss += self.pair_loss_rates_grid.loss_vector(z)
-            conloss_state = conloss[:, np.newaxis] * state if state.ndim == 2 else conloss * state
+            conloss_state = (
+                conloss[:, np.newaxis] * state if state.ndim == 2 else conloss * state
+            )
             r += self.dldz(z) * self.diff_operator.dot(conloss_state)
         return r
 
@@ -446,7 +446,11 @@ class UHECRPropagationSolver(object):
             if self.enable_pairprod_losses:
                 conloss += self.pair_loss_rates_grid.loss_vector(z)
             conloss_cu = cupy.array(conloss)
-            conloss_state = conloss_cu[:, np.newaxis] * state if state.ndim == 2 else conloss_cu * state
+            conloss_state = (
+                conloss_cu[:, np.newaxis] * state
+                if state.ndim == 2
+                else conloss_cu * state
+            )
             r += self.dldz(z) * self.diff_operator.dot(conloss_state)
 
         return cupy.asnumpy(r)
@@ -486,7 +490,9 @@ class UHECRPropagationSolver(object):
                 conloss += self.adia_loss_rates_grid.loss_vector(z)
             if self.enable_pairprod_losses:
                 conloss += self.pair_loss_rates_grid.loss_vector(z)
-            conloss_state = conloss[:, np.newaxis] * state if state.ndim == 2 else conloss * state
+            conloss_state = (
+                conloss[:, np.newaxis] * state if state.ndim == 2 else conloss * state
+            )
             if matrix_input:
                 res = csrmm(
                     self.dldz(z),

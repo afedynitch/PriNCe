@@ -1,8 +1,5 @@
 """Tests for prince_cr.config module."""
 
-import numpy as np
-import pytest
-
 import prince_cr.config as config
 
 

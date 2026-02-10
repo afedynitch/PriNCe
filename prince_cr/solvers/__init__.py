@@ -1,5 +1,5 @@
 from .propagation import (
-    UHECRPropagationResult,
-    UHECRPropagationSolverBDF,
-    UHECRPropagationSolverEULER,
+    UHECRPropagationResult as UHECRPropagationResult,
+    UHECRPropagationSolverBDF as UHECRPropagationSolverBDF,
+    UHECRPropagationSolverEULER as UHECRPropagationSolverEULER,
 )

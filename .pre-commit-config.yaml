@@ -15,7 +15,7 @@
 repos:
 # Standard hooks
 - repo: https://github.com/pre-commit/pre-commit-hooks
-  rev: v5.0.0
+  rev: v6.0.0
   hooks:
   - id: check-case-conflict
   - id: check-docstring-first
@@ -30,24 +30,29 @@ repos:
   - id: trailing-whitespace
     files: ^\.github/workflows/|.*\.py$
 
-# Python formatting
-- repo: https://github.com/psf/black
-  rev: 24.10.0
-  hooks:
-  - id: black
-
 # Ruff linter, replacement for flake8, pydocstyle, isort
 - repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: 'v0.8.6'
+  rev: 'v0.14.13'
   hooks:
-    - id: ruff
-      args: [--fix, --show-fixes]
-      exclude: src/prince_cr/cross_sections/_phenom_relations.py
+    - id: ruff-check
+      types_or: [ python, pyi ]
+      args: [--fix, --show-fixes] # do not run on notebooks
+    - id: ruff-format
+      types_or: [ python, pyi ]
 
-# # Enable the following later
-# # Python docstring formatting
-# - repo: https://github.com/pycqa/pydocstyle
-#   rev: 6.1.1
-#   hooks:
-#   - id: pydocstyle
-#     files: prince_cr/[^_].*\.py
+# CMake formatting
+- repo: https://github.com/cheshirekow/cmake-format-precommit
+  rev: v0.6.13
+  hooks:
+  - id: cmake-format
+    additional_dependencies: [pyyaml]
+    types: [file]
+    files: (\.cmake|CMakeLists.txt)(.in)?$
+    
+
+
+# towncrier
+- repo: https://github.com/twisted/towncrier
+  rev: 25.8.0
+  hooks:
+    - id: towncrier-check

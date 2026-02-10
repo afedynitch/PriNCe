@@ -1,13 +1,12 @@
 """Tests for prince_cr.cross_sections._phenom_relations module."""
 
 import numpy as np
-import pytest
 
 import prince_cr.config as config
 
 config.debug_level = 0
 
-from prince_cr.cross_sections._phenom_relations import (
+from prince_cr.cross_sections._phenom_relations import (  # noqa: E402
     list_species_by_mass,
     partitions,
     combinations,

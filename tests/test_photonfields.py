@@ -7,12 +7,10 @@ import prince_cr.config as config
 
 config.debug_level = 0
 
-from prince_cr.photonfields import (
-    PhotonField,
+from prince_cr.photonfields import (  # noqa: E402
     CombinedPhotonField,
     FlatPhotonSpectrum,
     CMBPhotonSpectrum,
-    EBLSplined2D,
     CIBFranceschini2D,
     CIBInoue2D,
     CIBGilmore2D,

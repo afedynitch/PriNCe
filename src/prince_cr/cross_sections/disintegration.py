@@ -1,5 +1,3 @@
-from os.path import join
-
 import numpy as np
 
 from prince_cr.util import info, get_AZN
@@ -100,7 +98,6 @@ class CompositeCrossSection(CrossSectionBase):
         self._join_models(model_list)
 
     def _join_models(self, model_list):
-
         info(1, "Attempt to join", len(model_list), "models.")
 
         # Number of modls to join
@@ -108,7 +105,6 @@ class CompositeCrossSection(CrossSectionBase):
         self.model_refs = []
         # Construct instances of models and set ranges where they are valid
         for imo, (e_thr, mclass, margs) in enumerate(model_list):
-
             # Create instance of a model, passing the provided args
             csm_inst = mclass(*margs)
 

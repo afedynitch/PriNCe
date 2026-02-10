@@ -1,7 +1,6 @@
 """Tests for prince_cr.cosmology module."""
 
 import numpy as np
-import pytest
 
 import prince_cr.config as config
 from prince_cr.cosmology import (
@@ -54,13 +53,13 @@ class TestStarFormationRate:
     def test_mid_z_branch(self):
         # 0.97 < z <= 4.48
         z = 2.0
-        expected = 10.0 ** 1.09 * (1.0 + z) ** -0.26
+        expected = 10.0**1.09 * (1.0 + z) ** -0.26
         np.testing.assert_allclose(star_formation_rate(z), expected, rtol=1e-10)
 
     def test_high_z_branch(self):
         # z > 4.48
         z = 5.0
-        expected = 10.0 ** 6.66 * (1.0 + z) ** -7.8
+        expected = 10.0**6.66 * (1.0 + z) ** -7.8
         np.testing.assert_allclose(star_formation_rate(z), expected, rtol=1e-10)
 
 

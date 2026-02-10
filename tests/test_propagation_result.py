@@ -8,8 +8,8 @@ import prince_cr.config as config
 config.debug_level = 0
 config.max_mass = 14
 
-from prince_cr.data import EnergyGrid, SpeciesManager
-from prince_cr.solvers.propagation import UHECRPropagationResult
+from prince_cr.data import EnergyGrid, SpeciesManager  # noqa: E402
+from prince_cr.solvers.propagation import UHECRPropagationResult  # noqa: E402
 
 
 @pytest.fixture
@@ -54,9 +54,7 @@ class TestUHECRPropagationResult:
         state2 = np.random.rand(spec_man.nspec * 88) * 1e-20
         result2 = UHECRPropagationResult(state2, egrid, spec_man)
         combined = result + result2
-        np.testing.assert_allclose(
-            combined.state, result.state + result2.state
-        )
+        np.testing.assert_allclose(combined.state, result.state + result2.state)
 
     def test_add_different_egrid_raises(self, result, spec_man):
         state2 = np.random.rand(spec_man.nspec * 88) * 1e-20
@@ -131,6 +129,8 @@ class TestUHECRPropagationResult:
 
     def test_check_id_grid_tuple(self, result):
         # Select species with A between 1 and 4
-        selector = lambda s: result.spec_man.ncoid2sref[s].A
+        def selector(s):
+            return result.spec_man.ncoid2sref[s].A
+
         ids, e = result._check_id_grid((selector, 1, 4), None)
         assert len(ids) > 0

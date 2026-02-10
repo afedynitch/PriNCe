@@ -1,6 +1,5 @@
 """Tests for prince_cr.core module."""
 
-import numpy as np
 import pytest
 
 import prince_cr.config as config
@@ -8,7 +7,7 @@ import prince_cr.config as config
 config.debug_level = 0
 config.max_mass = 4
 
-from prince_cr import core, cross_sections, photonfields
+from prince_cr import core, cross_sections, photonfields  # noqa: E402
 
 
 @pytest.fixture(scope="module")

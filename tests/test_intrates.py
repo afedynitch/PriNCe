@@ -25,27 +25,21 @@ cs = cross_sections.CompositeCrossSection(
 
 class TestCsec(unittest.TestCase):
     def test_kernel_1(self):
-        prince_run_talys = core.PriNCeRun(
-            max_mass=4, photon_field=pf, cross_sections=cs
-        )
+        prince_run_talys = core.PriNCeRun(max_mass=4, photon_field=pf, cross_sections=cs)
         self.assertEqual(prince_run_talys.int_rates._batch_matrix.shape, (88344, 72))
         self.assertEqual(prince_run_talys.int_rates._batch_rows.shape, (88344,))
         self.assertEqual(prince_run_talys.int_rates._batch_cols.shape, (88344,))
         self.assertEqual(prince_run_talys.int_rates._batch_vec.shape, (88344,))
 
     def test_kernel_4(self):
-        prince_run_talys = core.PriNCeRun(
-            max_mass=1, photon_field=pf, cross_sections=cs
-        )
+        prince_run_talys = core.PriNCeRun(max_mass=1, photon_field=pf, cross_sections=cs)
         self.assertEqual(prince_run_talys.int_rates._batch_matrix.shape, (17528, 72))
         self.assertEqual(prince_run_talys.int_rates._batch_rows.shape, (17528,))
         self.assertEqual(prince_run_talys.int_rates._batch_cols.shape, (17528,))
         self.assertEqual(prince_run_talys.int_rates._batch_vec.shape, (17528,))
 
     def test_kernel_14(self):
-        prince_run_talys = core.PriNCeRun(
-            max_mass=14, photon_field=pf, cross_sections=cs
-        )
+        prince_run_talys = core.PriNCeRun(max_mass=14, photon_field=pf, cross_sections=cs)
         self.assertEqual(prince_run_talys.int_rates._batch_matrix.shape, (287664, 72))
         self.assertEqual(prince_run_talys.int_rates._batch_rows.shape, (287664,))
         self.assertEqual(prince_run_talys.int_rates._batch_cols.shape, (287664,))

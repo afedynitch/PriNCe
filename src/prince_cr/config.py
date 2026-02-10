@@ -247,7 +247,7 @@ else:
     try:
         with h5py.File(path.join(data_dir, db_fname), "r") as prince_db:
             db_version = prince_db.attrs["version"]
-    except:
+    except (OSError, KeyError, Exception):
         print(f"Database file {db_fname} corrupted. Retrying download.")
         _download_file(url, path.join(data_dir, db_fname))
     finally:

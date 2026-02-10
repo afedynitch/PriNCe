@@ -8,13 +8,12 @@ import prince_cr.config as config
 config.debug_level = 0
 config.max_mass = 4
 
-from prince_cr import core, cross_sections, photonfields
-from prince_cr.solvers.propagation import (
-    UHECRPropagationSolver,
+from prince_cr import core, cross_sections, photonfields  # noqa: E402
+from prince_cr.solvers.propagation import (  # noqa: E402
     UHECRPropagationSolverBDF,
     UHECRPropagationSolverEULER,
 )
-from prince_cr.cr_sources import AugerFitSource, SimpleSource
+from prince_cr.cr_sources import SimpleSource  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -338,8 +337,11 @@ class TestEulerSolver:
             )
         )
         solver.solve(
-            dz=0.005, verbose=False, initial_inj=False,
-            disable_inj=True, progressbar=False
+            dz=0.005,
+            verbose=False,
+            initial_inj=False,
+            disable_inj=True,
+            progressbar=False,
         )
         assert solver.state is not None
 
@@ -372,6 +374,7 @@ class TestScipyBackend:
     def test_scipy_eqn_derivative(self, prince_run):
         """Test scipy backend derivative function."""
         import prince_cr.config as config
+
         old_backend = config.linear_algebra_backend
         try:
             config.linear_algebra_backend = "scipy"
@@ -400,6 +403,7 @@ class TestScipyBackend:
     def test_scipy_eqn_derivative_with_partial_diff(self, prince_run):
         """Test scipy backend with partial differential jacobian."""
         import prince_cr.config as config
+
         old_backend = config.linear_algebra_backend
         try:
             config.linear_algebra_backend = "scipy"
@@ -424,5 +428,3 @@ class TestScipyBackend:
             assert result.shape == state.shape
         finally:
             config.linear_algebra_backend = old_backend
-
-

@@ -36,7 +36,6 @@ class CombinedPhotonField(PhotonField):
     """
 
     def __init__(self, list_of_classes_and_args):
-
         self.model_list = []
 
         for arg in list_of_classes_and_args:

@@ -8,7 +8,7 @@ import prince_cr.config as config
 
 config.debug_level = 0
 
-from prince_cr.decays import (
+from prince_cr.decays import (  # noqa: E402
     get_particle_channels,
     get_decay_matrix,
     get_decay_matrix_bin_average,
@@ -23,7 +23,7 @@ from prince_cr.decays import (
     boost_conservation_avg,
     nu_from_beta_decay,
 )
-from prince_cr.data import spec_data
+from prince_cr.data import spec_data  # noqa: E402
 
 
 class TestPionToNumu:

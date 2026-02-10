@@ -7,13 +7,11 @@ import prince_cr.config as config
 
 config.debug_level = 0
 
-from prince_cr.data import (
+from prince_cr.data import (  # noqa: E402
     EnergyGrid,
     SpeciesManager,
     PrinceSpecies,
-    PrinceDB,
     InterpolatorWrapper,
-    spec_data,
     db_handler,
 )
 
@@ -25,8 +23,9 @@ class TestInterpolatorWrapper:
         x = np.linspace(0, 5, 10)
         y = np.linspace(0, 5, 10)
         z = np.outer(x, y)
-        rgi = RegularGridInterpolator((x, y), z, method="linear",
-                                       bounds_error=False, fill_value=0.0)
+        rgi = RegularGridInterpolator(
+            (x, y), z, method="linear", bounds_error=False, fill_value=0.0
+        )
         wrapper = InterpolatorWrapper(rgi)
         result = wrapper(np.array([2.5]), np.array([2.5]))
         np.testing.assert_allclose(result, 2.5 * 2.5, atol=0.5)
@@ -37,8 +36,9 @@ class TestInterpolatorWrapper:
         x = np.linspace(0, 5, 10)
         y = np.linspace(0, 5, 10)
         z = np.outer(x, y)
-        rgi = RegularGridInterpolator((x, y), z, method="linear",
-                                       bounds_error=False, fill_value=0.0)
+        rgi = RegularGridInterpolator(
+            (x, y), z, method="linear", bounds_error=False, fill_value=0.0
+        )
         wrapper = InterpolatorWrapper(rgi)
         result = wrapper(2.5, 2.5)
         assert np.isfinite(result)
@@ -49,8 +49,9 @@ class TestInterpolatorWrapper:
         x = np.linspace(0, 5, 10)
         y = np.linspace(0, 5, 10)
         z = np.outer(x, y)
-        rgi = RegularGridInterpolator((x, y), z, method="linear",
-                                       bounds_error=False, fill_value=0.0)
+        rgi = RegularGridInterpolator(
+            (x, y), z, method="linear", bounds_error=False, fill_value=0.0
+        )
         wrapper = InterpolatorWrapper(rgi)
         xvals = np.array([1.0, 2.0, 3.0])
         yvals = np.array([1.0, 2.0, 3.0])
@@ -79,6 +80,7 @@ class TestPrinceDB:
 
     def test_check_subgroup_invalid(self):
         import h5py
+
         with h5py.File(db_handler.prince_db_fname, "r") as f:
             with pytest.raises(Exception, match="Unknown selections"):
                 db_handler._check_subgroup_exists(f["photo_nuclear"], "NONEXISTENT")

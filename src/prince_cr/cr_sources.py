@@ -1,7 +1,7 @@
 """Defines source models for cosmic ray propagation
 
-    The standard interface requires to UHECRSolvers requires
-    that each source defines a methods injection_rate(self, z)
+The standard interface requires to UHECRSolvers requires
+that each source defines a methods injection_rate(self, z)
 """
 
 from abc import ABCMeta, abstractmethod
@@ -124,9 +124,7 @@ class CosmicRaySource(object, metaclass=ABCMeta):
 
         # Check if negative z is called
         if z < 0:
-            raise Exception(
-                "Source evolution not defined for negative z = {:}".format(z)
-            )
+            raise Exception("Source evolution not defined for negative z = {:}".format(z))
 
         # flat source evolution
         if self.source_evo_m == "flat":
@@ -241,7 +239,7 @@ class RigidityFlexSource(CosmicRaySource):
         spectral_index, rcut, alpha, relnorm = params
         inj_spec = self.spec_man.ncoid2sref[pid]
         A = float(inj_spec.A)
-        emax = rcut * inj_spec.Z ** alpha
+        emax = rcut * inj_spec.Z**alpha
         e_k = A * energy
         result = (
             relnorm
