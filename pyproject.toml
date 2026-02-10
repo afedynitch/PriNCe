@@ -69,13 +69,11 @@ extend-ignore = ["E203"]
 source = ["prince_cr"]
 omit = [
   "src/prince_cr/_deprecated/*",
-  "src/prince_cr/cross_sections/_phenom_relations.py",
 ]
 
 [tool.coverage.report]
 omit = [
   "src/prince_cr/_deprecated/*",
-  "src/prince_cr/cross_sections/_phenom_relations.py",
 ]
 exclude_lines = [
   "pragma: no cover",

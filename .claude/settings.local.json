@@ -5,7 +5,8 @@
       "Bash(python -m pytest:*)",
       "Bash(python -c:*)",
       "Bash(pytest:*)",
-      "Bash(pre-commit run:*)"
+      "Bash(pre-commit run:*)",
+      "Bash(gh:*)"
     ]
   }
 }

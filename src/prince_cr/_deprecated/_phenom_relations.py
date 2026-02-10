@@ -89,7 +89,7 @@ def residual_multiplicities():
     spalled_nucleons = []
     for Am in species_by_mass:
         for mother in species_by_mass[Am]:
-            for A_big_frag in range(Am / 2, Am - 1):
+            for A_big_frag in range(Am // 2, Am - 1):
                 for big_frag in species_by_mass[A_big_frag]:
                     if big_frag % 100 > mother % 100:
                         continue
@@ -122,13 +122,23 @@ def residual_multiplicities():
 # local lookup tables for efficiency
 # species_by_mass = list_species_by_mass(56, config['tau_dec_threshold'])
 species_by_mass = list_species_by_mass(56, 0.0)
-# resmul = residual_multiplicities()
+
+# Try to load precomputed resmul, generate if missing
 small_frags_relative_yields_filename = join(
     config.data_dir, "small_frags_relative_yields.pkl"
 )
-with open(small_frags_relative_yields_filename, "rb") as f:
-    # it's faster to pickle.load a precomputed resmul
-    resmul = load(f, encoding="latin1")
+try:
+    with open(small_frags_relative_yields_filename, "rb") as f:
+        # it's faster to pickle.load a precomputed resmul
+        resmul = load(f, encoding="latin1")
+except FileNotFoundError:
+    # Generate the pickle file if it doesn't exist
+    print(f"Generating {small_frags_relative_yields_filename} (this may take a few minutes)...")
+    resmul = residual_multiplicities()
+    from pickle import dump
+    with open(small_frags_relative_yields_filename, "wb") as f:
+        dump(resmul, f)
+    print(f"Saved residual multiplicities to {small_frags_relative_yields_filename}")
 
 
 # empirical relations from reference...
