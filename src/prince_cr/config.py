@@ -3,7 +3,7 @@
 import os.path as path
 import platform
 import sys
-import importlib
+import importlib.util
 import pathlib
 
 import numpy as np
