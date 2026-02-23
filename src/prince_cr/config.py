@@ -3,7 +3,7 @@
 import os.path as path
 import platform
 import sys
-import importlib
+import importlib.util
 import pathlib
 
 import numpy as np
@@ -104,6 +104,12 @@ y_cut = np.inf
 
 # Build equation system up to a maximal nuclear mass of
 max_mass = np.inf
+
+# Limit energy range loaded from HDF5 cross section tables.
+# Set to (e_min, e_max) tuple to load only data within this range,
+# reducing memory usage. Units match the energy grid in the database.
+# None means load the full range.
+cross_section_e_range = None
 
 # Include secondaries like photons and neutrinos
 secondaries = True
@@ -247,7 +253,7 @@ else:
     try:
         with h5py.File(path.join(data_dir, db_fname), "r") as prince_db:
             db_version = prince_db.attrs["version"]
-    except:
+    except (OSError, KeyError, Exception):
         print(f"Database file {db_fname} corrupted. Retrying download.")
         _download_file(url, path.join(data_dir, db_fname))
     finally:

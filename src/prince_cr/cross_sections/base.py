@@ -1,7 +1,6 @@
 """The module contains everything to handle cross section interfaces."""
 
-from abc import ABCMeta, abstractmethod
-from os.path import isfile, join
+from abc import ABCMeta
 
 import numpy as np
 
@@ -85,9 +84,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
             e_max = np.max(self._egrid_tab)
 
         info(5, "Setting range to {0:3.2e} - {1:3.2e}".format(e_min, e_max))
-        self._range = np.where((self._egrid_tab >= e_min) & (self._egrid_tab <= e_max))[
-            0
-        ]
+        self._range = np.where((self._egrid_tab >= e_min) & (self._egrid_tab <= e_max))[0]
         info(
             2,
             "Range set to {0:3.2e} - {1:3.2e}".format(
@@ -374,9 +371,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                 info(
                     3,
                     dbg_indent(reclev),
-                    "daughter {0} unknown. Force beta decay not implemented!!".format(
-                        da
-                    ),
+                    "daughter {0} unknown. Force beta decay not implemented!!".format(da),
                 )
                 return
 
@@ -457,8 +452,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         # Only stable (interacting) mother particles are left
         self._update_indices()
 
-        for (mother, daughter) in self.incl_idcs:
-
+        for mother, daughter in self.incl_idcs:
             if mother not in self.nonel_idcs:
                 info(
                     30,
@@ -477,8 +471,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
 
         self._update_indices()
 
-        for (mother, daughter) in self.incl_diff_idcs:
-
+        for mother, daughter in self.incl_diff_idcs:
             if mother not in self.nonel_idcs:
                 info(
                     30,
@@ -516,9 +509,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                 len(self._nonel_tab), len(self._incl_tab) + len(self._incl_diff_tab)
             ),
         )
-        info(
-            2, f"Cache used for decays, {decay_cached.cache_info()}"
-        )  # pylint:disable=no-value-for-parameter
+        info(2, f"Cache used for decays, {decay_cached.cache_info()}")  # pylint:disable=no-value-for-parameter
 
     def nonel_scale(self, mother, scale="A"):
         """Returns the nonel cross section scaled by `scale`.
@@ -609,8 +600,8 @@ class CrossSectionBase(object, metaclass=ABCMeta):
 
         elif (mother, daughter) not in self._incl_tab:
             raise Exception(
-                self.__class__.__name__ + "::"
-                "({0},{1}) combination not in inclusive cross sections".format(
+                self.__class__.__name__
+                + "::({0},{1}) combination not in inclusive cross sections".format(
                     mother, daughter
                 )
             )

@@ -30,7 +30,9 @@ class SophiaSuperposition(CrossSectionBase):
         from prince_cr.data import db_handler
 
         info(2, "Load tabulated cross sections")
-        photo_nuclear_tables = db_handler.photo_meson_db("SOPHIA")
+        photo_nuclear_tables = db_handler.photo_meson_db(
+            "SOPHIA", e_range=config.cross_section_e_range
+        )
         info(2, "Loading SOPHIA cross sections from file.")
 
         egrid = photo_nuclear_tables["energy_grid"]
@@ -226,7 +228,7 @@ class SophiaSuperposition(CrossSectionBase):
         return self.egrid, csec_diff[:, self._range]
 
 
-class EmpiricalModel(SophiaSuperposition):
+class EmpiricalModel(SophiaSuperposition):  # pragma: no cover
     """Photomeson model based on empirical relations and experimental data.
     More info:  L. Morejon et al JCAP11(2019)007
     """
@@ -331,7 +333,7 @@ class EmpiricalModel(SophiaSuperposition):
         """Populates all tabs (_nonel_tab, _incl_tab, _incl_diff_tab) so they can work
         with the _optimize_indices() method of the base class (CrossSectionBase).
         """
-        from ._phenom_relations import multiplicity_table
+        from prince_cr._deprecated._phenom_relations import multiplicity_table
 
         self._nonel_tab = {100: (), 101: ()}
 

@@ -1,21 +1,21 @@
 """Module implementing relations from paper
 
-Functions implementing formulas from paper 
+Functions implementing formulas from paper
 http://stacks.iop.org/1402-4896/49/i=3/a=004
 and others, to construct the inclusive cross
 sections.
 """
+
 import itertools
-import sys
 from collections import Counter
 from os.path import join
 from pickle import load
 
-from numpy import array, exp, inf, linspace, sum
+from numpy import exp, inf, sum
 
 from prince_cr.util import get_AZN
 from prince_cr.data import spec_data
-from prince_cr.config import config
+from prince_cr import config
 
 # JH: This file gave some linter errors for me, disabled for now
 # pylint: skip-file
@@ -26,6 +26,7 @@ from prince_cr.config import config
 #             self.__setitem__(key, 0)
 
 #         return dict.__getitem__(self, key)
+
 
 # listing functions to create species tables
 def list_species_by_mass(Amax, tau=inf):
@@ -67,14 +68,11 @@ def combinations(x, y):
     """Returns possible combinations of nuclei with mass A<=4
     such that they contain x protons and y neutrons.
     """
-    ncos_id = int((x + y) * 100 + x)
     mass_partitions = partitions(x + y)
 
     for mass_partition in mass_partitions:
         mass_partition = [f for f in mass_partition if f > 1]
-        species = [
-            species_by_mass[Af] for Af in mass_partition if Af in species_by_mass
-        ]
+        species = [species_by_mass[Af] for Af in mass_partition if Af in species_by_mass]
         for c in list(itertools.product(*species)):
             _, z, n = get_AZN(sum(c))
             if (z <= x) and (n <= y):
@@ -91,7 +89,7 @@ def residual_multiplicities():
     spalled_nucleons = []
     for Am in species_by_mass:
         for mother in species_by_mass[Am]:
-            for A_big_frag in range(Am / 2, Am - 1):
+            for A_big_frag in range(Am // 2, Am - 1):
                 for big_frag in species_by_mass[A_big_frag]:
                     if big_frag % 100 > mother % 100:
                         continue
@@ -124,13 +122,26 @@ def residual_multiplicities():
 # local lookup tables for efficiency
 # species_by_mass = list_species_by_mass(56, config['tau_dec_threshold'])
 species_by_mass = list_species_by_mass(56, 0.0)
-# resmul = residual_multiplicities()
+
+# Try to load precomputed resmul, generate if missing
 small_frags_relative_yields_filename = join(
     config.data_dir, "small_frags_relative_yields.pkl"
 )
-with open(small_frags_relative_yields_filename, "rb") as f:
-    # it's faster to pickle.load a precomputed resmul
-    resmul = load(f, encoding="latin1")
+try:
+    with open(small_frags_relative_yields_filename, "rb") as f:
+        # it's faster to pickle.load a precomputed resmul
+        resmul = load(f, encoding="latin1")
+except FileNotFoundError:
+    # Generate the pickle file if it doesn't exist
+    print(
+        f"Generating {small_frags_relative_yields_filename} (this may take a few minutes)..."
+    )
+    resmul = residual_multiplicities()
+    from pickle import dump
+
+    with open(small_frags_relative_yields_filename, "wb") as f:
+        dump(resmul, f)
+    print(f"Saved residual multiplicities to {small_frags_relative_yields_filename}")
 
 
 # empirical relations from reference...
@@ -148,7 +159,7 @@ def cs_gpi(A):
     Returns:
         float -- Mean cross section in miliibarn
     """
-    return 0.027 * A ** 0.847
+    return 0.027 * A**0.847
 
 
 def cs_gn(A):
@@ -161,7 +172,7 @@ def cs_gn(A):
         A {int} -- Nucleon number of the target nucleus
     """
 
-    return 0.104 * A ** 0.81
+    return 0.104 * A**0.81
 
 
 def xm(A):
@@ -176,7 +187,7 @@ def xm(A):
     Returns:
         int -- Maximum number of neutrons to be produced
     """
-    return int(1.4 * A ** 0.457)
+    return int(1.4 * A**0.457)
 
 
 def cs_gxn(A, x=2):
@@ -193,8 +204,8 @@ def cs_gxn(A, x=2):
     """
 
     if 1 < x < xm(A):
-        k = 37.0 * A ** -0.924
-        return 0.187 * A ** 0.684 * exp(-k * (x - 1) ** 1.25)
+        k = 37.0 * A**-0.924
+        return 0.187 * A**0.684 * exp(-k * (x - 1) ** 1.25)
     else:
         return 0
 
@@ -231,7 +242,7 @@ def cs_gp(Z=1, **kwargs):
     if "A" in kwargs:
         return 0.078 * kwargs["A"] ** 0.5
     else:
-        return 0.115 * Z ** 0.5
+        return 0.115 * Z**0.5
 
 
 def cs_gSp(Z, A, x=1, y=1):
@@ -256,11 +267,11 @@ def cs_gSp(Z, A, x=1, y=1):
     C = 2.3 * a - 1.044
     E = 446.0 / A
     if E < 21.0:
-        cs_M = 15.7 / E ** 1.356
+        cs_M = 15.7 / E**1.356
     elif 21.0 < E:
         cs_M = 0.248
     if E < 10.0:
-        B = 3.03 / E ** 1.06
+        B = 3.03 / E**1.06
     elif E > 10.0:
         B = 0.25
 
@@ -274,7 +285,6 @@ def cs_gSp_all(Z, A):
     for A_big_frag in range(A / 2, A - 1):
         for big_frag in species_by_mass[A_big_frag]:
             _, x, y = get_AZN(mother - big_frag)
-            spalled_id = 100 * (x + y) + x
 
             if (x < 1) or (y < 1):
                 # in spallation at least a neutron and proton escape
@@ -289,12 +299,10 @@ def cs_gSp_all(Z, A):
 def cs_gSp_all_inA(A):
     """Cross section summed for all possible spallation events"""
     n = 0
-    cs_summed = 0
     cs_vals = []
     if A in species_by_mass:
         for nuc in species_by_mass[A]:
             A, Z, N = get_AZN(nuc)
-            cs_summed = cs_gSp_all(Z, A)
             cs_vals.append(cs_gSp_all(Z, A))
             n += 1
 
@@ -318,7 +326,7 @@ def cs_tot(A):
 
     cstot = csp + cspi + csn + csxn + csSpal
 
-    return cstot * cs_norm[A]
+    return cstot * cs_norm[A]  # noqa: F821
 
 
 #### inclusive cross sections derived from relations above, and related functions
@@ -360,7 +368,7 @@ def partition_probability(partition, A, beta=0.1):
     return combinations, yields
 
 
-def partition_probability(combinations, A, beta=0.1):
+def partition_probability_v2(combinations, A, beta=0.1):  # noqa: F811
     """Gives partitions probabilities as exp(-beta*Ei)
     where Ei is the sum of binding energies of the components of the partition.
 
@@ -452,9 +460,9 @@ def spallation_multiplicities(mother):
                 else:
                     incl_tab[dau] = cs_frag * resmul[spalled_id][dau]
     for dau in incl_tab:
-        incl_tab[
-            dau
-        ] /= cs_sum  # all spallation cross section should match total spallation cross section
+        incl_tab[dau] /= (
+            cs_sum  # all spallation cross section should match total spallation cross section
+        )
 
     return incl_tab
 
@@ -470,7 +478,7 @@ def cs_Rincl(Z, A, yields):
     """
     Amax = max(yields.keys())
     nuclist = [100, 101]
-    csilist = [cs_nincl(Z, A), cs_pincl(Z, A)]
+    csilist = [cs_nincl(Z, A), cs_pincl(Z, A)]  # noqa: F821
     sub_frags = {}
     for nz in range(0, int(Z / 2.0) + 1):
         for nn in range(0, int((A - Z) / 2.0) + 1):

@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prince_cr"
-version = "0.7.0"
+version = "0.8.0"
 description = "Cosmic ray PRopagation Including Nuclear Cascade equations"
 readme = "README.md"
 license = { text = "BSD 3-Clause License" }
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [
   { name = "Jonas Heinze" },
   { name = "Anatoli Fedynitch" }
@@ -28,6 +28,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "License :: OSI Approved :: BSD License",
   "License :: OSI Approved :: GNU Library or Lesser General Public License (LGPL)"
 ]
@@ -38,7 +39,7 @@ dependencies = [
   "h5py",
   "requests"
 ]
-optional-dependencies = { test = ["pytest", "matplotlib"] }
+optional-dependencies = { test = ["pytest", "pytest-xdist", "matplotlib"] }
 
 [tool.setuptools]
 include-package-data = true
@@ -63,7 +64,31 @@ filterwarnings = ["error::FutureWarning", "error::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 90
+
+[tool.ruff.lint]
 extend-ignore = ["E203"]
+
+[tool.coverage.run]
+source = ["prince_cr"]
+omit = [
+  "src/prince_cr/_deprecated/*",
+]
+
+[tool.coverage.report]
+omit = [
+  "src/prince_cr/_deprecated/*",
+]
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+  "if has_cupy:",
+  "if has_cuda:",
+  "import cupy",
+  "except ModuleNotFoundError:",
+  "@abc.abstractmethod",
+]
 
 [tool.pydocstyle]
 convention = "numpy"

@@ -124,7 +124,6 @@ class PhotoNuclearInteractionRate(object):
 
         # values for x and y to cut on:
         x_cut = config.x_cut
-        y_cut = config.y_cut
         x_cut_proton = config.x_cut_proton
 
         ibatch = 0
@@ -142,8 +141,7 @@ class PhotoNuclearInteractionRate(object):
                 intp_nonel = resp.nonel_intp[moid].antiderivative()
 
             if ((moid, daid) in self.cross_sections.known_bc_channels) or (
-                has_nonel
-                and (moid, daid) not in self.cross_sections.known_diff_channels
+                has_nonel and (moid, daid) not in self.cross_sections.known_diff_channels
             ):
                 has_incl = (moid, daid) in resp.incl_intp
                 if has_incl:
@@ -190,16 +188,11 @@ class PhotoNuclearInteractionRate(object):
             elif (moid, daid) in self.cross_sections.known_diff_channels:
                 has_redist = (moid, daid) in resp.incl_diff_intp
                 if has_redist:
-                    intp_diff = resp.incl_diff_intp[(moid, daid)]
                     intp_diff_integral = resp.incl_diff_intp_integral[(moid, daid)]
                     intp_nonel = resp.nonel_intp[moid]
                     intp_nonel_antid = resp.nonel_intp[moid].antiderivative()
-
-                    ymin = np.min(intp_diff.get_knots()[1])
                 else:
                     raise Exception("This should not occur.")
-
-                ibatch_bf = ibatch
                 # generate outer products using broadcasting
                 emo = ecr[:, None, None]
                 eda = ecr[None, :, None]
@@ -259,8 +252,7 @@ class PhotoNuclearInteractionRate(object):
                         intp_nonel_antid(yu[cuts][emoidx == edaidx])
                         - intp_nonel_antid(yl[cuts][emoidx == edaidx])
                     ) * (
-                        diff_fac[cuts][emoidx == edaidx]
-                        * int_fac[cuts][emoidx == edaidx]
+                        diff_fac[cuts][emoidx == edaidx] * int_fac[cuts][emoidx == edaidx]
                     )
 
                 # Finally write this to the batch matrix
@@ -348,7 +340,7 @@ class PhotoNuclearInteractionRate(object):
 
             if using_cupy:
                 if isinstance(self._batch_matrix, np.ndarray):
-                    self._init_coupling_mat(p)
+                    self._init_coupling_mat()
                 cupy.dot(
                     self._batch_matrix,
                     cupy.array(self.photon_vector(z), dtype=np.float32),
@@ -391,7 +383,8 @@ class PhotoNuclearInteractionRate(object):
             .diagonal()
         )
 
-        length = 1 / rate
+        with np.errstate(divide="ignore"):
+            length = 1 / rate
 
         self.photon_field = mem_pfield
         return egrid, length
@@ -515,8 +508,8 @@ class ContinuousPairProductionLossRate(object):
         Return value from cache if redshift value didn't change since last call.
         """
         photon_vector = np.zeros_like(self.photon_grid)
-        photon_vector.reshape(-1)[self.pg_desort] = (
-            self.photon_field.get_photon_density(self.pg_sorted, z)
+        photon_vector.reshape(-1)[self.pg_desort] = self.photon_field.get_photon_density(
+            self.pg_sorted, z
         )
 
         return photon_vector

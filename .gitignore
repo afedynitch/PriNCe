@@ -9,3 +9,12 @@ __pycache__
 *.egg-info
 sandbox_*
 build
+dist
+
+# Test and coverage
+.pytest_cache
+.coverage
+htmlcov
+coverage.xml
+.benchmarks
+.ruff_cache

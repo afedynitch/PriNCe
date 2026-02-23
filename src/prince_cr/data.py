@@ -1,4 +1,5 @@
 """Module inteded to contain some prince-specific data structures."""
+
 import pickle as pickle
 import os.path as path
 import numpy as np
@@ -12,11 +13,11 @@ import prince_cr.config as config
 #: Dictionary containing particle properties, like mass, charge
 #: lifetime or branching ratios
 try:
-    spec_data = pickle.load(open(path.join(config.data_dir, "particle_data.ppo"), "rb"))
+    with open(path.join(config.data_dir, "particle_data.ppo"), "rb") as _f:
+        spec_data = pickle.load(_f)
 except UnicodeDecodeError:
-    spec_data = pickle.load(
-        open(path.join(config.data_dir, "particle_data.ppo"), "rb"), encoding="latin1"
-    )
+    with open(path.join(config.data_dir, "particle_data.ppo"), "rb") as _f:
+        spec_data = pickle.load(_f, encoding="latin1")
 except FileNotFoundError:
     info(0, 'Warning, particle database "particle_data.ppo" file not found.')
 
@@ -33,8 +34,7 @@ UNITS_AND_CONVERSIONS_DEF = dict(
     cm2Mpc=1.0 / (spc.parsec * spc.mega * 1e2),
     Mpc2cm=spc.mega * spc.parsec * 1e2,
     m_proton=spc.physical_constants["proton mass energy equivalent in MeV"][0] * 1e-3,
-    m_electron=spc.physical_constants["electron mass energy equivalent in MeV"][0]
-    * 1e-3,
+    m_electron=spc.physical_constants["electron mass energy equivalent in MeV"][0] * 1e-3,
     r_electron=spc.physical_constants["classical electron radius"][0] * 1e2,
     fine_structure=spc.fine_structure,
     GeV2erg=1.0 / 624.15,
@@ -52,12 +52,13 @@ PRINCE_UNITS = convert_to_namedtuple(UNITS_AND_CONVERSIONS_DEF, "PriNCeUnits")
 
 class InterpolatorWrapper:
     """Wrapper class to make RegularGridInterpolator behave like interp2d."""
-    
+
     def __init__(self, rgi):
         self.rgi = rgi
-    
+
     def __call__(self, x, y):
         import numpy as np
+
         x, y = np.broadcast_arrays(x, y)
         points = np.column_stack([x.ravel(), y.ravel()])
         result = self.rgi(points)
@@ -75,7 +76,6 @@ class PrinceDB(object):
     """
 
     def __init__(self):
-
         info(2, "Opening HDF5 file", config.db_fname)
         self.prince_db_fname = path.join(config.data_dir, config.db_fname)
         if not path.isfile(self.prince_db_fname):
@@ -95,37 +95,82 @@ class PrinceDB(object):
             info(0, "Choose from:\n", "\n".join(available_models))
             raise Exception("Unknown selections.")
 
-    def photo_nuclear_db(self, model_tag):
+    @staticmethod
+    def _energy_slice(egrid, e_range):
+        """Compute a contiguous slice for the energy axis.
+
+        Args:
+            egrid (numpy.array): Full energy grid from the database.
+            e_range (tuple or None): ``(e_min, e_max)`` bounds. ``None``
+                means use the full grid.
+
+        Returns:
+            slice: A contiguous slice object for indexing the energy axis.
+        """
+        if e_range is None:
+            return slice(None)
+        e_min, e_max = e_range
+        mask = (egrid >= e_min) & (egrid <= e_max)
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            raise ValueError(
+                "e_range ({}, {}) selects no points from the energy grid [{}, {}]".format(
+                    e_min, e_max, egrid[0], egrid[-1]
+                )
+            )
+        return slice(int(idx[0]), int(idx[-1]) + 1)
+
+    def photo_nuclear_db(self, model_tag, e_range=None):
         info(10, "Reading photo-nuclear db. tag={0}".format(model_tag))
         db_entry = {}
         with h5py.File(self.prince_db_fname, "r") as prince_db:
             self._check_subgroup_exists(prince_db["photo_nuclear"], model_tag)
-            for entry in [
-                "energy_grid",
-                "fragment_yields",
-                "inel_mothers",
-                "inelastic_cross_sctions",
-                "mothers_daughters",
-            ]:
+            grp = prince_db["photo_nuclear"][model_tag]
+
+            # Read energy grid first to compute the slice
+            egrid_full = grp["energy_grid"][:]
+            sl = self._energy_slice(egrid_full, e_range)
+            db_entry["energy_grid"] = egrid_full[sl]
+
+            # Index arrays — no energy dimension
+            for entry in ["inel_mothers", "mothers_daughters"]:
                 info(10, "Reading entry {0} from db.".format(entry))
-                db_entry[entry] = prince_db["photo_nuclear"][model_tag][entry][:]
+                db_entry[entry] = grp[entry][:]
+
+            # Cross section arrays — energy is the last axis
+            for entry in ["inelastic_cross_sctions", "fragment_yields"]:
+                info(10, "Reading entry {0} from db.".format(entry))
+                db_entry[entry] = grp[entry][..., sl]
+
         return db_entry
 
-    def photo_meson_db(self, model_tag):
+    def photo_meson_db(self, model_tag, e_range=None):
         info(10, "Reading photo-nuclear db. tag={0}".format(model_tag))
         db_entry = {}
         with h5py.File(self.prince_db_fname, "r") as prince_db:
             self._check_subgroup_exists(prince_db["photo_nuclear"], model_tag)
-            for entry in [
-                "energy_grid",
-                "xbins",
-                "fragment_yields",
-                "inel_mothers",
-                "inelastic_cross_sctions",
-                "mothers_daughters",
-            ]:
+            grp = prince_db["photo_nuclear"][model_tag]
+
+            # Read energy grid first to compute the slice
+            egrid_full = grp["energy_grid"][:]
+            sl = self._energy_slice(egrid_full, e_range)
+            db_entry["energy_grid"] = egrid_full[sl]
+
+            # xbins and index arrays — no energy dimension
+            db_entry["xbins"] = grp["xbins"][:]
+            for entry in ["inel_mothers", "mothers_daughters"]:
                 info(10, "Reading entry {0} from db.".format(entry))
-                db_entry[entry] = prince_db["photo_nuclear"][model_tag][entry][:]
+                db_entry[entry] = grp[entry][:]
+
+            # inelastic_cross_sctions: shape (n_mothers, n_energy)
+            info(10, "Reading entry inelastic_cross_sctions from db.")
+            db_entry["inelastic_cross_sctions"] = grp["inelastic_cross_sctions"][:, sl]
+
+            # fragment_yields: shape (n_channels, n_energy, n_xbins)
+            # Energy is axis 1 (middle), not the last axis
+            info(10, "Reading entry fragment_yields from db.")
+            db_entry["fragment_yields"] = grp["fragment_yields"][:, sl, :]
+
         return db_entry
 
     def ebl_spline(self, model_tag, subset="base"):
@@ -141,18 +186,21 @@ class PrinceDB(object):
             x_coords = spl_gr["x"][:]
             y_coords = spl_gr["y"][:]
             z_values = spl_gr["z"][:]
-            
+
             # RegularGridInterpolator expects z_values to have shape (len(x_coords), len(y_coords))
             # If z_values needs transposing to match this requirement, do it
             if z_values.shape != (len(x_coords), len(y_coords)):
                 z_values = z_values.T
-            
+
             # Create the interpolator
             rgi = RegularGridInterpolator(
-                (x_coords, y_coords), z_values, 
-                method="linear", bounds_error=False, fill_value=0.0
+                (x_coords, y_coords),
+                z_values,
+                method="linear",
+                bounds_error=False,
+                fill_value=0.0,
             )
-            
+
             # Return wrapper that maintains interp2d interface and is picklable
             return InterpolatorWrapper(rgi)
 
@@ -211,7 +259,6 @@ class PrinceSpecies(object):
         return A, Z, A - Z
 
     def __init__(self, ncoid, princeidx, d):
-
         info(5, "Initializing new species", ncoid)
 
         #: Neucosma ID of particle
@@ -271,7 +318,7 @@ class PrinceSpecies(object):
                 self.is_baryon = True
                 self.is_nucleus = True
                 self.A, self.Z, self.N = self.calc_AZN(ncoid)
-            elif ncoid not in [2, 3, 4, 50]:
+            elif ncoid in [2, 3, 4, 50]:
                 self.is_hadron = True
                 self.is_meson = True
             else:
