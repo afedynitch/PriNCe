@@ -13,11 +13,11 @@ import prince_cr.config as config
 #: Dictionary containing particle properties, like mass, charge
 #: lifetime or branching ratios
 try:
-    spec_data = pickle.load(open(path.join(config.data_dir, "particle_data.ppo"), "rb"))
+    with open(path.join(config.data_dir, "particle_data.ppo"), "rb") as _f:
+        spec_data = pickle.load(_f)
 except UnicodeDecodeError:
-    spec_data = pickle.load(
-        open(path.join(config.data_dir, "particle_data.ppo"), "rb"), encoding="latin1"
-    )
+    with open(path.join(config.data_dir, "particle_data.ppo"), "rb") as _f:
+        spec_data = pickle.load(_f, encoding="latin1")
 except FileNotFoundError:
     info(0, 'Warning, particle database "particle_data.ppo" file not found.')
 

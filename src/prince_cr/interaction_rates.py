@@ -383,7 +383,8 @@ class PhotoNuclearInteractionRate(object):
             .diagonal()
         )
 
-        length = 1 / rate
+        with np.errstate(divide="ignore"):
+            length = 1 / rate
 
         self.photon_field = mem_pfield
         return egrid, length

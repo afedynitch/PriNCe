@@ -149,10 +149,12 @@ class UHECRPropagationResult(object):
 
         # get the average and variance by using the spectra as weights
         lnA = np.array([np.log(self.spec_man.ncoid2sref[el].A) for el in nco_ids])
-        average = (lnA[:, np.newaxis] * spectra).sum(axis=0) / spectra.sum(axis=0)
-        variance = (lnA[:, np.newaxis] ** 2 * spectra).sum(axis=0) / spectra.sum(
-            axis=0
-        ) - average**2
+        total = spectra.sum(axis=0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            average = (lnA[:, np.newaxis] * spectra).sum(axis=0) / total
+            variance = (lnA[:, np.newaxis] ** 2 * spectra).sum(
+                axis=0
+            ) / total - average**2
 
         return com_egrid, average, variance
 
