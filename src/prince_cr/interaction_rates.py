@@ -340,7 +340,7 @@ class PhotoNuclearInteractionRate(object):
 
             if using_cupy:
                 if isinstance(self._batch_matrix, np.ndarray):
-                    self._init_coupling_mat(p)  # noqa: F821
+                    self._init_coupling_mat()
                 cupy.dot(
                     self._batch_matrix,
                     cupy.array(self.photon_vector(z), dtype=np.float32),
