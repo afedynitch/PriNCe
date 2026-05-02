@@ -18,3 +18,6 @@ htmlcov
 coverage.xml
 .benchmarks
 .ruff_cache
+
+# Local-only worktrees
+.worktrees
