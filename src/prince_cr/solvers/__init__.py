@@ -1,11 +1,11 @@
 from .propagation import (
     UHECRPropagationResult,
-    UHECRPropagationSolverBDF,
+    UHECRPropagationSolverETD2,
     UHECRPropagationSolverEULER,
 )
 
 __all__ = [
     "UHECRPropagationResult",
-    "UHECRPropagationSolverBDF",
+    "UHECRPropagationSolverETD2",
     "UHECRPropagationSolverEULER",
 ]

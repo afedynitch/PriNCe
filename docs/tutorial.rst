@@ -50,13 +50,14 @@ Most settings need to be set before creating other objects, such as `PriNCeRun`
 Solving the Transport equation
 ..............................
 
-To solve the transport equation, create an instance of :class:`UHECRPropagationSolverBDF`::
+To solve the transport equation, create an instance of :class:`UHECRPropagationSolverETD2`::
 
-    from prince_cr.solvers import UHECRPropagationSolverBDF
-    solver = UHECRPropagationSolverBDF(initial_z=1., final_z = 0.,prince_run=prince_run,
+    from prince_cr.solvers import UHECRPropagationSolverETD2
+    solver = UHECRPropagationSolverETD2(initial_z=1., final_z = 0.,prince_run=prince_run,
                                     enable_pairprod_losses = True, enable_adiabatic_losses = True)
 
-This will use Backward Differentiation to solve the transport equation from redshift 1 to 0.
+This will use an exponential time-differencing RK2 (Cox–Matthews) integrator
+to solve the transport equation from redshift 1 to 0.
 The Switches can be used to enable or disable interactions. There are no UHECRs injected into the system yet.
 Add a source class by::
 

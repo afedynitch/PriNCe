@@ -53,10 +53,10 @@ ruff check src/prince_cr tests
    - Initializes cross sections, photon fields, interaction rates
    - Manages species list and system dimensions
 
-2. **Solver Stack (solvers/propagation.py)**:
-   - `UHECRPropagationSolver`: Base solver with derivative computation
-   - `UHECRPropagationSolverBDF`: Backward differentiation formula integrator (recommended)
-   - `UHECRPropagationSolverEULER`: Simple Euler stepper for testing
+2. **Solver Stack (solvers/propagation.py + solvers/etd2.py)**:
+   - `UHECRPropagationSolver`: Base solver with RHS / linear-operator construction
+   - `UHECRPropagationSolverETD2`: Exponential time-differencing RK2 (Cox–Matthews) integrator (recommended)
+   - `UHECRPropagationSolverEULER`: Simple Euler stepper for testing / debugging
    - `UHECRPropagationResult`: Container for propagation results with analysis methods
 
 3. **Physics Modules**:
@@ -76,9 +76,11 @@ ruff check src/prince_cr tests
 
 ### Key Design Patterns
 
-**Jacobian Matrix Construction**: The interaction rates module builds a sparse CSR matrix representing all photo-nuclear interactions. The matrix is recomputed only when redshift changes significantly (controlled by `config.update_rates_z_threshold`).
+**Jacobian Matrix Construction**: The interaction rates module builds a sparse CSR matrix representing all photo-nuclear interactions. The matrix is recomputed only when redshift changes significantly (controlled by `config.update_rates_z_threshold`). The CSR sparsity pattern is set once at init and only `coupling_mat.data` is overwritten in place — this contract must be preserved by any custom solver.
 
-**Semi-Lagrangian Solver**: Continuous energy losses (adiabatic expansion, pair production) are handled separately from discrete interactions using semi-Lagrangian interpolation methods. Multiple interpolation schemes are available via `config.semi_lagr_method` (linear, quadratic, cubic, 4th/5th order Lagrange weights).
+**ETD2 integrator**: The default `UHECRPropagationSolverETD2` (`solvers/etd2.py`) treats the diagonal of `L(z) = J(z) + dl/dz · D · diag(κ(z))` exactly via `exp(h · diag(L))` and the off-diagonal block with two SpMVs per stage (4 SpMVs / step). The expensive photo-hadronic rate matrix is cached at the `update_rates_z_threshold`; the cheap `dl/dz`, `κ(z)`, and source `b(z)` pieces are recomputed every step. Source term enters via the same φ₁/φ₂ machinery, frozen at step start to preserve 2nd order. See `solvers/etd2.py` for the kernel.
+
+**Continuous-loss FD operator**: `DifferentialOperator` (`solvers/partial_diff.py`) is a sparse 4th-order one-sided FD operator on log-E, left-multiplied by `diag(1/E)` and `block_diag`-replicated across species so a single SpMV `D · (κ⊙n)` handles all species simultaneously. Centered rows use `[-3, -10, 18, -6, 1]/(12·h)` (asymmetric, upwind-biased toward higher energies); the first/last three rows fall back to 3- and 4-point one-sided stencils (only 2nd-order at the edges). At production grid (8 bins/decade) the centered-row error is ≲ 1.5 % even for `α = -3` — see `tests/test_stencil_accuracy.py` for the audit.
 
 **Batch Matrix Computation**: Interaction rates are computed in batches across the photon energy grid, then integrated to produce the final rate matrix. This design optimizes memory access patterns.
 
@@ -95,7 +97,7 @@ The `config.py` module uses module-level globals for configuration. Key settings
 
 - **Grids**: `cosmic_ray_grid`, `photon_grid` - tuple format (log10_Emin, log10_Emax, nbins_per_decade)
 - **Physics**: `tau_dec_threshold` (decay lifetime cutoff), `max_mass` (maximum nuclear mass), `secondaries` (include photons/neutrinos)
-- **Numerics**: `update_rates_z_threshold`, `semi_lagr_method`, `linear_algebra_backend`
+- **Numerics**: `update_rates_z_threshold`, `linear_algebra_backend`
 - **Debug**: `debug_level` (0=silent, higher=more verbose)
 
 The configuration is read at import time and can be modified before creating a `PriNCeRun` instance.
@@ -128,7 +130,9 @@ The database download is handled automatically by `config.py` on first import.
 
 4. **Index Mapping**: `SpeciesManager` provides `lidx()`/`uidx()` for grid indices and `lbin()`/`ubin()` for bin edges. These are critical for slicing state vectors correctly.
 
-5. **Matrix Updates**: The Jacobian is cached and only updated when `|z - z_cached| > threshold`. Forgetting this can cause stale rates in custom solvers.
+5. **Matrix Updates**: The Jacobian is cached and only updated when `|z - z_cached| > threshold`. Forgetting this can cause stale rates in custom solvers. The update path overwrites `coupling_mat.data` in place — never reassign the matrix or rebuild it, or you break the sparsity-pattern contract relied on by all SpMV backends. The ETD2 path additionally caches the diagonal/off-diagonal split of the un-scaled photo-hadronic matrix (`_etd2_M_raw_off`) and refreshes it together with the underlying rate cache.
+
+6. **Solver wall-clock**: ETD2 with default settings completes the realistic AugerFitSource case (z=1→0, dz=1e-3, production grid 91 species × 88 E-bins) in ~6 s on a laptop. Tightening `recomp_z_threshold` below the default 0.01 cuts the per-cache-window systematic at proportional wall-clock cost; the `tests/conftest.py::baseline_state` fixture uses `thr=1e-3, dz=2e-4` (~50 s) for the regression reference.
 
 ## Platform Notes
 
