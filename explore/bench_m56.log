@@ -1,0 +1,23 @@
+CUPY not found for GPU support. Degrading to MKL.
+MKL runtime not found. Degrading to scipy.
+=== bench max_mass=56 cr_grid=(3.0, 14.0, 8) ph_grid=(-15.0, -6.0, 8) ===
+
+Building photon field + cross sections (shared across runs)...
+  setup done in 9.6s  (species=93, bc=2892, diff=840)
+
+[legacy] building PriNCeRun...
+PhotoNuclearInteractionRate::_init_coupling_mat(): Initiating coupling matrix in (CSR) format
+[legacy] _init_matrices: 61.80s  RSS_delta=+2693.7 MB  batch_matrix=1720512×72 (991.0 MB)
+
+[toeplitz] building PriNCeRun...
+PhotoNuclearInteractionRate::_init_coupling_mat(): Initiating coupling matrix in (CSR) format
+[toeplitz] _init_matrices: 4.80s  RSS_delta=+112.4 MB  batch_matrix=1720512×72 (991.0 MB)
+
+=== summary ===
+    method      init [s]      RSS Δ [MB]        batch rows      batch [MB]
+    ------      --------      ----------        ----------      ----------
+    legacy         61.80         +2693.7         1,720,512           991.0
+  toeplitz          4.80          +112.4         1,720,512           991.0
+
+speedup (legacy/toeplitz init time): 12.87×
+transient RSS reduction: legacy needed 2694 MB, toeplitz needed 112 MB  (23.96× less)

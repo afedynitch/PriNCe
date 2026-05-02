@@ -1,0 +1,26 @@
+CUPY not found for GPU support. Degrading to MKL.
+MKL runtime not found. Degrading to scipy.
+=== profile max_mass=56 cr_grid=(3.0, 14.0, 8) ph_grid=(-15.0, -6.0, 8) ===
+[photon_field]   0.00s  RSS_delta=   +0.6 MB  RSS=   84.2 MB
+[cross_sections.__init__ (table load + reduction)]   6.82s  RSS_delta=+1939.9 MB  RSS= 2024.1 MB
+  known_species:       93
+  known_bc_channels:   2892
+  known_diff_channels: 840
+[ResponseFunction (.resp first access)]   3.09s  RSS_delta= +275.5 MB  RSS= 2299.6 MB
+  nonel_intp:               84 splines
+  incl_intp:                2809 splines
+  incl_diff_intp:           840 2D splines
+  incl_diff_intp_integral:  840 2D splines (antideriv)
+  pickle sizes (MB): nonel=2.9  incl=69.3  incl_diff=550.9  incl_diff_integral=550.9
+PhotoNuclearInteractionRate::_init_coupling_mat(): Initiating coupling matrix in (CSR) format
+[PriNCeRun.__init__ (incl. _init_matrices)]  63.57s  RSS_delta=+1926.5 MB  RSS= 5350.9 MB
+  dim_states:        8008
+  cr_grid.d:         88
+  ph_grid.d:         72
+  batch_matrix:      shape=(1720512, 72)  bytes=991.0 MB
+  batch_rows:        (1720512,)  bytes=13.8 MB
+  batch_cols:        (1720512,)  bytes=13.8 MB
+  coupling_mat nnz:  1720512  data_bytes=13.8 MB
+  rows attributable to bc channels:   254496
+  rows attributable to diff channels: 1466016
+  diff rows / dcr^2 (avg per channel): 0.225

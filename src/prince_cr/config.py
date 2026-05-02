@@ -123,6 +123,14 @@ ignore_particles = [
 # Update rates at not more frequently than this value in z
 update_rates_z_threshold = 0.01
 
+# Kernel construction method for `_init_matrices`:
+#   "toeplitz" — exploits log-grid structure, ~5–14× faster init, ~3× smaller peak RSS,
+#                produces the same dense `_batch_matrix` (machine-epsilon agreement).
+#                Requires CR and photon grids to share the same bins/decade.
+#   "legacy"   — original dense (dcr, dph) / (dcr, dcr, dph) intermediate tensors.
+#                Kept for benchmarking and as a fallback if grids have different log-steps.
+kernel_method = "toeplitz"
+
 # #Number of MKL threads (for sparse matrix multiplication the performance
 # #advantage from using more than a few threads is limited by memory bandwidth)
 MKL_threads = 32

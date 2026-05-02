@@ -113,6 +113,15 @@ The `indices`/`indptr` arrays are never touched, so any custom solver must prese
 
 **Batch Matrix Computation**: Interaction rates are computed in batches across the photon energy grid, then integrated to produce the final rate matrix. This design optimizes memory access patterns.
 
+**Kernel Construction (`_init_matrices`)**: Two paths are available, selected by `config.kernel_method` (default `"toeplitz"`):
+
+- `"toeplitz"` exploits the fact that with log-spaced CR and photon grids sharing the same bins/decade, every integration corner `y = b_ph[j] · E_mo[i_mo] / m_p` and `x = b_cr[i_da] / E_mo[i_mo]` lies on a 1D log-grid indexed by `(i_mo + j)` and `(i_da - i_mo)` respectively. Each response spline is sampled **once** on a length-`(dcr+dph)` y-grid (1D) or a `(dcr+dph) × 2 dcr` (y, x) outer-product grid (2D); per-channel tiles are then assembled by integer-index lookup. The prefactor `int_fac · diff_fac` simplifies algebraically to `m_p / E_mo[i_mo]` (bc) or that times `Δec[i_mo] / Δec[i_da]` (diff) — never materialised as full (dcr, dph) tensors. Measured on the production grid: 13–14× faster `_init_matrices` and 24–37× lower transient RSS (max_mass=14: 11.6 → 0.85 s; max_mass=56: 61.8 → 4.8 s, transient RSS 2.7 GB → 112 MB).
+- `"legacy"` evaluates each spline at every (i_mo, i_da, j) corner via dense (dcr, dph) / (dcr, dcr, dph) intermediates. Kept for benchmarking and for cases where the CR and photon grids intentionally use different bins/decade.
+
+When `kernel_method = "toeplitz"`, `_assert_log_grids_compatible` runs at init and **raises a `RuntimeError`** if `cosmic_ray_grid` and `photon_grid` (or the CR center/edge log-steps) do not all share the same bins/decade. There is no silent fallback: mismatched grids would silently produce wrong rates, so the user must either align the grids or explicitly switch to `"legacy"`.
+
+The two paths produce the same `_batch_matrix` to machine precision and the same downstream `coupling_mat` (verified by `tests/test_kernel_toeplitz.py`). The Phase-1 implementation in this branch keeps `_batch_matrix` dense — persistent storage is unchanged. Storage savings (per-channel Toeplitz form, lazy expansion in `_update_rates`) are a separate Phase 2 not yet implemented.
+
 **Linear Algebra Backends**: The code supports three backends for sparse matrix operations:
 - `"scipy"`: Standard numpy/scipy (always available)
 - `"MKL"`: Intel MKL for CPU acceleration (auto-detected)

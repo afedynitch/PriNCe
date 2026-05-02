@@ -95,7 +95,258 @@ class PhotoNuclearInteractionRate(object):
         info(3, "Memory usage: {0} MB".format(self._batch_matrix.nbytes / 1024**2))
 
     def _init_matrices(self):
-        """A new take on filling the matrices"""
+        """Build `_batch_matrix` and the row/col index arrays.
+
+        Two paths are available, selected by `config.kernel_method`:
+
+        - "toeplitz" (default): exploits the fact that the integration corners
+          fall on a 1D log-y grid (bc channels) or a 2D log-(y,x) grid (diff
+          channels) when the CR and photon grids share the same bins/decade.
+          Each response spline is sampled once on this small structured grid,
+          and the per-channel tile is filled by integer-index lookup. The grid
+          assumption is checked at init: a `RuntimeError` is raised when the
+          CR-grid centers, CR-grid bin edges, and photon-grid bin edges do not
+          all share the same log-step.
+
+        - "legacy": original implementation that builds full (dcr, dph) /
+          (dcr, dcr, dph) intermediate tensors and evaluates each spline at
+          every corner. Kept for benchmarking and for grids that intentionally
+          use different log-steps.
+
+        Both paths produce the same `_batch_matrix` to machine precision; the
+        sparsity-pattern contract (lex-sorted rows/cols) is established by
+        `_init_coupling_mat` afterwards regardless of the path.
+        """
+        method = getattr(config, "kernel_method", "toeplitz")
+        if method == "toeplitz":
+            self._assert_log_grids_compatible()
+            self._init_matrices_toeplitz()
+        elif method == "legacy":
+            self._init_matrices_legacy()
+        else:
+            raise ValueError(
+                f"config.kernel_method = {method!r}; expected 'toeplitz' or 'legacy'."
+            )
+
+    def _assert_log_grids_compatible(self):
+        """Verify that CR-grid centers, CR-grid bin edges, and photon-grid bin
+        edges all share the same log-step. The Toeplitz kernel path relies on
+        this assumption; mismatched grids would silently produce wrong rates.
+        Raises RuntimeError on mismatch.
+        """
+        ecr = self.e_cosmicray.grid
+        bcr = self.e_cosmicray.bins
+        bph = self.e_photon.bins
+        if ecr.size < 2 or bcr.size < 2 or bph.size < 2:
+            raise RuntimeError(
+                "Toeplitz kernel requires at least 2 grid points in each axis "
+                f"(got dcr={ecr.size}, bcr={bcr.size}, bph={bph.size})."
+            )
+        s_ecr = np.log10(ecr[1] / ecr[0])
+        s_bcr = np.log10(bcr[1] / bcr[0])
+        s_bph = np.log10(bph[1] / bph[0])
+        if not (np.isclose(s_ecr, s_bcr) and np.isclose(s_ecr, s_bph)):
+            cr_bpd = self.e_cosmicray.d / np.log10(
+                self.e_cosmicray.bins[-1] / self.e_cosmicray.bins[0]
+            )
+            ph_bpd = self.e_photon.d / np.log10(
+                self.e_photon.bins[-1] / self.e_photon.bins[0]
+            )
+            raise RuntimeError(
+                "Toeplitz kernel requires the cosmic-ray and photon grids to "
+                "share the same bins-per-decade (log-step). "
+                f"Got cr~{cr_bpd:.3f} bins/decade, ph~{ph_bpd:.3f} bins/decade "
+                f"(log-steps: cr_centers={s_ecr:.6f}, cr_bins={s_bcr:.6f}, "
+                f"ph_bins={s_bph:.6f}). "
+                "Either align config.cosmic_ray_grid and config.photon_grid on "
+                "the same bins/decade, or set config.kernel_method='legacy'."
+            )
+
+    def _init_matrices_toeplitz(self):
+        """Toeplitz/log-grid kernel construction.
+
+        For each channel `(mo, da)`:
+          - bc:    B[i_mo, j] = (m_p/E_mo[i_mo]) · ΔR̂[i_mo + j]
+          - diff:  B[i_mo, i_da, j] = (m_p/E_mo[i_mo]) · (Δec[i_mo]/Δec[i_da])
+                                      · ΔΔR̂[i_mo + j, i_da - i_mo + (dcr - 1)]
+
+        Each response spline is sampled once: 1D antiderivatives on a length
+        (dcr + dph) log-y grid; 2D antiderivatives on a (dcr + dph) × (2 dcr)
+        outer-product grid. The final dense tile is built by integer-index
+        broadcasting and stuffed into `_batch_matrix` exactly as the legacy
+        path does. Downstream (`_init_coupling_mat`) is unchanged.
+        """
+        spec_man = self.spec_man
+        sp_id_ref = spec_man.ncoid2sref
+        resp = self.cross_sections.resp
+        m_pr = PRINCE_UNITS.m_proton
+
+        ecr = self.e_cosmicray.grid
+        bcr = self.e_cosmicray.bins
+        bph = self.e_photon.bins
+        dcr = self.e_cosmicray.d
+        dph = self.e_photon.d
+        delta_ec = self.e_cosmicray.widths
+
+        # ----- log-grid construction -----
+        log_step = np.log10(ecr[1] / ecr[0])
+        # 1D y-grid: y[k] = ecr[0] * bph[0] / m_p · 10^(k δ), k = 0..dcr+dph-1
+        y0 = ecr[0] * bph[0] / m_pr
+        y_grid = y0 * 10 ** (np.arange(dcr + dph) * log_step)
+        # 1D x-grid for diff channels: covers (i_da - i_mo) ∈ [-(dcr-1), dcr-1]
+        # plus +1 offset for x_u, so length 2*dcr. Index offset is (dcr-1).
+        x0 = bcr[0] / ecr[0]
+        x_grid = x0 * 10 ** ((np.arange(2 * dcr) - (dcr - 1)) * log_step)
+
+        # ----- prefactors -----
+        factor_mo = m_pr / ecr  # shape (dcr,) — used by bc and diagonal nonel
+        # factor_diff[i_mo, i_da] = (m_p/ecr[i_mo]) · (delta_ec[i_mo]/delta_ec[i_da])
+        factor_diff = factor_mo[:, None] * (delta_ec[:, None] / delta_ec[None, :])
+
+        # ----- index arrays for tile assembly -----
+        i_idx = np.arange(dcr)
+        j_idx = np.arange(dph)
+        # A[i_mo, j] = i_mo + j  ∈ [0, dcr+dph-2]   (index into ΔR̂ / a-axis of ΔΔR̂)
+        A_2d = i_idx[:, None] + j_idx[None, :]
+        # B_idx[i_mo, i_da] = (i_da - i_mo) + (dcr - 1)  ∈ [0, 2 dcr - 2]
+        B_idx = (i_idx[None, :] - i_idx[:, None]) + (dcr - 1)
+
+        # ----- pre-sample 1D antiderivatives once -----
+        # nonel: dict[mo] → ΔR̂_nonel of length (dcr+dph-1)
+        nonel_dR = {}
+        for mo, intp in resp.nonel_intp.items():
+            R = intp.antiderivative()(y_grid)
+            nonel_dR[mo] = np.diff(R)
+        # incl (boost-conserving): dict[(mo,da)] → ΔR̂_incl of length (dcr+dph-1)
+        incl_dR = {}
+        for key, intp in resp.incl_intp.items():
+            R = intp.antiderivative()(y_grid)
+            incl_dR[key] = np.diff(R)
+
+        # ----- pre-sample 2D antiderivatives once -----
+        # diff: dict[(mo,da)] → ΔΔR̂ of shape (dcr+dph-1, 2*dcr-1)
+        diff_ddR = {}
+        if resp.incl_diff_intp_integral:
+            Y2d, X2d = np.meshgrid(y_grid, x_grid, indexing="ij")
+            Yflat, Xflat = Y2d.ravel(), X2d.ravel()
+            shape2d = Y2d.shape
+            for key, intp2d in resp.incl_diff_intp_integral.items():
+                R = intp2d.ev(Xflat, Yflat).reshape(shape2d)
+                ddR = R[1:, 1:] - R[1:, :-1] - R[:-1, 1:] + R[:-1, :-1]
+                diff_ddR[key] = ddR
+
+        # ----- iterate channels and fill _batch_matrix -----
+        x_cut = config.x_cut
+        x_cut_proton = config.x_cut_proton
+
+        # x_l(i_mo, i_da) = bcr[i_da] / ecr[i_mo] depends on (i_da - i_mo) only;
+        # precompute a (dcr, dcr) array once.
+        xl_2d = bcr[:-1][None, :] / ecr[:, None]  # shape (dcr, dcr)
+
+        ibatch = 0
+        emo_idcs = np.arange(dcr)
+        eda_idcs = np.arange(dcr)
+        # i_mo grid for diagonal-nonel handling in diff channels
+        diag = np.arange(dcr)
+
+        # Match the legacy iteration order so debug prints align; it doesn't
+        # affect the final matrix because `_init_coupling_mat` lex-sorts.
+        known_species_rev = spec_man.known_species[::-1]
+        import itertools
+
+        for moid, daid in itertools.product(known_species_rev, known_species_rev):
+            if moid < 100:
+                continue
+
+            has_nonel = moid == daid
+            in_bc = (moid, daid) in self.cross_sections.known_bc_channels
+            in_diff = (moid, daid) in self.cross_sections.known_diff_channels
+
+            if in_bc or (has_nonel and not in_diff):
+                # ---- bc channel branch ----
+                has_incl = (moid, daid) in incl_dR
+                if not (has_nonel or has_incl):
+                    raise Exception("Channel without interactions:", (moid, daid))
+
+                # Tile = factor_mo[i_mo] · ΔR̂[A_2d[i_mo, j]]
+                tile = np.zeros((dcr, dph))
+                if has_incl:
+                    tile += factor_mo[:, None] * incl_dR[(moid, daid)][A_2d]
+                if has_nonel:
+                    tile -= factor_mo[:, None] * nonel_dR[moid][A_2d]
+
+                self._batch_matrix[ibatch:ibatch + dcr, :] = tile
+                ibatch += dcr
+                self._batch_rows.append(sp_id_ref[daid].lidx() + eda_idcs)
+                self._batch_cols.append(sp_id_ref[moid].lidx() + emo_idcs)
+
+            elif in_diff:
+                # ---- diff channel branch ----
+                if (moid, daid) not in diff_ddR:
+                    raise Exception("incl_diff_intp_integral missing for", (moid, daid))
+
+                ddR = diff_ddR[(moid, daid)]  # shape (dcr+dph-1, 2*dcr-1)
+
+                # Compute the (dcr, dcr, dph) tile via fancy indexing.
+                # res[i_mo, i_da, j] = factor_diff[i_mo, i_da] · ddR[A_2d[i_mo,j], B_idx[i_mo, i_da]]
+                res = factor_diff[:, :, None] * ddR[
+                    A_2d[:, None, :],     # (dcr, 1, dph) — i_mo + j
+                    B_idx[:, :, None],    # (dcr, dcr, 1) — i_da - i_mo + dcr-1
+                ]
+
+                # Apply the `res<0` clip BEFORE nonel subtraction (matches legacy)
+                np.clip(res, 0.0, None, out=res)
+
+                # Diagonal nonel subtraction (only when mo==da)
+                if has_nonel:
+                    nonel_tile = factor_mo[:, None] * nonel_dR[moid][A_2d]
+                    # Subtract on the diagonal i_mo == i_da
+                    res[diag, diag, :] -= nonel_tile
+
+                # x-cut filter (depends only on (i_mo, i_da))
+                cut_low = x_cut_proton if daid == 101 else x_cut
+                cuts2d = np.logical_and(xl_2d >= cut_low, xl_2d <= 1)
+
+                # Extract kept rows and the corresponding (row, col) indices
+                kept = res[cuts2d]  # shape (n_kept, dph)
+                n_kept = kept.shape[0]
+                if n_kept == 0:
+                    continue
+
+                # Row index = sp_id_ref[daid].lidx() + i_da; column = sp_id_ref[moid].lidx() + i_mo
+                # Build the same (i_mo, i_da) grid used for the cut.
+                imo_grid, ida_grid = np.meshgrid(emo_idcs, eda_idcs, indexing="ij")
+                rows = sp_id_ref[daid].lidx() + ida_grid[cuts2d]
+                cols = sp_id_ref[moid].lidx() + imo_grid[cuts2d]
+
+                self._batch_matrix[ibatch:ibatch + n_kept, :] = kept
+                ibatch += n_kept
+                self._batch_rows.append(rows)
+                self._batch_cols.append(cols)
+
+            else:
+                info(20, "Species combination not included in model", moid, daid)
+
+        self._batch_matrix = self._batch_matrix[:ibatch, :]
+        self._batch_rows = np.concatenate(self._batch_rows, axis=None)
+        self._batch_cols = np.concatenate(self._batch_cols, axis=None)
+        self._batch_vec = np.zeros(ibatch)
+
+        info(2, f"Batch matrix shape: {self._batch_matrix.shape}")
+        info(2, f"Batch rows shape: {self._batch_rows.shape}")
+        info(2, f"Batch cols shape: {self._batch_cols.shape}")
+        info(2, f"Batch vector shape: {self._batch_vec.shape}")
+
+        memory = (
+            self._batch_matrix.nbytes
+            + self._batch_rows.nbytes
+            + self._batch_cols.nbytes
+            + self._batch_vec.nbytes
+        ) / 1024**2
+        info(3, "Memory usage after initialization: {:} MB".format(memory))
+
+    def _init_matrices_legacy(self):
+        """Legacy dense-tensor kernel construction. Kept for benchmarking."""
 
         # Define some short-cuts
         known_species = self.spec_man.known_species[::-1]
