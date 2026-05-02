@@ -31,9 +31,6 @@ class TestConfigConstants:
     def test_grid_scale(self):
         assert config.grid_scale in ["E", "logE"]
 
-    def test_semi_lagr_method(self):
-        assert isinstance(config.semi_lagr_method, str)
-
     def test_data_dir_exists(self):
         import os
 

@@ -7,7 +7,7 @@ from prince_cr.data import PRINCE_UNITS, EnergyGrid
 from prince_cr.util import info
 import prince_cr.config as config
 
-from .partial_diff import DifferentialOperator, SemiLagrangianSolver
+from .partial_diff import DifferentialOperator
 
 
 class UHECRPropagationResult(object):
@@ -215,7 +215,6 @@ class UHECRPropagationSolver(object):
         self.diff_operator = DifferentialOperator(
             prince_run.cr_grid, prince_run.spec_man.nspec
         ).operator
-        self.semi_lag_solver = SemiLagrangianSolver(prince_run.cr_grid)
 
         # Configuration of BLAS backend
         self.using_cupy = False
@@ -280,120 +279,6 @@ class UHECRPropagationSolver(object):
             self.jacobian.data *= 0.0
 
         self.last_hadr_jac = None
-
-    def semi_lagrangian(self, delta_z, z, state):
-        z = z - self.z_offset
-
-        # if no continuous losses are enables, just return the state.
-        if not self.enable_adiabatic_losses and not self.enable_pairprod_losses:
-            return state
-
-        conloss = np.zeros_like(self.adia_loss_rates_bins.energy_vector)
-        if self.enable_adiabatic_losses:
-            conloss += self.adia_loss_rates_bins.loss_vector(z)
-        if self.enable_pairprod_losses:
-            conloss += self.pair_loss_rates_bins.loss_vector(z)
-        conloss *= self.dldz(z) * delta_z
-
-        method = config.semi_lagr_method
-
-        # -------------------------------------------------------------------
-        # numpy interpolator
-        # -------------------------------------------------------------------
-        if method == "intp_numpy":
-            for spec in self.spec_man.species_refs:
-                lbin, ubin = spec.lbin(), spec.ubin()
-                lidx, uidx = spec.lidx(), spec.uidx()
-                state[lidx:uidx] = self.semi_lag_solver.interpolate(
-                    conloss[lbin:ubin], state[lidx:uidx]
-                )
-        # -------------------------------------------------------------------
-        # local gradient interpolation
-        # -------------------------------------------------------------------
-        elif method == "gradient":
-            for spec in self.spec_man.species_refs:
-                lbin, ubin = spec.lbin(), spec.ubin()
-                lidx, uidx = spec.lidx(), spec.uidx()
-                state[lidx:uidx] = self.semi_lag_solver.interpolate_gradient(
-                    conloss[lbin:ubin], state[lidx:uidx]
-                )
-
-        # -------------------------------------------------------------------
-        # linear lagrange weigts
-        # -------------------------------------------------------------------
-        elif method == "linear":
-            for spec in self.spec_man.species_refs:
-                lbin, ubin = spec.lbin(), spec.ubin()
-                lidx, uidx = spec.lidx(), spec.uidx()
-                state[lidx:uidx] = self.semi_lag_solver.interpolate_linear_weights(
-                    conloss[lbin:ubin], state[lidx:uidx]
-                )
-
-        # -------------------------------------------------------------------
-        # quadratic lagrange weigts
-        # -------------------------------------------------------------------
-        elif method == "quadratic":
-            for spec in self.spec_man.species_refs:
-                lbin, ubin = spec.lbin(), spec.ubin()
-                lidx, uidx = spec.lidx(), spec.uidx()
-                state[lidx:uidx] = self.semi_lag_solver.interpolate_quadratic_weights(
-                    conloss[lbin:ubin], state[lidx:uidx]
-                )
-
-        # -------------------------------------------------------------------
-        # cubic lagrange weigts
-        # -------------------------------------------------------------------
-        elif method == "cubic":
-            for spec in self.spec_man.species_refs:
-                lbin, ubin = spec.lbin(), spec.ubin()
-                lidx, uidx = spec.lidx(), spec.uidx()
-                state[lidx:uidx] = self.semi_lag_solver.interpolate_cubic_weights(
-                    conloss[lbin:ubin], state[lidx:uidx]
-                )
-
-        # -------------------------------------------------------------------
-        # 4th order lagrange weigts
-        # -------------------------------------------------------------------
-        elif method == "4th_order":
-            for spec in self.spec_man.species_refs:
-                lbin, ubin = spec.lbin(), spec.ubin()
-                lidx, uidx = spec.lidx(), spec.uidx()
-                state[lidx:uidx] = self.semi_lag_solver.interpolate_4thorder_weights(
-                    conloss[lbin:ubin], state[lidx:uidx]
-                )
-
-        # -------------------------------------------------------------------
-        # 5th order lagrange weigts
-        # -------------------------------------------------------------------
-        elif method == "5th_order":
-            for spec in self.spec_man.species_refs:
-                lbin, ubin = spec.lbin(), spec.ubin()
-                lidx, uidx = spec.lidx(), spec.uidx()
-                state[lidx:uidx] = self.semi_lag_solver.interpolate_5thorder_weights(
-                    conloss[lbin:ubin], state[lidx:uidx]
-                )
-
-        # -------------------------------------------------------------------
-        # finite diff euler steps
-        # -------------------------------------------------------------------
-        elif method == "finite_diff":
-            conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
-            if self.enable_adiabatic_losses:
-                conloss += self.adia_loss_rates_grid.loss_vector(z)
-            if self.enable_pairprod_losses:
-                conloss += self.pair_loss_rates_grid.loss_vector(z)
-
-            state[:] = state + self.dldz(z) * delta_z * self.diff_operator.dot(
-                conloss * state
-            )
-
-        # -------------------------------------------------------------------
-        # if method was not in list before, raise an Expection
-        # -------------------------------------------------------------------
-        else:
-            raise Exception("Unknown semi-lagrangian method ({:})".format(method))
-
-        return state
 
     def eqn_deriv_standard(self, z, state, *args):
         z = z - self.z_offset
@@ -515,126 +400,6 @@ class UHECRPropagationSolver(object):
         return res
 
 
-class UHECRPropagationSolverBDF(UHECRPropagationSolver):
-    def __init__(self, *args, **kwargs):
-        self.atol = kwargs.pop("atol", 1e40)
-        self.rtol = kwargs.pop("rtol", 1e-10)
-        super(UHECRPropagationSolverBDF, self).__init__(*args, **kwargs)
-
-    def _init_solver(self, dz):
-        initial_state = np.zeros(self.dim_states)
-
-        self._update_jacobian(self.initial_z)
-        self.current_z_rates = self.initial_z
-
-        # find the maximum injection and reduce the system by this
-        self.red_idx = np.nonzero(self.injection(1.0, 0.0))[0].max()
-
-        # Convert csr_matrix from GPU to scipy
-        try:
-            sparsity = self.had_int_rates.get_hadr_jacobian(self.initial_z, 1.0).get()
-        except AttributeError:
-            sparsity = self.had_int_rates.get_hadr_jacobian(self.initial_z, 1.0)
-
-        from prince_cr.util import PrinceBDF
-
-        self.r = PrinceBDF(
-            self.eqn_derivative,
-            self.initial_z,
-            initial_state,
-            self.final_z,
-            max_step=np.abs(dz),
-            atol=self.atol,
-            rtol=self.rtol,
-            #  jac = self.eqn_jac,
-            jac_sparsity=sparsity,
-            vectorized=True,
-        )
-
-    def solve(
-        self,
-        dz=1e-3,
-        verbose=True,
-        summary=False,
-        extended_output=False,
-        full_reset=False,
-        progressbar=False,
-    ):
-        from time import time
-        from prince_cr.util import PrinceProgressBar
-
-        reset_counter = 0
-        stepcount = 0
-        dz = -1 * dz
-        start_time = time()
-
-        info(2, "Setting up Solver")
-        self._init_solver(dz)
-        info(2, "Solver initialized in {0} s".format(time() - start_time))
-
-        self.pre_step_hook(self.initial_z)
-
-        info(2, "Starting integration.")
-        with PrinceProgressBar(
-            bar_type=progressbar, nsteps=-(self.initial_z - self.final_z) / dz
-        ) as pbar:
-            while self.r.status == "running":
-                # print '------ at', self.r.t, '------'
-                if verbose:
-                    info(3, "Integrating at z = {0}".format(self.r.t))
-                # --------------------------------------------
-                # Evaluate a step
-                # --------------------------------------------
-                self.r.step()
-                # --------------------------------------------
-                # Some last checks and resets
-                # --------------------------------------------
-                if verbose:
-                    print("last step:", self.r.step_size)
-                    print("h_abs:", self.r.h_abs)
-                    print("LU decomp:", self.r.nlu)
-                    print("current order:", self.r.dense_output().order)
-                    print("---" * 20)
-
-                self.post_step_hook(self.r.t)
-
-                stepcount += 1
-                reset_counter += 1
-                pbar.update()
-
-        if self.r.status == "failed":
-            raise Exception(
-                "Integrator failed at t = {:}, try adjusting the tolerances".format(
-                    self.r.t
-                )
-            )
-        if verbose:
-            print(
-                "Integrator finished with t = {:}, last step was dt = {:}".format(
-                    self.r.t, self.r.step_size
-                )
-            )
-
-        # after each run we delete the solver to save memory
-        self.state = self.r.y.copy()
-
-        if summary or verbose:
-            print("Summary:")
-            print("---------------------")
-            print("status:   ", self.r.status)
-            print("time:     ", self.r.t)
-            print("last step:", self.r.step_size)
-            print("RHS eval: ", self.r.nfev)
-            print("Jac eval: ", self.r.njev)
-            print("LU decomp:", self.r.nlu)
-            print("---------------------")
-
-        del self.r
-
-        end_time = time()
-        info(2, "Integration completed in {0} s".format(end_time - start_time))
-
-
 class UHECRPropagationSolverEULER(UHECRPropagationSolver):
     def __init__(self, *args, **kwargs):
         super(UHECRPropagationSolverEULER, self).__init__(*args, **kwargs)
@@ -685,27 +450,6 @@ class UHECRPropagationSolverEULER(UHECRPropagationSolver):
                 state += self.eqn_derivative(curr_z, state) * dz
 
                 # --------------------------------------------
-                # Apply the injection
-                # --------------------------------------------
-                if not disable_inj:
-                    if (
-                        not self.enable_injection_jacobian
-                        and not self.enable_partial_diff_jacobian
-                    ):
-                        if verbose:
-                            print("applying injection at t =", curr_z)
-                        state += self.injection(dz, curr_z)
-
-                # --------------------------------------------
-                # Apply the semi lagrangian
-                # --------------------------------------------
-                if not self.enable_partial_diff_jacobian:
-                    if self.enable_adiabatic_losses or self.enable_pairprod_losses:
-                        if verbose:
-                            print("applying semi lagrangian at t =", curr_z)
-                        state = self.semi_lagrangian(dz, curr_z, state)
-
-                # --------------------------------------------
                 # Some last checks and resets
                 # --------------------------------------------
                 if curr_z < -1 * dz:
@@ -718,3 +462,168 @@ class UHECRPropagationSolverEULER(UHECRPropagationSolver):
         end_time = time()
         info(2, "Integration completed in {0} s".format(end_time - start_time))
         self.state = state
+
+
+class UHECRPropagationSolverETD2(UHECRPropagationSolver):
+    """Exponential time-differencing RK2 (Cox-Matthews) integrator.
+
+    Treats the diagonal of ``L(z) = J(z) + dl/dz · D · diag(κ(z))`` exactly
+    via ``exp(h · diag(L))`` and the off-diagonal block with two SpMVs per
+    stage (4 SpMVs / step). Source term ``b(z) = injection(z)`` enters via
+    the same φ₁/φ₂ machinery, frozen at step start to preserve 2nd order.
+
+    Caching: the photo-hadronic rate matrix ``M_raw(z)`` is the expensive
+    piece (it requires a batch SpMV against the photon vector at z). It is
+    refreshed only when ``|z - z_cached| > config.update_rates_z_threshold``,
+    matching the BDF path. The cheap pieces — ``dl/dz(z)``, ``κ(z)``, and
+    the source ``b(z)`` — are recomputed every step, mirroring the per-call
+    behaviour of ``eqn_deriv_standard``. This avoids a per-cache-window
+    systematic of ~``recomp_z_threshold``-magnitude in the propagation
+    result.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Cached pieces; populated lazily inside solve().
+        self._etd2_z_cached = None
+        self._etd2_M_raw = None  # un-dldz-scaled photo-hadronic matrix
+        self._etd2_M_raw_diag = None
+        self._etd2_M_raw_off = None
+        # Constant pieces, populated on first solve():
+        self._etd2_D_diag = None
+        self._etd2_D_off = None
+
+    def _build_continuous_loss_grid(self, z):
+        """κ(z) on the grid (used inside D · diag(κ))."""
+        conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
+        if self.enable_adiabatic_losses:
+            conloss += self.adia_loss_rates_grid.loss_vector(z)
+        if self.enable_pairprod_losses:
+            conloss += self.pair_loss_rates_grid.loss_vector(z)
+        return conloss
+
+    def _refresh_M_raw(self, z):
+        """Refresh the cached un-scaled photo-hadronic matrix at z."""
+        from .etd2 import split_operator
+
+        # scale_fac=1.0 → the raw rate matrix (no dldz factor).
+        if self.enable_photohad_losses:
+            M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+        else:
+            # Zero matrix with full sparsity: easiest is the cached one with
+            # data zeroed.
+            M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+            M = M.copy() if hasattr(M, "copy") else M
+            M.data = np.zeros_like(M.data)
+        # split_operator returns (diag, off CSR with diagonal eliminated).
+        d_M, M_off = split_operator(M)
+        self._etd2_z_cached = z
+        self._etd2_M_raw_diag = d_M
+        self._etd2_M_raw_off = M_off
+        # Mirror the BDF cache used by eqn_deriv_standard so debug prints
+        # / progress hooks stay consistent.
+        self.current_z_rates = z
+
+    def _ensure_D_split(self):
+        """Compute and cache the FD operator's diagonal/off-diagonal split."""
+        if self._etd2_D_diag is not None:
+            return
+        from .etd2 import split_operator
+
+        D = self.diff_operator
+        if not hasattr(D, "indices"):
+            D = D.tocsr()
+        d_D, D_off = split_operator(D)
+        self._etd2_D_diag = d_D
+        self._etd2_D_off = D_off
+
+    def _operator_at(self, z):
+        """Return ``(d, apply_F)`` for the ETD2 step at redshift ``z``.
+
+        d = dldz(z) · (M_raw_diag + κ(z) ⊙ D_diag)
+        apply_F(x, out) = dldz(z) · M_raw_off · x
+                          + dldz(z) · D_off · (κ(z) ⊙ x)
+                          + b(z)
+        """
+        if (
+            self._etd2_z_cached is None
+            or abs(z - self._etd2_z_cached) > self.recomp_z_threshold
+        ):
+            self._refresh_M_raw(z)
+
+        dldz = self.dldz(z)
+        if self.enable_partial_diff_jacobian:
+            kappa = self._build_continuous_loss_grid(z)
+        else:
+            kappa = None
+
+        # Diagonal d = dldz · (M_raw_diag + κ ⊙ D_diag)
+        d = dldz * self._etd2_M_raw_diag.copy()
+        if kappa is not None:
+            d += dldz * (kappa * self._etd2_D_diag)
+
+        if self.enable_injection_jacobian and self.list_of_sources:
+            b = self.injection(1.0, z)
+        else:
+            b = None
+
+        M_off = self._etd2_M_raw_off
+        D_off = self._etd2_D_off if kappa is not None else None
+
+        # Pre-allocate one scratch buffer for κ⊙x — reused inside apply_F.
+        kx_buf = np.empty(self.dim_states) if kappa is not None else None
+
+        def apply_F(x, out):
+            np.copyto(out, M_off.dot(x))
+            if kappa is not None:
+                np.multiply(kappa, x, out=kx_buf)
+                np.add(out, D_off.dot(kx_buf), out=out)
+            np.multiply(out, dldz, out=out)
+            if b is not None:
+                np.add(out, b, out=out)
+
+        return d, apply_F
+
+    def solve(
+        self,
+        dz=1e-3,
+        verbose=False,
+        summary=False,
+        progressbar=False,
+    ):
+        from time import time
+        from .etd2 import integrate
+
+        start_time = time()
+        info(2, "ETD2: setting up integration")
+
+        # Sign convention: integrate from initial_z (high) to final_z (low),
+        # so step h = -dz < 0. Build a uniform grid of size dz, with the
+        # final step truncated to land exactly on final_z.
+        dz_step = -float(abs(dz))
+        n_full = int(np.floor((self.final_z - self.initial_z) / dz_step))
+        z_grid = self.initial_z + np.arange(n_full + 1) * dz_step
+        if abs(z_grid[-1] - self.final_z) > 1e-12:
+            z_grid = np.concatenate([z_grid, [self.final_z]])
+
+        state = np.zeros(self.dim_states)
+        # Force first-step rebuild of the cached photo-hadronic matrix.
+        self._etd2_z_cached = None
+        self.current_z_rates = self.initial_z
+        self._ensure_D_split()
+
+        self.pre_step_hook(self.initial_z)
+
+        info(2, f"ETD2: integrating with {len(z_grid) - 1} steps of dz≈{dz_step:.2e}")
+        integrate(state, z_grid, operator_at=self._operator_at)
+
+        self.post_step_hook(self.final_z)
+        self.state = state
+        end_time = time()
+        info(2, "ETD2: integration completed in {0:.2f} s".format(end_time - start_time))
+
+        if summary or verbose:
+            print("ETD2 summary:")
+            print(f"  steps: {len(z_grid) - 1}")
+            print(f"  initial z: {self.initial_z} → final z: {self.final_z}")
+            print(f"  wall time: {end_time - start_time:.3f} s")

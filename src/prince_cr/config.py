@@ -71,9 +71,6 @@ photon_grid = (-15, -6, 8)
 #: 'logE': linear grid in x = log_10(E): x_i = x_min + i * Delta
 grid_scale = "E"
 
-#: Order of semi-lagrangian for energy derivative
-semi_lagr_method = "5th_order"
-
 # ===========================================================================
 # Model options
 # ===========================================================================

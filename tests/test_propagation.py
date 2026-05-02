@@ -2,7 +2,7 @@
 
 import pytest
 
-from prince_cr.solvers import UHECRPropagationSolverBDF
+from prince_cr.solvers import UHECRPropagationSolverETD2
 from prince_cr.cr_sources import AugerFitSource
 
 
@@ -21,7 +21,7 @@ def test_kernel_1(prince_run_talys):
 
 
 def test_propagation(prince_run_talys):
-    solver = UHECRPropagationSolverBDF(
+    solver = UHECRPropagationSolverETD2(
         initial_z=1.0,
         final_z=0.0,
         prince_run=prince_run_talys,

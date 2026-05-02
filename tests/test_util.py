@@ -16,7 +16,6 @@ from prince_cr.util import (
     get_AZN,
     bin_widths,
     AdditiveDictionary,
-    PrinceBDF,
     PrinceProgressBar,
 )
 
@@ -265,56 +264,3 @@ class TestPrinceProgressBar:
             pbar.update()
 
 
-class TestPrinceBDF:
-    def test_simple_ode(self):
-        """Test BDF solver on dy/dt = -y, y(0)=1 => y(1) = e^-1"""
-        from scipy.sparse import csr_matrix
-
-        def fun(t, y):
-            return -y
-
-        # Create a simple sparsity pattern
-        sparsity = csr_matrix(np.ones((1, 1)))
-
-        solver = PrinceBDF(
-            fun,
-            0.0,
-            np.array([1.0]),
-            1.0,
-            max_step=0.1,
-            atol=1e-8,
-            rtol=1e-8,
-            jac_sparsity=sparsity,
-        )
-
-        while solver.status == "running":
-            solver.step()
-
-        np.testing.assert_allclose(solver.y[0], np.exp(-1), rtol=1e-4)
-
-    def test_vectorized_ode(self):
-        """Test BDF solver with vectorized=True"""
-        from scipy.sparse import csr_matrix
-
-        def fun(t, y):
-            return -y
-
-        sparsity = csr_matrix(np.ones((2, 2)))
-
-        solver = PrinceBDF(
-            fun,
-            0.0,
-            np.array([1.0, 2.0]),
-            1.0,
-            max_step=0.1,
-            atol=1e-6,
-            rtol=1e-6,
-            jac_sparsity=sparsity,
-            vectorized=True,
-        )
-
-        while solver.status == "running":
-            solver.step()
-
-        np.testing.assert_allclose(solver.y[0], np.exp(-1), rtol=1e-3)
-        np.testing.assert_allclose(solver.y[1], 2 * np.exp(-1), rtol=1e-3)
