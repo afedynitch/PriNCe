@@ -1,6 +1,7 @@
 # Test whether cross section are correctly created.
 import unittest
 
+import numpy as np
 from prince_cr import cross_sections
 
 species_talys = {
@@ -687,29 +688,41 @@ species_joined = {
 # Config is set in conftest.py
 
 
-class TestCsec(unittest.TestCase):
-    def test_talys(self):
-        cs = cross_sections.TabulatedCrossSection("CRP2_TALYS")
-        self.assertEqual(cs.known_species, species_talys["species"])
-        self.assertEqual(cs.known_bc_channels, species_talys["incl"])
-        self.assertEqual(cs.known_diff_channels, species_talys["diff"])
+class TestFlukaPhotoNuclear(unittest.TestCase):
+    """Structural sanity for the FLUKA photo-nuclear loader.
 
-    def test_peanut(self):
-        cs = cross_sections.TabulatedCrossSection("PEANUT_IAS")
-        self.assertEqual(cs.known_species, species_peanut["species"])
-        self.assertEqual(cs.known_bc_channels, species_peanut["incl"])
-        self.assertEqual(cs.known_diff_channels, species_peanut["diff"])
+    The legacy TALYS / PEANUT / Composite tests compared against hand-typed
+    channel-list golden snapshots (``species_talys`` etc., still defined
+    above for reference but unused). Those data sources are gone; FLUKA
+    has 78 mothers and ~5500 channels at v0, too many to hand-type. We
+    test structural invariants instead: every channel in known_bc_channels
+    has both endpoints in known_species, every nonel mother has a real
+    ndarray, etc.
+    """
 
-    def test_joined(self):
-        cs = cross_sections.CompositeCrossSection(
-            [
-                (0.0, cross_sections.TabulatedCrossSection, ("CRP2_TALYS",)),
-                (0.14, cross_sections.SophiaSuperposition, ()),
-            ]
-        )
-        self.assertEqual(cs.known_species, species_joined["species"])
-        self.assertEqual(cs.known_bc_channels, species_joined["incl"])
-        self.assertEqual(cs.known_diff_channels, species_joined["diff"])
+    def test_loads(self):
+        cs = cross_sections.FlukaPhotoNuclear()
+        self.assertGreater(len(cs.known_species), 0)
+        self.assertGreater(len(cs._nonel_tab), 0)
+        self.assertGreater(len(cs._incl_diff_tab), 0)
+
+    def test_channels_self_consistent(self):
+        cs = cross_sections.FlukaPhotoNuclear()
+        species = set(cs.known_species)
+        for mo, da in cs.known_bc_channels:
+            self.assertIn(mo, species, f"mother {mo} not in known_species")
+            self.assertIn(da, species, f"daughter {da} not in known_species")
+        for mo, da in cs.known_diff_channels:
+            self.assertIn(mo, species, f"mother {mo} not in known_species")
+
+    def test_nonel_values_are_real_ndarrays(self):
+        cs = cross_sections.FlukaPhotoNuclear()
+        for mo, sig in cs._nonel_tab.items():
+            # Either a bare ndarray on the egrid, or a (egrid, sig) tuple
+            if isinstance(sig, tuple):
+                _, sig = sig
+            self.assertIsInstance(sig, np.ndarray)
+            self.assertGreater(sig.size, 0, f"nonel[{mo}] is empty")
 
 
 if __name__ == "__main__":
