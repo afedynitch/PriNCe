@@ -51,33 +51,16 @@ def pf():
 
 
 @pytest.fixture(scope="session")
-def sophia():
-    """Session-scoped SOPHIA cross sections."""
-    return cross_sections.SophiaSuperposition()
-
-
-@pytest.fixture(scope="session")
-def talys():
-    """Session-scoped TALYS cross sections."""
-    return cross_sections.TabulatedCrossSection("CRP2_TALYS")
-
-
-@pytest.fixture(scope="session")
-def composite(talys, sophia):
-    """Session-scoped composite cross section (TALYS + SOPHIA)."""
-    return cross_sections.CompositeCrossSection(
-        [
-            (0.0, cross_sections.TabulatedCrossSection, ("CRP2_TALYS",)),
-            (0.14, cross_sections.SophiaSuperposition, ()),
-        ]
-    )
+def fluka():
+    """Session-scoped FLUKA photo-nuclear cross sections."""
+    return cross_sections.FlukaPhotoNuclear()
 
 
 # Alias for tests that use the name "cs"
 @pytest.fixture(scope="session")
-def cs(composite):
-    """Alias for composite cross section."""
-    return composite
+def cs(fluka):
+    """Alias for the FLUKA cross section."""
+    return fluka
 
 
 @pytest.fixture(scope="session")
@@ -125,15 +108,12 @@ def cached_prince_run():
         _cfg.x_cut = 1e-4
         _cfg.x_cut_proton = 1e-2
         _cfg.tau_dec_threshold = np.inf
+        _cfg.fluka_db_path = "/Users/anatoli/devel_mac/prince-fluka-utils"
+        _cfg.fluka_db_fname = "prince_db_v0.h5"
         pf_full = photonfields.CombinedPhotonField(
             [photonfields.CMBPhotonSpectrum, photonfields.CIBGilmore2D]
         )
-        cs_full = cross_sections.CompositeCrossSection(
-            [
-                (0.0, cross_sections.TabulatedCrossSection, ("CRP2_TALYS",)),
-                (0.14, cross_sections.SophiaSuperposition, ()),
-            ]
-        )
+        cs_full = cross_sections.FlukaPhotoNuclear()
         run = core.PriNCeRun(max_mass=56, photon_field=pf_full, cross_sections=cs_full)
     finally:
         config.cosmic_ray_grid, config.photon_grid, config.max_mass = saved
