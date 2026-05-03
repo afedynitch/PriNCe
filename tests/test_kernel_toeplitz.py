@@ -54,12 +54,7 @@ def test_init_matrices_raises_on_grid_mismatch(pf):
         cfg.max_mass = 1
         from prince_cr import cross_sections as _cs
 
-        local_cs = _cs.CompositeCrossSection(
-            [
-                (0.0, _cs.TabulatedCrossSection, ("CRP2_TALYS",)),
-                (0.14, _cs.SophiaSuperposition, ()),
-            ]
-        )
+        local_cs = _cs.FlukaPhotoNuclear()
         with pytest.raises(RuntimeError, match="bins-per-decade"):
             core.PriNCeRun(max_mass=1, photon_field=pf, cross_sections=local_cs)
     finally:

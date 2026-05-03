@@ -32,13 +32,11 @@ def main(out_path: Path) -> None:
         [photonfields.CMBPhotonSpectrum, photonfields.CIBGilmore2D]
     )
 
-    print("Building cross sections (Talys + Sophia superposition)...")
-    cs = cross_sections.CompositeCrossSection(
-        [
-            (0.0, cross_sections.TabulatedCrossSection, ("CRP2_TALYS",)),
-            (0.14, cross_sections.SophiaSuperposition, ()),
-        ]
-    )
+    print("Building cross sections (FLUKA photo-nuclear)...")
+    # FLUKA db is built by sibling repo prince-fluka-utils.
+    cfg.fluka_db_path = "/Users/anatoli/devel_mac/prince-fluka-utils"
+    cfg.fluka_db_fname = "prince_db_v0.h5"
+    cs = cross_sections.FlukaPhotoNuclear()
 
     t0 = time.time()
     print("Building PriNCeRun(max_mass=56)...")
