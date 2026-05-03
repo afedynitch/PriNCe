@@ -88,13 +88,16 @@ _WARNED: set = set()
 
 
 def _warn_misclassified(mo: int, da: int) -> None:
-    """Log once per (mo, da) that the daughter is not a nucleus and so was
-    skipped from the boost-conserving bucket.
+    """Log once per (mo, da) that this row was dropped from the
+    boost-conserving bucket as anomalous. Catches two v0 db artefacts:
 
-    The v0 prince-fluka-utils generator routes some non-nuclear daughters
-    (K^±, Λ, free p/n) into ``mothers_daughters`` instead of
-    ``elementary_daughters``. Filing this as an open question on the
-    generator side; FlukaPhotoNuclear simply skips them.
+    1. **Non-nuclear daughter** (K^±, Λ, free p/n routed to
+       ``mothers_daughters`` instead of ``elementary_daughters``).
+    2. **Daughter heavier than mother** (e.g. He-3 → He-4) — physically
+       impossible from γ + (Z,A); a known v0 generator bug.
+
+    Both belong as open questions against prince-fluka-utils;
+    FlukaPhotoNuclear simply skips them.
     """
     key = (int(mo), int(da))
     if key in _WARNED:
@@ -102,8 +105,8 @@ def _warn_misclassified(mo: int, da: int) -> None:
     _WARNED.add(key)
     info(
         0,
-        "FlukaPhotoNuclear: dropping misclassified ({0}, {1}) — daughter "
-        "is not a nucleus; expected in elementary_daughters bucket".format(mo, da),
+        "FlukaPhotoNuclear: dropping anomalous ({0}, {1}) — either "
+        "daughter is not a nucleus or A_da > A_mo (v0 db artefact)".format(mo, da),
     )
 
 
