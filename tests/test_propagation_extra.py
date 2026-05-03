@@ -1,17 +1,12 @@
 """Additional tests for prince_cr.solvers.propagation module.
 
-Covers UHECRPropagationSolver base-class behavior, ETD2 init/options,
-EULER smoke tests, and the scipy-backend RHS path.
+Covers UHECRPropagationSolver base-class behavior and ETD2 init/options.
 """
 
 import numpy as np
 import pytest
 
-import prince_cr.config as config
-from prince_cr.solvers.propagation import (
-    UHECRPropagationSolverETD2,
-    UHECRPropagationSolverEULER,
-)
+from prince_cr.solvers.propagation import UHECRPropagationSolverETD2
 from prince_cr.cr_sources import SimpleSource
 
 
@@ -116,37 +111,6 @@ class TestInjection:
         assert result.shape == (prince_run.dim_states,)
 
 
-class TestEulerSolver:
-    def test_init(self, prince_run):
-        solver = UHECRPropagationSolverEULER(
-            initial_z=0.1,
-            final_z=0.0,
-            prince_run=prince_run,
-        )
-        assert solver.initial_z == 0.1
-        assert solver.final_z == 0.0
-
-    def test_solve_short(self, prince_run):
-        """EULER smoke test on the short-z, default-flags path."""
-        solver = UHECRPropagationSolverEULER(
-            initial_z=0.01,
-            final_z=0.0,
-            prince_run=prince_run,
-            enable_injection_jacobian=True,
-            enable_partial_diff_jacobian=True,
-        )
-        solver.add_source_class(
-            SimpleSource(
-                prince_run,
-                params={101: (2.0, 1e10, 1e-50)},
-                m="flat",
-            )
-        )
-        solver.solve(dz=0.005, verbose=False, progressbar=False)
-        assert solver.state is not None
-        assert np.all(np.isfinite(solver.state))
-
-
 class TestETD2SolverOptions:
     def test_z_offset(self, prince_run):
         solver = _solver(
@@ -176,51 +140,3 @@ class TestETD2SolverOptions:
         assert np.all(np.isfinite(solver.state))
 
 
-class TestScipyBackend:
-    def test_scipy_eqn_derivative(self, prince_run):
-        """scipy-backend RHS path produces a state-shaped vector."""
-        old_backend = config.linear_algebra_backend
-        try:
-            config.linear_algebra_backend = "scipy"
-            solver = _solver(UHECRPropagationSolverETD2, prince_run)
-            solver.add_source_class(
-                SimpleSource(
-                    prince_run,
-                    params={101: (2.0, 1e10, 1e-50)},
-                    m="flat",
-                )
-            )
-            solver._update_jacobian(0.1)
-            solver.current_z_rates = 0.1
-            state = np.zeros(solver.dim_states)
-            result = solver.eqn_derivative(0.05, state)
-            assert result.shape == state.shape
-        finally:
-            config.linear_algebra_backend = old_backend
-
-    def test_scipy_eqn_derivative_with_partial_diff(self, prince_run):
-        """scipy-backend RHS path with partial-diff jacobian flag enabled."""
-        old_backend = config.linear_algebra_backend
-        try:
-            config.linear_algebra_backend = "scipy"
-            solver = UHECRPropagationSolverEULER(
-                initial_z=0.01,
-                final_z=0.0,
-                prince_run=prince_run,
-                enable_injection_jacobian=True,
-                enable_partial_diff_jacobian=True,
-            )
-            solver.add_source_class(
-                SimpleSource(
-                    prince_run,
-                    params={101: (2.0, 1e10, 1e-50)},
-                    m="flat",
-                )
-            )
-            solver._update_jacobian(0.01)
-            solver.current_z_rates = 0.01
-            state = np.zeros(solver.dim_states)
-            result = solver.eqn_derivative(0.01, state)
-            assert result.shape == state.shape
-        finally:
-            config.linear_algebra_backend = old_backend

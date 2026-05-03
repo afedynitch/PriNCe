@@ -78,9 +78,7 @@ def test_pure_adiabatic_loss_runs_without_nan(cached_prince_run):
     injection, the state remains zero throughout; the test exercises the
     solver wiring on an analytically-trivial case.
     """
-    from prince_cr.solvers.propagation import UHECRPropagationSolverEULER
-
-    solver = UHECRPropagationSolverEULER(
+    solver = UHECRPropagationSolverETD2(
         initial_z=0.05,
         final_z=0.0,
         prince_run=cached_prince_run,
@@ -90,5 +88,5 @@ def test_pure_adiabatic_loss_runs_without_nan(cached_prince_run):
         enable_injection_jacobian=False,
         enable_partial_diff_jacobian=True,
     )
-    solver.solve(dz=1e-4, verbose=False, progressbar=False)
+    solver.solve(dz=1e-4, verbose=False)
     assert np.all(np.isfinite(solver.state))

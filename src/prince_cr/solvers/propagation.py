@@ -216,20 +216,6 @@ class UHECRPropagationSolver(object):
             prince_run.cr_grid, prince_run.spec_man.nspec
         ).operator
 
-        # Configuration of BLAS backend
-        self.using_cupy = False
-        if config.has_cupy and config.linear_algebra_backend.lower() == "cupy":
-            self.eqn_derivative = self.eqn_deriv_cupy
-            self.using_cupy = True
-        elif config.has_mkl and config.linear_algebra_backend.lower() == "mkl":
-            self.eqn_derivative = self.eqn_deriv_mkl
-        else:
-            self.eqn_derivative = self.eqn_deriv_standard
-
-        # Reset counters
-        self.ncallsf = 0
-        self.ncallsj = 0
-
     @property
     def known_species(self):
         return self.spec_man.known_species
@@ -264,206 +250,6 @@ class UHECRPropagationSolver(object):
         else:
             return f * self.list_of_sources[0].injection_rate(z)
 
-    def _update_jacobian(self, z):
-        info(5, "Updating jacobian matrix at redshift", z)
-
-        # enable photohadronic losses, or use a zero matrix
-        if self.enable_photohad_losses:
-            self.jacobian = self.had_int_rates.get_hadr_jacobian(
-                z, self.dldz(z), force_update=True
-            )
-        else:
-            self.jacobian = self.had_int_rates.get_hadr_jacobian(
-                z, self.dldz(z), force_update=True
-            )
-            self.jacobian.data *= 0.0
-
-        self.last_hadr_jac = None
-
-    def eqn_deriv_standard(self, z, state, *args):
-        z = z - self.z_offset
-
-        self.ncallsf += 1
-
-        # Update rates/cross sections only if solver requests to do so
-        if abs(z - self.current_z_rates) > self.recomp_z_threshold:
-            self._update_jacobian(z)
-            self.current_z_rates = z
-
-        r = self.jacobian.dot(state)
-
-        if self.enable_injection_jacobian:
-            inj = self.injection(1.0, z)
-            r += inj[:, np.newaxis] if state.ndim == 2 else inj
-
-        if self.enable_partial_diff_jacobian:
-            conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
-            if self.enable_adiabatic_losses:
-                conloss += self.adia_loss_rates_grid.loss_vector(z)
-            if self.enable_pairprod_losses:
-                conloss += self.pair_loss_rates_grid.loss_vector(z)
-            conloss_state = (
-                conloss[:, np.newaxis] * state if state.ndim == 2 else conloss * state
-            )
-            r += self.dldz(z) * self.diff_operator.dot(conloss_state)
-        return r
-
-    def eqn_deriv_cupy(self, z, state, *args):
-        import cupy
-
-        z = z - self.z_offset
-
-        self.ncallsf += 1
-
-        # Update rates/cross sections only if solver requests to do so
-        if abs(z - self.current_z_rates) > self.recomp_z_threshold:
-            self._update_jacobian(z)
-            self.current_z_rates = z
-
-        state = cupy.array(state)
-
-        r = self.jacobian.dot(state)
-        if self.enable_injection_jacobian:
-            inj = cupy.array(self.injection(1.0, z))
-            r += inj[:, np.newaxis] if state.ndim == 2 else inj
-        if self.enable_partial_diff_jacobian:
-            conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
-            if self.enable_adiabatic_losses:
-                conloss += self.adia_loss_rates_grid.loss_vector(z)
-            if self.enable_pairprod_losses:
-                conloss += self.pair_loss_rates_grid.loss_vector(z)
-            conloss_cu = cupy.array(conloss)
-            conloss_state = (
-                conloss_cu[:, np.newaxis] * state
-                if state.ndim == 2
-                else conloss_cu * state
-            )
-            r += self.dldz(z) * self.diff_operator.dot(conloss_state)
-
-        return cupy.asnumpy(r)
-
-    def eqn_deriv_mkl(self, z, state, *args):
-        from prince_cr.solvers.mkl_interface import csrmm, csrmv
-
-        if state.ndim == 2 and state.shape[1] > 1:
-            matrix_input = True
-        else:
-            matrix_input = False
-
-        # Here starts the eqn_deriv content
-        z = z - self.z_offset
-        self.ncallsf += 1
-
-        # Update rates/cross sections only if solver requests to do so
-        if abs(z - self.current_z_rates) > self.recomp_z_threshold:
-            self._update_jacobian(z)
-            self.current_z_rates = z
-
-        res = np.zeros(state.shape)
-
-        if matrix_input:
-            state = np.ascontiguousarray(state)
-            res = csrmm(1.0, self.jacobian, state, 0.0, res)
-        else:
-            res = csrmv(1.0, self.jacobian, state, 0.0, res)
-
-        if self.enable_injection_jacobian:
-            inj = self.injection(1.0, z)
-            res += inj[:, np.newaxis] if state.ndim == 2 else inj
-
-        if self.enable_partial_diff_jacobian:
-            conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
-            if self.enable_adiabatic_losses:
-                conloss += self.adia_loss_rates_grid.loss_vector(z)
-            if self.enable_pairprod_losses:
-                conloss += self.pair_loss_rates_grid.loss_vector(z)
-            conloss_state = (
-                conloss[:, np.newaxis] * state if state.ndim == 2 else conloss * state
-            )
-            if matrix_input:
-                res = csrmm(
-                    self.dldz(z),
-                    self.diff_operator,
-                    conloss_state,
-                    1.0,
-                    res,
-                )
-            else:
-                res = csrmv(
-                    self.dldz(z),
-                    self.diff_operator,
-                    conloss_state,
-                    1.0,
-                    res,
-                )
-
-        return res
-
-
-class UHECRPropagationSolverEULER(UHECRPropagationSolver):
-    def __init__(self, *args, **kwargs):
-        super(UHECRPropagationSolverEULER, self).__init__(*args, **kwargs)
-
-    def solve(
-        self,
-        dz=1e-3,
-        verbose=True,
-        override_initial_state=None,
-        extended_output=False,
-        initial_inj=False,
-        disable_inj=False,
-        progressbar=False,
-    ):
-        from prince_cr.util import PrinceProgressBar
-        from time import time
-
-        self._update_jacobian(self.initial_z)
-        self.current_z_rates = self.initial_z
-
-        dz = -1 * dz
-        start_time = time()
-        curr_z = self.initial_z
-        if initial_inj:
-            initial_state = self.injection(dz, self.initial_z)
-            print(initial_state)
-        else:
-            initial_state = np.zeros(self.dim_states)
-        state = initial_state
-
-        self.pre_step_hook(self.initial_z)
-
-        info(2, "Starting integration.")
-        with PrinceProgressBar(
-            bar_type=progressbar, nsteps=-(self.initial_z - self.final_z) / dz
-        ) as pbar:
-            while curr_z + dz >= self.final_z:
-                if verbose:
-                    info(3, "Integrating at z={0}".format(curr_z))
-
-                # --------------------------------------------
-                # Solve for hadronic interactions
-                # --------------------------------------------
-                if verbose:
-                    print("Solving hadr losses at t =", curr_z)
-                self._update_jacobian(curr_z)
-
-                state += self.eqn_derivative(curr_z, state) * dz
-
-                # --------------------------------------------
-                # Some last checks and resets
-                # --------------------------------------------
-                if curr_z < -1 * dz:
-                    print("break at z =", curr_z)
-                    break
-                curr_z += dz
-                self.post_step_hook(curr_z)
-                pbar.update()
-
-        end_time = time()
-        info(2, "Integration completed in {0} s".format(end_time - start_time))
-        self.state = state
-
-
 class UHECRPropagationSolverETD2(UHECRPropagationSolver):
     """Exponential time-differencing RK2 (Cox-Matthews) integrator.
 
@@ -472,56 +258,52 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
     stage (4 SpMVs / step). Source term ``b(z) = injection(z)`` enters via
     the same φ₁/φ₂ machinery, frozen at step start to preserve 2nd order.
 
-    Caching: the photo-hadronic rate matrix ``M_raw(z)`` is the expensive
-    piece (it requires a batch SpMV against the photon vector at z). It is
-    refreshed only when ``|z - z_cached| > config.update_rates_z_threshold``,
-    matching the BDF path. The cheap pieces — ``dl/dz(z)``, ``κ(z)``, and
-    the source ``b(z)`` — are recomputed every step, mirroring the per-call
-    behaviour of ``eqn_deriv_standard``. This avoids a per-cache-window
-    systematic of ~``recomp_z_threshold``-magnitude in the propagation
-    result.
+    Caching: the expensive z-dependent pieces — the photo-hadronic rate
+    matrix ``M_raw(z)`` and the pair-production loss vector ``κ_pair(z)``
+    (CIB interpolated at ``dim_cr × xi_steps`` points) — are refreshed
+    together at ``recomp_z_threshold`` resolution. Truly cheap pieces
+    (``dl/dz(z)``, ``κ_adia(z)`` closed form, source ``b(z)``) are
+    recomputed every step.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Cached pieces; populated lazily inside solve().
-        self._etd2_z_cached = None
-        self._etd2_M_raw = None  # un-dldz-scaled photo-hadronic matrix
+        # Pieces refreshed at ``recomp_z_threshold`` resolution (z tracked by
+        # ``self.current_z_rates`` from the base class).
         self._etd2_M_raw_diag = None
         self._etd2_M_raw_off = None
-        # Constant pieces, populated on first solve():
+        # κ_pair(z) is expensive (CIB interpolated at dim_cr × xi_steps points).
+        # κ_adia(z) is closed-form and trivially cheap, recomputed per step.
+        self._etd2_kappa_pair_cached = None
+        # Constant pieces, populated on first solve().
         self._etd2_D_diag = None
         self._etd2_D_off = None
 
-    def _build_continuous_loss_grid(self, z):
-        """κ(z) on the grid (used inside D · diag(κ))."""
-        conloss = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
-        if self.enable_adiabatic_losses:
-            conloss += self.adia_loss_rates_grid.loss_vector(z)
-        if self.enable_pairprod_losses:
-            conloss += self.pair_loss_rates_grid.loss_vector(z)
-        return conloss
+    def _refresh_z_caches(self, z):
+        """Refresh all rate-cache-window-bound pieces at z.
 
-    def _refresh_M_raw(self, z):
-        """Refresh the cached un-scaled photo-hadronic matrix at z."""
+        Bundles the photo-hadronic matrix and the pair-production loss
+        vector — both expensive and both naturally tied to the same z
+        resolution. Cheap pieces (adiabatic κ, dl/dz, source b(z)) stay
+        per-step.
+        """
         from .etd2 import split_operator
 
-        # scale_fac=1.0 → the raw rate matrix (no dldz factor).
-        if self.enable_photohad_losses:
-            M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
-        else:
-            # Zero matrix with full sparsity: easiest is the cached one with
-            # data zeroed.
-            M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+        # scale_fac=1.0 → raw rate matrix (no dldz factor); we apply dldz later.
+        M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+        if not self.enable_photohad_losses:
+            # Zero matrix with full sparsity preserved.
             M = M.copy() if hasattr(M, "copy") else M
             M.data = np.zeros_like(M.data)
-        # split_operator returns (diag, off CSR with diagonal eliminated).
         d_M, M_off = split_operator(M)
-        self._etd2_z_cached = z
         self._etd2_M_raw_diag = d_M
         self._etd2_M_raw_off = M_off
-        # Mirror the BDF cache used by eqn_deriv_standard so debug prints
-        # / progress hooks stay consistent.
+
+        if self.enable_pairprod_losses:
+            self._etd2_kappa_pair_cached = self.pair_loss_rates_grid.loss_vector(z)
+        else:
+            self._etd2_kappa_pair_cached = None
+
         self.current_z_rates = z
 
     def _ensure_D_split(self):
@@ -544,16 +326,23 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         apply_F(x, out) = dldz(z) · M_raw_off · x
                           + dldz(z) · D_off · (κ(z) ⊙ x)
                           + b(z)
+
+        κ(z) = κ_adia(z) (per-step, closed form) + κ_pair(z) (cached at
+        ``recomp_z_threshold`` together with the photo-hadronic matrix).
         """
         if (
-            self._etd2_z_cached is None
-            or abs(z - self._etd2_z_cached) > self.recomp_z_threshold
+            self.current_z_rates is None
+            or abs(z - self.current_z_rates) > self.recomp_z_threshold
         ):
-            self._refresh_M_raw(z)
+            self._refresh_z_caches(z)
 
         dldz = self.dldz(z)
         if self.enable_partial_diff_jacobian:
-            kappa = self._build_continuous_loss_grid(z)
+            kappa = np.zeros_like(self.adia_loss_rates_grid.energy_vector)
+            if self.enable_adiabatic_losses:
+                kappa += self.adia_loss_rates_grid.loss_vector(z)
+            if self._etd2_kappa_pair_cached is not None:
+                kappa += self._etd2_kappa_pair_cached
         else:
             kappa = None
 
@@ -608,8 +397,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
 
         state = np.zeros(self.dim_states)
         # Force first-step rebuild of the cached photo-hadronic matrix.
-        self._etd2_z_cached = None
-        self.current_z_rates = self.initial_z
+        self.current_z_rates = None
         self._ensure_D_split()
 
         self.pre_step_hook(self.initial_z)
