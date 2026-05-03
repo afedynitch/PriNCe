@@ -94,43 +94,9 @@ class PhotoNuclearInteractionRate(object):
         self._batch_cols = []
         info(3, "Memory usage: {0} MB".format(self._batch_matrix.nbytes / 1024**2))
 
-    def _init_matrices(self):
-        """Build `_batch_matrix` and the row/col index arrays.
-
-        Two paths are available, selected by `config.kernel_method`:
-
-        - "toeplitz" (default): exploits the fact that the integration corners
-          fall on a 1D log-y grid (bc channels) or a 2D log-(y,x) grid (diff
-          channels) when the CR and photon grids share the same bins/decade.
-          Each response spline is sampled once on this small structured grid,
-          and the per-channel tile is filled by integer-index lookup. The grid
-          assumption is checked at init: a `RuntimeError` is raised when the
-          CR-grid centers, CR-grid bin edges, and photon-grid bin edges do not
-          all share the same log-step.
-
-        - "legacy": original implementation that builds full (dcr, dph) /
-          (dcr, dcr, dph) intermediate tensors and evaluates each spline at
-          every corner. Kept for benchmarking and for grids that intentionally
-          use different log-steps.
-
-        Both paths produce the same `_batch_matrix` to machine precision; the
-        sparsity-pattern contract (lex-sorted rows/cols) is established by
-        `_init_coupling_mat` afterwards regardless of the path.
-        """
-        method = getattr(config, "kernel_method", "toeplitz")
-        if method == "toeplitz":
-            self._assert_log_grids_compatible()
-            self._init_matrices_toeplitz()
-        elif method == "legacy":
-            self._init_matrices_legacy()
-        else:
-            raise ValueError(
-                f"config.kernel_method = {method!r}; expected 'toeplitz' or 'legacy'."
-            )
-
     def _assert_log_grids_compatible(self):
         """Verify that CR-grid centers, CR-grid bin edges, and photon-grid bin
-        edges all share the same log-step. The Toeplitz kernel path relies on
+        edges all share the same log-step. The kernel construction relies on
         this assumption; mismatched grids would silently produce wrong rates.
         Raises RuntimeError on mismatch.
         """
@@ -139,7 +105,7 @@ class PhotoNuclearInteractionRate(object):
         bph = self.e_photon.bins
         if ecr.size < 2 or bcr.size < 2 or bph.size < 2:
             raise RuntimeError(
-                "Toeplitz kernel requires at least 2 grid points in each axis "
+                "Kernel construction requires at least 2 grid points in each axis "
                 f"(got dcr={ecr.size}, bcr={bcr.size}, bph={bph.size})."
             )
         s_ecr = np.log10(ecr[1] / ecr[0])
@@ -153,16 +119,16 @@ class PhotoNuclearInteractionRate(object):
                 self.e_photon.bins[-1] / self.e_photon.bins[0]
             )
             raise RuntimeError(
-                "Toeplitz kernel requires the cosmic-ray and photon grids to "
-                "share the same bins-per-decade (log-step). "
+                "Kernel construction requires the cosmic-ray and photon grids "
+                "to share the same bins-per-decade (log-step). "
                 f"Got cr~{cr_bpd:.3f} bins/decade, ph~{ph_bpd:.3f} bins/decade "
                 f"(log-steps: cr_centers={s_ecr:.6f}, cr_bins={s_bcr:.6f}, "
                 f"ph_bins={s_bph:.6f}). "
-                "Either align config.cosmic_ray_grid and config.photon_grid on "
-                "the same bins/decade, or set config.kernel_method='legacy'."
+                "Align config.cosmic_ray_grid and config.photon_grid on the "
+                "same bins/decade."
             )
 
-    def _init_matrices_toeplitz(self):
+    def _init_matrices(self):
         """Toeplitz/log-grid kernel construction.
 
         For each channel `(mo, da)`:
@@ -173,9 +139,14 @@ class PhotoNuclearInteractionRate(object):
         Each response spline is sampled once: 1D antiderivatives on a length
         (dcr + dph) log-y grid; 2D antiderivatives on a (dcr + dph) × (2 dcr)
         outer-product grid. The final dense tile is built by integer-index
-        broadcasting and stuffed into `_batch_matrix` exactly as the legacy
-        path does. Downstream (`_init_coupling_mat`) is unchanged.
+        broadcasting and stuffed into `_batch_matrix`. Downstream
+        (`_init_coupling_mat`) lex-sorts the rows/cols.
+
+        Requires the CR and photon grids to share the same bins/decade
+        (`_assert_log_grids_compatible`).
         """
+        self._assert_log_grids_compatible()
+
         spec_man = self.spec_man
         sp_id_ref = spec_man.ncoid2sref
         resp = self.cross_sections.resp
@@ -249,8 +220,7 @@ class PhotoNuclearInteractionRate(object):
         # i_mo grid for diagonal-nonel handling in diff channels
         diag = np.arange(dcr)
 
-        # Match the legacy iteration order so debug prints align; it doesn't
-        # affect the final matrix because `_init_coupling_mat` lex-sorts.
+        # Iteration order is irrelevant — `_init_coupling_mat` lex-sorts.
         known_species_rev = spec_man.known_species[::-1]
         import itertools
 
@@ -294,7 +264,8 @@ class PhotoNuclearInteractionRate(object):
                     B_idx[:, :, None],    # (dcr, dcr, 1) — i_da - i_mo + dcr-1
                 ]
 
-                # Apply the `res<0` clip BEFORE nonel subtraction (matches legacy)
+                # Clip negatives (spline-induced) BEFORE the nonel subtraction —
+                # otherwise we'd erase the negative diagonal contribution.
                 np.clip(res, 0.0, None, out=res)
 
                 # Diagonal nonel subtraction (only when mo==da)
@@ -323,194 +294,6 @@ class PhotoNuclearInteractionRate(object):
                 ibatch += n_kept
                 self._batch_rows.append(rows)
                 self._batch_cols.append(cols)
-
-            else:
-                info(20, "Species combination not included in model", moid, daid)
-
-        self._batch_matrix = self._batch_matrix[:ibatch, :]
-        self._batch_rows = np.concatenate(self._batch_rows, axis=None)
-        self._batch_cols = np.concatenate(self._batch_cols, axis=None)
-        self._batch_vec = np.zeros(ibatch)
-
-        info(2, f"Batch matrix shape: {self._batch_matrix.shape}")
-        info(2, f"Batch rows shape: {self._batch_rows.shape}")
-        info(2, f"Batch cols shape: {self._batch_cols.shape}")
-        info(2, f"Batch vector shape: {self._batch_vec.shape}")
-
-        memory = (
-            self._batch_matrix.nbytes
-            + self._batch_rows.nbytes
-            + self._batch_cols.nbytes
-            + self._batch_vec.nbytes
-        ) / 1024**2
-        info(3, "Memory usage after initialization: {:} MB".format(memory))
-
-    def _init_matrices_legacy(self):
-        """Legacy dense-tensor kernel construction. Kept for benchmarking."""
-
-        # Define some short-cuts
-        known_species = self.spec_man.known_species[::-1]
-        sp_id_ref = self.spec_man.ncoid2sref
-        resp = self.cross_sections.resp
-        m_pr = PRINCE_UNITS.m_proton
-
-        # Energy variables
-        dcr = self.e_cosmicray.d
-        dph = self.e_photon.d
-        ecr = self.e_cosmicray.grid
-        bcr = self.e_cosmicray.bins
-        eph = self.e_photon.grid
-        bph = self.e_photon.bins
-        delta_ec = self.e_cosmicray.widths
-        delta_ph = self.e_photon.widths
-
-        # Edges of each CR energy bin and photon energy bin
-        elims = np.vstack([bcr[:-1], bcr[1:]])
-        plims = np.vstack([bph[:-1], bph[1:]])
-
-        # CR and photon grid indices
-        emo_idcs = np.arange(dcr)
-        eda_idcs = np.arange(dcr)
-        p_idcs = np.arange(dph)
-
-        # values for x and y to cut on:
-        x_cut = config.x_cut
-        x_cut_proton = config.x_cut_proton
-
-        ibatch = 0
-        import itertools
-
-        spec_iter = itertools.product(known_species, known_species)
-        for moid, daid in spec_iter:
-            if moid < 100:
-                continue
-            else:
-                info(10, f"Filling channel {moid} -> {daid}")
-
-            has_nonel = moid == daid
-            if has_nonel:
-                intp_nonel = resp.nonel_intp[moid].antiderivative()
-
-            if ((moid, daid) in self.cross_sections.known_bc_channels) or (
-                has_nonel and (moid, daid) not in self.cross_sections.known_diff_channels
-            ):
-                has_incl = (moid, daid) in resp.incl_intp
-                if has_incl:
-                    intp_bc = resp.incl_intp[(moid, daid)].antiderivative()
-                else:
-                    info(1, "Inclusive interpolator not found for", (moid, daid))
-
-                if not (has_nonel or has_incl):
-                    raise Exception("Channel without interactions:", (moid, daid))
-
-                # The cross sections need to be evaluated
-                # on x = E_{CR,da} / E_{CR,mo} and y = E_ph * E_{CR,mo} / m_proton
-                # To vectorize the evaluation, we create outer products using numpy
-                # broadcasting:
-
-                emo = ecr
-                xl = elims[0] / emo
-                xu = elims[1] / emo
-                delta_x = delta_ec / emo
-
-                yl = plims[0, None, :] * emo[:, None] / m_pr
-                yu = plims[1, None, :] * emo[:, None] / m_pr
-                delta_y = delta_ph[None, :] * emo[:, None] / m_pr
-
-                int_fac = delta_ec[:, None] * delta_ph[None, :] / emo[:, None]
-                diff_fac = 1.0 / delta_x[:, None] / delta_y
-
-                # This takes the average by evaluating the integral and dividing by bin
-                # width
-                if has_incl:
-                    self._batch_matrix[ibatch : ibatch + len(emo), :] = (
-                        (intp_bc(yu) - intp_bc(yl)) * int_fac * diff_fac
-                    )
-                if has_nonel:
-                    self._batch_matrix[ibatch : ibatch + len(emo), :] -= (
-                        (intp_nonel(yu) - intp_nonel(yl)) * int_fac * diff_fac
-                    )
-
-                # finally map this to the coupling matrix
-                ibatch += len(emo)
-                self._batch_rows.append(sp_id_ref[daid].lidx() + eda_idcs)
-                self._batch_cols.append(sp_id_ref[moid].lidx() + emo_idcs)
-
-            elif (moid, daid) in self.cross_sections.known_diff_channels:
-                has_redist = (moid, daid) in resp.incl_diff_intp
-                if has_redist:
-                    intp_diff_integral = resp.incl_diff_intp_integral[(moid, daid)]
-                    intp_nonel = resp.nonel_intp[moid]
-                    intp_nonel_antid = resp.nonel_intp[moid].antiderivative()
-                else:
-                    raise Exception("This should not occur.")
-                # generate outer products using broadcasting
-                emo = ecr[:, None, None]
-                eda = ecr[None, :, None]
-                epho = eph[None, None, :]
-                target_shape = np.ones_like(emo * eda * epho)
-
-                xl = elims[0, None, :, None] / emo * target_shape
-                xu = elims[1, None, :, None] / emo * target_shape
-                delta_x = delta_ec[None, :, None] / emo
-
-                yl = plims[0, None, None, :] * emo / m_pr * target_shape
-                yu = plims[1, None, None, :] * emo / m_pr * target_shape
-                delta_y = delta_ph[None, None, :] * emo / m_pr
-
-                int_fac = (
-                    delta_ec[:, None, None] * delta_ph[None, None, :] / emo
-                ) * target_shape
-                diff_fac = 1.0 / delta_x / delta_y
-
-                # Generate boolean arrays to cut on xvalues
-                if daid == 101:
-                    cuts = np.logical_and(xl >= x_cut_proton, xl <= 1)
-                else:
-                    # or (yu < ymin) or (yl > y_cut)
-                    cuts = np.logical_and(xl >= x_cut, xl <= 1)
-                cuts = cuts[:, :, 0]
-
-                # # NOTE JH: This is an old version, which brute force vectorizes the integral with numpy
-                # # I am leaving this in the comments, in case we want to go back for testing-
-                # integrator = np.vectorize(intp_diff.integral)
-                # res = integrator(xl[cuts], xu[cuts], yl[cuts], yu[cuts]) * diff_fac[cuts] * int_fac[cuts]
-
-                # This takes the average by evaluating the integral and dividing by bin width
-                # intp_diff_integral contains the antiderivate, to to get the integral (xl,yl,xu,yu)
-                # we need to substract INT = (0,0,xu,yu) - (0,0,xl,yu) - (0,0,xu,yl) +
-                # (0,0,xl,yl)
-                res = intp_diff_integral.ev(xu[cuts], yu[cuts])
-                res -= intp_diff_integral.ev(xl[cuts], yu[cuts])
-                res -= intp_diff_integral.ev(xu[cuts], yl[cuts])
-                res += intp_diff_integral.ev(xl[cuts], yl[cuts])
-                res *= diff_fac[cuts] * int_fac[cuts]
-                res[res < 0] = 0.0
-
-                # Since we made cuts on x, we need to make the same cut on the index
-                # mapping
-                emoidx, edaidx, _ = np.meshgrid(
-                    sp_id_ref[moid].lidx() + emo_idcs,
-                    sp_id_ref[daid].lidx() + eda_idcs,
-                    p_idcs,
-                    indexing="ij",
-                )
-                emoidx, edaidx = emoidx[cuts], edaidx[cuts]
-
-                # Now add the nonel interactions on the main diagonal
-                if has_nonel:
-                    res[emoidx == edaidx] -= (
-                        intp_nonel_antid(yu[cuts][emoidx == edaidx])
-                        - intp_nonel_antid(yl[cuts][emoidx == edaidx])
-                    ) * (
-                        diff_fac[cuts][emoidx == edaidx] * int_fac[cuts][emoidx == edaidx]
-                    )
-
-                # Finally write this to the batch matrix
-                self._batch_matrix[ibatch : ibatch + len(emoidx), :] = res
-                self._batch_rows.append(edaidx[:, 0])
-                self._batch_cols.append(emoidx[:, 0])
-                ibatch += len(emoidx)
 
             else:
                 info(20, "Species combination not included in model", moid, daid)
