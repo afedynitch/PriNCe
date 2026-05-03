@@ -333,7 +333,7 @@ class EmpiricalModel(SophiaSuperposition):  # pragma: no cover
         """Populates all tabs (_nonel_tab, _incl_tab, _incl_diff_tab) so they can work
         with the _optimize_indices() method of the base class (CrossSectionBase).
         """
-        from prince_cr._deprecated._phenom_relations import multiplicity_table
+        from prince_cr.cross_sections.empirical_relations import multiplicity_table
 
         self._nonel_tab = {100: (), 101: ()}
 

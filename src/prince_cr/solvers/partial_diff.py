@@ -21,36 +21,9 @@ class DifferentialOperator(object):
     def construct_differential_operator(self):
         from scipy.sparse import block_diag, coo_matrix
 
-        # # Construct a
-        # # First rows of operator matrix
-        # diags_leftmost = [0, 1, 2, 3]
-        # coeffs_leftmost = [-11, 18, -9, 2]
-        # denom_leftmost = 6.
-        # diags_left_1 = [-1, 0, 1, 2, 3]
-        # coeffs_left_1 = [-3, -10, 18, -6, 1]
-        # denom_left_1 = 12.
-        # diags_left_2 = [-2, -1, 0, 1, 2, 3]
-        # coeffs_left_2 = [3, -30, -20, 60, -15, 2]
-        # denom_left_2 = 60.
-        # # Centered diagonals
-        # diags = [-3, -2, -1, 1, 2, 3]
-        # coeffs = [-1, 9, -45, 45, -9, 1]
-        # denom = 60.
-        # # First rows of operator matrix
-        # diags_leftmost = [0, 1]
-        # coeffs_leftmost = [-1, 1]
-        # denom_leftmost = 1.
-        # diags_left_1 = [0, 1]
-        # coeffs_left_1 = [-1, 1]
-        # denom_left_1 = 1.
-        # diags_left_2 = [0, 1]
-        # coeffs_left_2 = [-1, 1]
-        # denom_left_2 = 1.
-        # # Centered diagonals
-        # diags = [0, 1]
-        # coeffs = [-1, 1]
-        # denom = 1.
-        # First rows of operator matrix
+        # Bulk: 4th-order asymmetric upwind stencil on log-E (correct for losses
+        # that move flux toward lower E). Rows 0..2 and dim_e-3..dim_e-1 use
+        # 3- and 4-point one-sided stencils (2nd-order at the edges).
         diags_leftmost = [1, 2, 3]
         coeffs_leftmost = [-3, 4, -1]
         denom_leftmost = 2.0
@@ -61,58 +34,9 @@ class DifferentialOperator(object):
         coeffs_left_2 = [-2, -3, 6, -1]
         denom_left_2 = 6.0
 
-        # # Centered diagonals
-        # diags = [-1, 0, 1, 2]
-        # coeffs = [-2, -3, 6, -1]
-        # denom = 6.
-
-        # # First rows of operator matrix
-        # diags_leftmost = [0, 1, 2, 3]
-        # coeffs_leftmost = [-11, 18, -9, 2]
-        # denom_leftmost = 6.
-        # diags_left_1 = [-1, 0, 1, 2, 3]
-        # coeffs_left_1 = [-3, -10, 18, -6, 1]
-        # denom_left_1 = 12.
-        # diags_left_2 = [-2, -1, 0, 1, 2, 3]
-        # coeffs_left_2 = [3, -30, -20, 60, -15, 2]
-        # denom_left_2 = 60.
-
-        # # Centered diagonals
-        # diags = [-2, -1, 0, 1, 2, 3]
-        # coeffs = [3, -30, -20, 60, -15, 2]
-        # denom = 60.
-
-        # print diags
-        # print coeffs
-        # diags = [-d for d in diags[::-1]]
-        # coeffs = [-d for d in coeffs[::-1]]
-        # denom = denom
-        # print diags
-        # print coeffs
-        # diags = [-3, -2, -1, 1, 2, 3]
-        # coeffs = [-1, 9, -45, 45, -9, 1]
-        # denom = 60.
-
         diags = [-1, 0, 1, 2, 3]
         coeffs = [-3, -10, 18, -6, 1]
         denom = 12.0
-
-        # diags = [0, 1, 2, 3]
-        # coeffs = [-11, 18, -9, 2]
-        # denom = 6.
-
-        # diags_leftmost = [0, 1]
-        # coeffs_leftmost = [-1, 1]
-        # denom_leftmost = 1.
-        # diags_left_1 = [0, 1]
-        # coeffs_left_1 = [-1, 1]
-        # denom_left_1 = 1.
-        # diags_left_2 = [0, 1]
-        # coeffs_left_2 = [-1, 1]
-        # denom_left_2 = 1.
-        # diags = [0, 1]
-        # coeffs = [-1, 1]
-        # denom = 1.
 
         # Last rows at the right of operator matrix
         diags_right_2 = [-d for d in diags_left_2[::-1]]
@@ -174,11 +98,13 @@ class DifferentialOperator(object):
                 + "degree {:}, stencils given: {}".format(degree, stencils)
             )
 
+        from math import factorial
+
         # setup of equation system
         exponents = np.arange(len(stencils))
         matrix = np.power.outer(stencils, exponents).T
         right = np.zeros_like(stencils)
-        right[degree] = np.math.factorial(degree)
+        right[degree] = factorial(degree)
 
         # solution
         return np.linalg.solve(matrix, right)
