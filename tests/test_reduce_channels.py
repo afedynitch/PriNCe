@@ -26,20 +26,16 @@ import pytest
 GOLDEN_PATH = Path(__file__).resolve().parent / "data" / "cs_reduced_tabs.pkl"
 
 
-def _build_fresh_composite():
-    """Rebuild the composite cross section from scratch.
+def _build_fresh_cs():
+    """Rebuild the FlukaPhotoNuclear cross section from scratch.
 
-    The session-scoped `composite` fixture won't tell us whether a fresh
-    build still reduces to the same state, so we instantiate here.
+    The session-scoped `fluka` fixture caches across the test session;
+    instantiating here lets us verify that a fresh build still reduces
+    to the same channel set / values.
     """
     from prince_cr import cross_sections
 
-    return cross_sections.CompositeCrossSection(
-        [
-            (0.0, cross_sections.TabulatedCrossSection, ("CRP2_TALYS",)),
-            (0.14, cross_sections.SophiaSuperposition, ()),
-        ]
-    )
+    return cross_sections.FlukaPhotoNuclear()
 
 
 def _array_fingerprint(arr):
@@ -97,8 +93,8 @@ def _assert_tabs_match(actual, expected, label):
 
 
 def test_reduce_channels_regression():
-    """Fresh CompositeCrossSection build reduces to a stable channel set/values."""
-    cs = _build_fresh_composite()
+    """Fresh FlukaPhotoNuclear build reduces to a stable channel set/values."""
+    cs = _build_fresh_cs()
     snap = _snapshot_tabs(cs)
 
     regen = os.environ.get("PRINCE_REGEN_REDUCE") == "1"
