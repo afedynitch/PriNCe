@@ -647,18 +647,53 @@ class PhotoNuclearInteractionRate(object):
         return egrid, length
 
 
-class ContinuousAdiabaticLossRate(object):
-    """Implementation of continuous pair production loss rates."""
+class _ContinuousLossRateBase(object):
+    """Shared boilerplate for continuous loss-rate classes.
 
-    def __init__(self, prince_run, energy="grid", *args, **kwargs):
+    Both subclasses build a per-species vector keyed either to the
+    cosmic-ray grid (``energy='grid'``, length ``dim_states``) or to its
+    bin edges (``energy='bins'``, length ``dim_bins``).
+    """
+
+    def __init__(self, prince_run):
         info(3, "creating instance")
-        #: Reference to species manager
         self.spec_man = prince_run.spec_man
-
-        # Initialize grids
         self.e_cosmicray = prince_run.cr_grid
         self.dim_states = prince_run.dim_states
         self.dim_bins = prince_run.dim_bins
+
+    def _energy_axis(self, energy):
+        """Resolve ``energy`` to ``(dim, e_array, lo_idx, hi_idx)``.
+
+        ``lo_idx``/``hi_idx`` are callables taking a species and returning
+        the per-species slice bounds in the resulting vector.
+        """
+        if energy == "grid":
+            return (
+                self.dim_states,
+                self.e_cosmicray.grid,
+                lambda s: s.lidx(),
+                lambda s: s.uidx(),
+            )
+        if energy == "bins":
+            return (
+                self.dim_bins,
+                self.e_cosmicray.bins,
+                lambda s: s.lbin(),
+                lambda s: s.ubin(),
+            )
+        raise ValueError(
+            "Unexpected energy keyword ({}), use either 'grid' or 'bins'".format(
+                energy
+            )
+        )
+
+
+class ContinuousAdiabaticLossRate(_ContinuousLossRateBase):
+    """Implementation of continuous pair production loss rates."""
+
+    def __init__(self, prince_run, energy="grid", *args, **kwargs):
+        super().__init__(prince_run)
         # Init adiabatic loss vector
         self.energy_vector = self._init_energy_vec(energy)
 
@@ -674,20 +709,10 @@ class ContinuousAdiabaticLossRate(object):
 
     def _init_energy_vec(self, energy):
         """Prepare vector for scaling with units, charge and mass."""
-        if energy == "grid":
-            energy_vector = np.zeros(self.dim_states)
-            for spec in self.spec_man.species_refs:
-                energy_vector[spec.lidx() : spec.uidx()] = self.e_cosmicray.grid
-        elif energy == "bins":
-            energy_vector = np.zeros(self.dim_bins)
-            for spec in self.spec_man.species_refs:
-                energy_vector[spec.lbin() : spec.ubin()] = self.e_cosmicray.bins
-        else:
-            raise Exception(
-                "Unexpected energy keyword ({:}), use either (grid) or (bins)",
-                format(energy),
-            )
-
+        dim, earr, lo, hi = self._energy_axis(energy)
+        energy_vector = np.zeros(dim)
+        for spec in self.spec_man.species_refs:
+            energy_vector[lo(spec) : hi(spec)] = earr
         return energy_vector
 
     def single_loss_length(self, pid, z):
@@ -702,21 +727,15 @@ class ContinuousAdiabaticLossRate(object):
         return egrid, length
 
 
-class ContinuousPairProductionLossRate(object):
+class ContinuousPairProductionLossRate(_ContinuousLossRateBase):
     """Implementation of continuous pair production loss rates."""
 
     def __init__(self, prince_run, energy="grid", *args, **kwargs):
-        info(3, "creating instance")
-        #: Reference to species manager
-        self.spec_man = prince_run.spec_man
+        super().__init__(prince_run)
 
         #: Owning PriNCeRun (source of `photon_field`, see property below)
         self.prince_run = prince_run
 
-        # Initialize grids
-        self.e_cosmicray = prince_run.cr_grid
-        self.dim_states = prince_run.dim_states
-        self.dim_bins = prince_run.dim_bins
         self.e_photon = prince_run.ph_grid
 
         # xi is dimensionless (natural units) variable
@@ -730,17 +749,10 @@ class ContinuousPairProductionLossRate(object):
         # Scale vector containing the units and factors of Z**2 for nuclei
         self.scale_vec = self._init_scale_vec(energy)
 
-        # Gamma factor of the cosmic ray
-        if energy == "grid":
-            gamma = self.e_cosmicray.grid / PRINCE_UNITS.m_proton
-        elif energy == "bins":
-            gamma = self.e_cosmicray.bins / PRINCE_UNITS.m_proton
-        else:
-            raise Exception(
-                "Unexpected energy keyword ({:}), use either (grid) or (bins)",
-                format(energy),
-            )
-        # Grid of photon energies for interpolation
+        # Grid of photon energies for interpolation. `_energy_axis` already
+        # validated `energy` above; reuse the same axis here.
+        _, earr, _, _ = self._energy_axis(energy)
+        gamma = earr / PRINCE_UNITS.m_proton
         self.photon_grid = np.outer(1 / gamma, self.xi) * PRINCE_UNITS.m_electron / 2.0
         self.pg_desort = self.photon_grid.reshape(-1).argsort()
         self.pg_sorted = self.photon_grid.reshape(-1)[self.pg_desort]
@@ -779,42 +791,21 @@ class ContinuousPairProductionLossRate(object):
 
     def _init_scale_vec(self, energy):
         """Prepare vector for scaling with units, charge and mass."""
-        if energy == "grid":
-            scale_vec = np.zeros(self.dim_states)
-            units = (
-                PRINCE_UNITS.fine_structure
-                * PRINCE_UNITS.r_electron**2
-                * PRINCE_UNITS.m_electron**2
-            )
-            for spec in self.spec_man.species_refs:
-                if not spec.is_nucleus:
-                    continue
-                scale_vec[spec.lidx() : spec.uidx()] = (
-                    units
-                    * abs(spec.charge) ** 2
-                    / float(spec.A)
-                    * np.ones_like(self.e_cosmicray.grid, dtype="double")
-                )
-        elif energy == "bins":
-            scale_vec = np.zeros(self.dim_bins)
-            units = (
-                PRINCE_UNITS.fine_structure
-                * PRINCE_UNITS.r_electron**2
-                * PRINCE_UNITS.m_electron**2
-            )
-            for spec in self.spec_man.species_refs:
-                if not spec.is_nucleus:
-                    continue
-                scale_vec[spec.lbin() : spec.ubin()] = (
-                    units
-                    * abs(spec.charge) ** 2
-                    / float(spec.A)
-                    * np.ones_like(self.e_cosmicray.bins, dtype="double")
-                )
-        else:
-            raise Exception(
-                "Unexpected energy keyword ({:}), use either (grid) or (bins)",
-                format(energy),
+        dim, earr, lo, hi = self._energy_axis(energy)
+        scale_vec = np.zeros(dim)
+        units = (
+            PRINCE_UNITS.fine_structure
+            * PRINCE_UNITS.r_electron**2
+            * PRINCE_UNITS.m_electron**2
+        )
+        for spec in self.spec_man.species_refs:
+            if not spec.is_nucleus:
+                continue
+            scale_vec[lo(spec) : hi(spec)] = (
+                units
+                * abs(spec.charge) ** 2
+                / float(spec.A)
+                * np.ones_like(earr, dtype="double")
             )
         return scale_vec
 
