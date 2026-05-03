@@ -266,26 +266,11 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         """Follows decay chains until all inclusive reactions point to
         stable final state particles.
 
-        The "tau_dec_threshold" parameter in the config controls the
+        The ``tau_dec_threshold`` parameter in the config controls the
         definition of stable. Unstable nuclei for which no decay channels
-        are known, will be forced to beta-decay until they reach a stable
-        element.
+        are known are simply dropped (no forced beta decay).
         """
-        from prince_cr.util import AdditiveDictionary
-
-        # TODO: check routine, how to avoid empty channels and
-        # mothers with zero nonel cross sections
-
-        # The new dictionary that will replace _incl_tab
-        new_incl_tab = AdditiveDictionary()
-        new_dec_diff_tab = AdditiveDictionary()
-
         threshold = config.tau_dec_threshold
-
-        # How to indent debug printout for recursion
-        def dbg_indent(lev):
-            return 4 * lev * "-" + ">" if lev else ""
-
         info(2, "Integrating out species with lifetime smaller than", threshold)
         info(
             3,
@@ -305,141 +290,8 @@ class CrossSectionBase(object, metaclass=ABCMeta):
 
             self.xbins = SophiaSuperposition().xbins
 
-        bc = self.xcenters
-        bw = bin_widths(self.xbins)
-        # The x_mu/x_pi grid
-        # dec_grid = np.fromfunction(
-        #     lambda j, i: 10**(np.log10(bc[1] / bc[0]) * (j - i)), (len(bc),
-        #                                                            len(bc)))
-
-        # dec_grid = np.outer(bc, 1 / bc)
-
-        dec_bins = np.outer(self.xbins, 1 / bc)
-        dec_bins_lower = dec_bins[:-1]
-        dec_bins_upper = dec_bins[1:]
-
-        # dec_grid[dec_grid > 1.] *= 0.
-        # The differential element dx_mu/x_pi
-        int_scale = np.tile(bw / bc, (len(bc), 1))
-
-        from functools import lru_cache
-
-        @lru_cache(maxsize=512, typed=False)
-        def decay_cached(mother, daughter):
-            dec_dist = int_scale * decs.get_decay_matrix_bin_average(
-                mother, daughter, dec_bins_lower, dec_bins_upper
-            )
-
-            return dec_dist
-
-        def convolve_with_decay_distribution(
-            diff_dist, mother, daughter, branching_ratio
-        ):
-            r"""Computes the prompt decay xdist by convolving the x distribution
-            of the unstable particle with the decay product distribution.
-
-            :math:`\frac{{\rm d}N^{A\gamma \to \mu}}{{\rm d}x_j} =
-            \sum_{i=0}^{N_x}~\Delta x_i
-            \frac{{\rm d}N^{A\gamma \to \pi}}{{\rm d} x_i}~
-            \frac{{\rm d}N^{\pi \to \mu}}{{\rm d} x_j}`
-            """
-            # dec_dist = int_scale * decs.get_decay_matrix(
-            #     mother, daughter, dec_grid)
-            dec_dist = decay_cached(mother, daughter)
-
-            info(20, "convolving with decay dist", mother, daughter)
-            # Handle the case where table entry is (energy_grid, matrix)
-            if not isinstance(diff_dist, tuple):
-                return branching_ratio * dec_dist.dot(diff_dist)
-            else:
-                return diff_dist[0], branching_ratio * dec_dist.dot(diff_dist[1])
-
-        def follow_chain(first_mo, da, csection, reclev):
-            """Recursive function to follow decay chains until all
-            final state particles are stable.
-
-            The result is saved in two dictionaries; one for the boost
-            conserving inclusive channels and the other one collects
-            channels with meson or lepton decay products, which will
-            need special care due to energy redistributions of these
-            secondaries.
-            """
-
-            info(10, dbg_indent(reclev), "Entering with", first_mo, da)
-
-            if da not in spec_data:
-                info(
-                    3,
-                    dbg_indent(reclev),
-                    "daughter {0} unknown. Force beta decay not implemented!!".format(da),
-                )
-                return
-
-            # Daughter is stable. Add it to the new dictionary and terminate
-            # recursion
-            if spec_data[da]["lifetime"] >= threshold:
-                if self.is_differential(None, da):
-                    # If the daughter is a meson or lepton, use the dictionary for
-                    # differential channels
-                    info(
-                        20,
-                        dbg_indent(reclev),
-                        "daughter {0} stable and differential. Adding to ({1}, {2})".format(
-                            da, first_mo, da
-                        ),
-                    )
-                    new_dec_diff_tab[(first_mo, da)] = csection
-                else:
-                    info(
-                        20,
-                        dbg_indent(reclev),
-                        "daughter {0} stable. Adding to ({1}, {2})".format(
-                            da, first_mo, da
-                        ),
-                    )
-                    new_incl_tab[(first_mo, da)] = csection
-                return
-
-            # ..otherwise follow decay products of this daughter, tracking the
-            # original mother particle (first_mo). The cross section (csection) is
-            # reduced by the branching ratio (br) of this particular channel
-            for br, daughters in spec_data[da]["branchings"]:
-                info(
-                    10,
-                    dbg_indent(reclev),
-                    ("{3} -> {0:4d} -> {2:4.2f}: {1}").format(
-                        da, ", ".join(map(str, daughters)), br, first_mo
-                    ),
-                )
-
-                for chained_daughter in daughters:
-                    # Follow each secondary and increment the recursion level by one
-                    if self.is_differential(None, chained_daughter):
-                        info(
-                            10,
-                            "daughter",
-                            chained_daughter,
-                            "of",
-                            da,
-                            "is differential",
-                        )
-                        follow_chain(
-                            first_mo,
-                            chained_daughter,
-                            convolve_with_decay_distribution(
-                                self._arange_on_xgrid(csection),
-                                da,
-                                chained_daughter,
-                                br,
-                            ),
-                            reclev + 1,
-                        )
-                    else:
-                        follow_chain(
-                            first_mo, chained_daughter, br * csection, reclev + 1
-                        )
-
-        # Remove all unstable particles from the dictionaries
+        # Drop unstable mothers from the nonel dictionary first; the chain
+        # reduction below only walks daughters of mothers that survive.
         for mother in sorted(self._nonel_tab.keys()):
             if mother not in spec_data or spec_data[mother]["lifetime"] < threshold:
                 info(
@@ -449,9 +301,10 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                     ),
                 )
                 _ = self._nonel_tab.pop(mother)
-        # Only stable (interacting) mother particles are left
         self._update_indices()
 
+        # Drop incl entries whose mother is no longer stable; for the rest,
+        # move differential channels to _incl_diff_tab.
         for mother, daughter in self.incl_idcs:
             if mother not in self.nonel_idcs:
                 info(
@@ -463,8 +316,6 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                 _ = self._incl_tab.pop((mother, daughter))
 
             elif self.is_differential(mother, daughter):
-                # Move the distributions which are expected to be differential
-                # to _incl_diff_tab
                 self._incl_diff_tab[(mother, daughter)] = self._arange_on_xgrid(
                     self._incl_tab.pop((mother, daughter))
                 )
@@ -483,23 +334,17 @@ class CrossSectionBase(object, metaclass=ABCMeta):
 
         self._update_indices()
 
-        # Launch the reduction for each inclusive channel
+        # Walk every channel's decay chain and accumulate stable-final-state
+        # contributions into the reducer's two output dicts.
+        reducer = _DecayChainReducer(self, threshold)
         for (mo, da), value in list(self._incl_tab.items()):
-            # print mo, da, value
-            # print '---'*30
-            follow_chain(mo, da, value, 0)
-
+            reducer.follow(mo, da, value)
         for (mo, da), value in list(self._incl_diff_tab.items()):
-            # print mo, da, value
-            # print '---'*30
-            follow_chain(mo, da, value, 0)
+            reducer.follow(mo, da, value)
 
-        # Overwrite the old incl dictionary
-        self._incl_tab = dict(new_incl_tab)
-        # Overwrite the old incl_diff dictionary
-        self._incl_diff_tab = dict(new_dec_diff_tab)
-        # Reduce also the incl_diff_tab by removing the unknown mothers. At this stage
-        # of the code, the particles with redistributions are
+        self._incl_tab = dict(reducer.new_incl_tab)
+        self._incl_diff_tab = dict(reducer.new_dec_diff_tab)
+
         info(
             3,
             (
@@ -509,7 +354,10 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                 len(self._nonel_tab), len(self._incl_tab) + len(self._incl_diff_tab)
             ),
         )
-        info(2, f"Cache used for decays, {decay_cached.cache_info()}")  # pylint:disable=no-value-for-parameter
+        info(
+            2,
+            f"Cache used for decays: {reducer.decay_cache_size} entries.",
+        )
 
     def nonel_scale(self, mother, scale="A"):
         """Returns the nonel cross section scaled by `scale`.
@@ -695,6 +543,146 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         multiplicities = cs_incl / np.where(cs_nonel == 0, np.inf, cs_nonel)
 
         return egrid_nonel, multiplicities
+
+
+class _DecayChainReducer(object):
+    """Walk decay chains for `CrossSectionBase._reduce_channels`.
+
+    For a given owning cross-section and lifetime threshold, `follow` recurses
+    on a (mother, daughter) channel until the daughter is stable (lifetime
+    >= threshold), accumulating the cross section -- multiplied by the
+    branching ratios along the way -- into one of two output dicts on this
+    instance:
+
+      - `new_incl_tab`:    boost-conserving stable daughters
+      - `new_dec_diff_tab`: stable daughters that carry an x redistribution
+
+    The decay distribution between two species (`int_scale * decay_matrix`)
+    is cached on the instance so we don't rebuild it for repeated chained
+    daughters.
+    """
+
+    def __init__(self, owner, threshold):
+        from prince_cr.util import AdditiveDictionary
+
+        self.owner = owner
+        self.threshold = threshold
+        self.new_incl_tab = AdditiveDictionary()
+        self.new_dec_diff_tab = AdditiveDictionary()
+
+        bc = owner.xcenters
+        bw = bin_widths(owner.xbins)
+        dec_bins = np.outer(owner.xbins, 1 / bc)
+        self._dec_bins_lower = dec_bins[:-1]
+        self._dec_bins_upper = dec_bins[1:]
+        self._int_scale = np.tile(bw / bc, (len(bc), 1))
+
+        self._decay_cache = {}
+
+    @property
+    def decay_cache_size(self):
+        return len(self._decay_cache)
+
+    @staticmethod
+    def _dbg_indent(reclev):
+        return 4 * reclev * "-" + ">" if reclev else ""
+
+    def _decay_dist(self, mother, daughter):
+        key = (mother, daughter)
+        cached = self._decay_cache.get(key)
+        if cached is None:
+            cached = self._int_scale * decs.get_decay_matrix_bin_average(
+                mother, daughter, self._dec_bins_lower, self._dec_bins_upper
+            )
+            self._decay_cache[key] = cached
+        return cached
+
+    def _convolve(self, diff_dist, mother, daughter, branching_ratio):
+        r"""Convolve `diff_dist` (already on the x-grid) with the
+        mother→daughter decay distribution and scale by the branching ratio.
+
+        :math:`\frac{{\rm d}N^{A\gamma \to \mu}}{{\rm d}x_j} =
+        \sum_{i=0}^{N_x}~\Delta x_i
+        \frac{{\rm d}N^{A\gamma \to \pi}}{{\rm d} x_i}~
+        \frac{{\rm d}N^{\pi \to \mu}}{{\rm d} x_j}`
+        """
+        dec_dist = self._decay_dist(mother, daughter)
+        info(20, "convolving with decay dist", mother, daughter)
+        if not isinstance(diff_dist, tuple):
+            return branching_ratio * dec_dist.dot(diff_dist)
+        return diff_dist[0], branching_ratio * dec_dist.dot(diff_dist[1])
+
+    def follow(self, first_mo, da, csection, reclev=0):
+        """Recurse into `da`'s decay chain, anchored on `first_mo`.
+
+        Either records `csection` against a stable terminal daughter, or
+        delegates to `_recurse_into_daughters` to walk one more level.
+        """
+        info(10, self._dbg_indent(reclev), "Entering with", first_mo, da)
+
+        if da not in spec_data:
+            info(
+                3,
+                self._dbg_indent(reclev),
+                "daughter {0} unknown. Force beta decay not implemented!!".format(da),
+            )
+            return
+
+        if spec_data[da]["lifetime"] >= self.threshold:
+            self._record_stable(first_mo, da, csection, reclev)
+            return
+
+        self._recurse_into_daughters(first_mo, da, csection, reclev)
+
+    def _record_stable(self, first_mo, da, csection, reclev):
+        """Terminal arm: daughter is stable. Route to the right output dict."""
+        if self.owner.is_differential(None, da):
+            info(
+                20,
+                self._dbg_indent(reclev),
+                "daughter {0} stable and differential. Adding to ({1}, {2})".format(
+                    da, first_mo, da
+                ),
+            )
+            self.new_dec_diff_tab[(first_mo, da)] = csection
+        else:
+            info(
+                20,
+                self._dbg_indent(reclev),
+                "daughter {0} stable. Adding to ({1}, {2})".format(da, first_mo, da),
+            )
+            self.new_incl_tab[(first_mo, da)] = csection
+
+    def _recurse_into_daughters(self, first_mo, da, csection, reclev):
+        """Recursive arm: daughter is unstable. For each branching, recurse on
+        each chained daughter, scaling the cross section by the branching
+        ratio and convolving with the decay distribution if the chained
+        daughter requires x-redistribution.
+        """
+        for br, daughters in spec_data[da]["branchings"]:
+            info(
+                10,
+                self._dbg_indent(reclev),
+                ("{3} -> {0:4d} -> {2:4.2f}: {1}").format(
+                    da, ", ".join(map(str, daughters)), br, first_mo
+                ),
+            )
+            for chained_daughter in daughters:
+                if self.owner.is_differential(None, chained_daughter):
+                    info(10, "daughter", chained_daughter, "of", da, "is differential")
+                    self.follow(
+                        first_mo,
+                        chained_daughter,
+                        self._convolve(
+                            self.owner._arange_on_xgrid(csection),
+                            da,
+                            chained_daughter,
+                            br,
+                        ),
+                        reclev + 1,
+                    )
+                else:
+                    self.follow(first_mo, chained_daughter, br * csection, reclev + 1)
 
 
 if __name__ == "__main__":
