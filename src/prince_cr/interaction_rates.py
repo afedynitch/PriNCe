@@ -78,9 +78,10 @@ class PhotoNuclearInteractionRate(object):
         for specid in self.spec_man.known_species:
             if specid < 100:
                 continue
-            # Add the main diagonal self-couplings (absoption)
+            # Add the main diagonal self-couplings (absorption)
             batch_dim += dcr
-            for rtup in self.cross_sections.reactions[specid]:
+            # Daughter-only species have no outgoing reactions; skip them here.
+            for rtup in self.cross_sections.reactions.get(specid, []):
                 # Off main diagonal couplings (reinjection)
                 if rtup in self.cross_sections.known_bc_channels:
                     batch_dim += dcr
@@ -226,6 +227,9 @@ class PhotoNuclearInteractionRate(object):
 
         for moid, daid in itertools.product(known_species_rev, known_species_rev):
             if moid < 100:
+                continue
+            # Daughter-only species have no cross sections; skip them as mothers.
+            if moid not in self.cross_sections.reactions:
                 continue
 
             has_nonel = moid == daid
