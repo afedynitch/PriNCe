@@ -75,6 +75,20 @@ class PhotoNuclearInteractionRate(object):
         dph = self.e_photon.d
 
         batch_dim = 0
+        # Surface any daughter-only species (in known_species but absent from
+        # reactions) so a debugger doesn't have to chase silent absorption
+        # holes downstream. Empty list means clean db.
+        daughter_only = [
+            s
+            for s in self.spec_man.known_species
+            if s >= 100 and s not in self.cross_sections.reactions
+        ]
+        if daughter_only:
+            info(
+                2,
+                "Daughter-only species (no primary cross-sections, "
+                "off-diagonal absorption skipped): {0}".format(daughter_only),
+            )
         for specid in self.spec_man.known_species:
             if specid < 100:
                 continue
