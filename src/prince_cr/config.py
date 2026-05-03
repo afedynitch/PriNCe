@@ -28,8 +28,19 @@ print_module = False
 #: Directory where the data files for the calculation are stored
 data_dir = path.join(base_path, "data")
 
-#: PrinceDB file name
+#: PrinceDB file name (legacy; serves EBL_models in production after the
+#: FLUKA wiring lands)
 db_fname = "prince_db_05.h5"
+
+#: FLUKA-derived photo-nuclear database file name. Built by
+#: ``prince-fluka-utils`` (separate repo). Path defaults to ``data_dir``;
+#: override ``prince_cr.config.fluka_db_path`` to point at the source repo.
+fluka_db_fname = "prince_db_v0.h5"
+
+#: Directory containing ``fluka_db_fname``. No auto-download for v0 — set
+#: this to the prince-fluka-utils repo root or copy the file into
+#: ``data_dir``.
+fluka_db_path = data_dir
 
 #: Model file for redistribution functions (from SOPHIA or similar)
 redist_fname = "sophia_redistribution_logbins.npy"
