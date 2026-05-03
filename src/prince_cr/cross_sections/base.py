@@ -280,16 +280,6 @@ class CrossSectionBase(object, metaclass=ABCMeta):
             ).format(len(self._nonel_tab), len(self._incl_tab)),
         )
 
-        if self.xbins is None:
-            info(
-                4,
-                "Model does not provide a native xbins. Assuming JH special sophia",
-                "binning.",
-            )
-            from .photo_meson import SophiaSuperposition
-
-            self.xbins = SophiaSuperposition().xbins
-
         # Drop unstable mothers from the nonel dictionary first; the chain
         # reduction below only walks daughters of mothers that survive.
         for mother in sorted(self._nonel_tab.keys()):
