@@ -173,6 +173,52 @@ class PrinceDB(object):
 
         return db_entry
 
+    def fluka_photo_nuclear_db(self, model_tag, e_range=None):
+        """Read photo_nuclear/<tag>/ from the FLUKA db (a separate file from
+        ``db_fname``). Lazy: opens the file on each call.
+
+        Args:
+            model_tag (str): subgroup tag, e.g. ``"FLUKA_2025"``.
+            e_range (tuple or None): ``(e_min, e_max)`` GeV bounds.
+
+        Returns:
+            dict with keys: ``energy_grid``, ``xbins``, ``inel_mothers``,
+            ``mothers_daughters``, ``elementary_daughters``,
+            ``inelastic_cross_sctions`` (typo preserved), ``fragment_yields``
+            (n_ch, n_E), ``elementary_yields`` (n_em, n_E, n_x).
+        """
+        info(10, "Reading FLUKA photo-nuclear db. tag={0}".format(model_tag))
+        fpath = path.join(config.fluka_db_path, config.fluka_db_fname)
+        if not path.isfile(fpath):
+            raise FileNotFoundError(
+                f"FLUKA db not found at {fpath}. "
+                "Set prince_cr.config.fluka_db_path to its directory "
+                "(e.g. the prince-fluka-utils repo root)."
+            )
+
+        db_entry = {}
+        with h5py.File(fpath, "r") as fdb:
+            self._check_subgroup_exists(fdb["photo_nuclear"], model_tag)
+            grp = fdb["photo_nuclear"][model_tag]
+
+            egrid_full = grp["energy_grid"][:]
+            sl = self._energy_slice(egrid_full, e_range)
+            db_entry["energy_grid"] = egrid_full[sl]
+            db_entry["xbins"] = grp["xbins"][:]
+
+            for entry in ("inel_mothers", "mothers_daughters", "elementary_daughters"):
+                info(10, "Reading entry {0} from FLUKA db.".format(entry))
+                db_entry[entry] = grp[entry][:]
+
+            # σ_inel: (n_m, n_E) — slice last axis
+            db_entry["inelastic_cross_sctions"] = grp["inelastic_cross_sctions"][:, sl]
+            # heavy yields: (n_ch, n_E) — slice last axis
+            db_entry["fragment_yields"] = grp["fragment_yields"][:, sl]
+            # elementary yields: (n_em, n_E, n_x) — slice middle axis
+            db_entry["elementary_yields"] = grp["elementary_yields"][:, sl, :]
+
+        return db_entry
+
     def ebl_spline(self, model_tag, subset="base"):
         from scipy.interpolate import RegularGridInterpolator
 

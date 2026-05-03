@@ -29,6 +29,11 @@ config.x_cut_proton = 1e-2
 config.tau_dec_threshold = np.inf
 config.max_mass = 14
 
+# FLUKA db lives in a sibling repo during v0 development. Production users
+# either copy the file into data_dir or override this path themselves.
+config.fluka_db_path = "/Users/anatoli/devel_mac/prince-fluka-utils"
+config.fluka_db_fname = "prince_db_v0.h5"
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
