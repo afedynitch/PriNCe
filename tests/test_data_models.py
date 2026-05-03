@@ -159,15 +159,6 @@ class TestPrinceSpeciesVariants:
         assert n14.Z == 7
         assert n14.N == 7
 
-    def test_indices_method(self):
-        species = [100, 101]
-        sm = SpeciesManager(species, 10)
-        proton = sm.ncoid2sref[101]
-        indices = proton.indices()
-        assert len(indices) == 10
-        assert indices[0] == proton.lidx()
-        assert indices[-1] == proton.uidx() - 1
-
     def test_lbin_ubin(self):
         species = [100, 101]
         sm = SpeciesManager(species, 10)

@@ -24,8 +24,8 @@ class PhotoNuclearInteractionRate(object):
         info(3, "creating instance")
         self.with_dense_jac = with_dense_jac
 
-        #: Reference to PhotonField object
-        self.photon_field = prince_run.photon_field
+        #: Owning PriNCeRun (source of `photon_field`, see property below)
+        self.prince_run = prince_run
 
         #: Reference to CrossSection object
         self.cross_sections = prince_run.cross_sections
@@ -38,7 +38,6 @@ class PhotoNuclearInteractionRate(object):
         self.e_cosmicray = prince_run.cr_grid
 
         # Initialize cache of redshift value
-        self._ph_vec_zcache = None
         self._ratemat_zcache = None
 
         # Initialize the matrices for batch computation
@@ -53,7 +52,11 @@ class PhotoNuclearInteractionRate(object):
         self._init_matrices()
         self._init_coupling_mat()
 
-    def photon_vector(self, z):
+    @property
+    def photon_field(self):
+        return self.prince_run.photon_field
+
+    def photon_vector(self, z, pfield=None):
         """Returns photon vector at redshift `z` on photon grid.
 
         This vector is in fact a matrix of vectors of the interpolated
@@ -61,13 +64,10 @@ class PhotoNuclearInteractionRate(object):
 
         Args:
             z (float): redshift
-
-        Return value from cache if redshift value didn't change since last call.
+            pfield: optional photon field override; defaults to ``self.photon_field``.
         """
-        # photon_vector = np.zeros_like(self.e_photon.grid)
-        photon_vector = self.photon_field.get_photon_density(self.e_photon.grid, z)
-
-        return photon_vector
+        pf = pfield if pfield is not None else self.photon_field
+        return pf.get_photon_density(self.e_photon.grid, z)
 
     def _estimate_batch_matrix(self):
         """estimate dimension of the batch matrix"""
@@ -574,7 +574,7 @@ class PhotoNuclearInteractionRate(object):
         else:
             self._batch_matrix = self._batch_matrix[self.sortidx, :]
 
-    def _update_rates(self, z, force_update=False):
+    def _update_rates(self, z, force_update=False, pfield=None):
         """Batch compute all nonel and inclusive rates if z changes.
 
         The result is always stored in the same vectors, since '_init_rate_matstruc'
@@ -582,11 +582,12 @@ class PhotoNuclearInteractionRate(object):
 
         Args:
             z (float): Redshift value at which the photon field is taken.
+            pfield: optional photon field override (one-shot, bypasses cache).
 
         Returns:
             (bool): True if fields we indeed updated, False if nothing happened.
         """
-        if self._ratemat_zcache != z or force_update:
+        if pfield is not None or self._ratemat_zcache != z or force_update:
             info(5, "Updating batch rate vectors.")
 
             if using_cupy:
@@ -594,42 +595,48 @@ class PhotoNuclearInteractionRate(object):
                     self._init_coupling_mat()
                 cupy.dot(
                     self._batch_matrix,
-                    cupy.array(self.photon_vector(z), dtype=np.float32),
+                    cupy.array(self.photon_vector(z, pfield=pfield), dtype=np.float32),
                     out=self._batch_vec,
                 )
             else:
-                np.dot(self._batch_matrix, self.photon_vector(z), out=self._batch_vec)
-            self._ratemat_zcache = z
+                np.dot(
+                    self._batch_matrix,
+                    self.photon_vector(z, pfield=pfield),
+                    out=self._batch_vec,
+                )
+            # Invalidate cache for one-shot pfield overrides so the next
+            # normal-path call recomputes against `self.photon_field`.
+            self._ratemat_zcache = None if pfield is not None else z
             return True
         else:
             return False
 
-    def _update_coupling_mat(self, z, scale_fac, force_update=False):
+    def _update_coupling_mat(self, z, scale_fac, force_update=False, pfield=None):
         """Updates the sparse (csr) coupling matrix
         Only the data vector is updated to minimize computation
         """
         # Do not execute dot product if photon field didn't change
-        if self._update_rates(z, force_update):
+        if self._update_rates(z, force_update, pfield=pfield):
+            # Sparsity-pattern contract (see CLAUDE.md): only `data` is mutated;
+            # `indices`/`indptr` were fixed by `_init_coupling_mat`. SpMV backends
+            # (scipy/MKL/cupy) rely on the pattern being intact.
+            assert self.coupling_mat.data.size == self._batch_vec.size
             self.coupling_mat.data = scale_fac * self._batch_vec
 
-    def get_hadr_jacobian(self, z, scale_fac=1.0, force_update=False):
+    def get_hadr_jacobian(self, z, scale_fac=1.0, force_update=False, pfield=None):
         """Returns the nonel rate vector and coupling matrix."""
-        self._update_coupling_mat(z, scale_fac, force_update)
+        self._update_coupling_mat(z, scale_fac, force_update, pfield=pfield)
         return self.coupling_mat
 
     def single_interaction_length(self, pid, z, pfield=None):
         """Returns energy loss length in cm
         (convenience function for plotting)
         """
-        if pfield is not None:
-            mem_pfield = self.photon_field
-            self.photon_field = pfield
-
         species = self.spec_man.ncoid2sref[pid]
         egrid = self.e_cosmicray.grid * species.A
         rate = (
             -1
-            * self.get_hadr_jacobian(force_update=True, z=z)
+            * self.get_hadr_jacobian(force_update=True, z=z, pfield=pfield)
             .toarray()[species.sl, species.sl]
             .diagonal()
         )
@@ -637,7 +644,6 @@ class PhotoNuclearInteractionRate(object):
         with np.errstate(divide="ignore"):
             length = 1 / rate
 
-        self.photon_field = mem_pfield
         return egrid, length
 
 
@@ -704,8 +710,8 @@ class ContinuousPairProductionLossRate(object):
         #: Reference to species manager
         self.spec_man = prince_run.spec_man
 
-        #: Reference to PhotonField object
-        self.photon_field = prince_run.photon_field
+        #: Owning PriNCeRun (source of `photon_field`, see property below)
+        self.prince_run = prince_run
 
         # Initialize grids
         self.e_cosmicray = prince_run.cr_grid
@@ -739,15 +745,21 @@ class ContinuousPairProductionLossRate(object):
         self.pg_desort = self.photon_grid.reshape(-1).argsort()
         self.pg_sorted = self.photon_grid.reshape(-1)[self.pg_desort]
 
-    def loss_vector(self, z):
+    @property
+    def photon_field(self):
+        return self.prince_run.photon_field
+
+    def loss_vector(self, z, pfield=None):
         """Returns all continuous losses on dim_states grid"""
 
-        rate_single = trapz(self.photon_vector(z) * self.phi_xi2, self.xi, axis=1)
+        rate_single = trapz(
+            self.photon_vector(z, pfield=pfield) * self.phi_xi2, self.xi, axis=1
+        )
         pprod_loss_vector = self.scale_vec * np.tile(rate_single, self.spec_man.nspec)
 
         return pprod_loss_vector
 
-    def photon_vector(self, z):
+    def photon_vector(self, z, pfield=None):
         """Returns photon vector at redshift `z` on photon grid.
 
         This vector is in fact a matrix of vectors of the interpolated
@@ -755,11 +767,11 @@ class ContinuousPairProductionLossRate(object):
 
         Args:
             z (float): redshift
-
-        Return value from cache if redshift value didn't change since last call.
+            pfield: optional photon field override; defaults to ``self.photon_field``.
         """
+        pf = pfield if pfield is not None else self.photon_field
         photon_vector = np.zeros_like(self.photon_grid)
-        photon_vector.reshape(-1)[self.pg_desort] = self.photon_field.get_photon_density(
+        photon_vector.reshape(-1)[self.pg_desort] = pf.get_photon_density(
             self.pg_sorted, z
         )
 
@@ -810,17 +822,12 @@ class ContinuousPairProductionLossRate(object):
         """Returns energy loss length in cm
         (convenience function for plotting)
         """
-        if pfield is not None:
-            mem_pfield = self.photon_field
-            self.photon_field = pfield
-
         species = self.spec_man.ncoid2sref[pid]
 
         egrid = self.e_cosmicray.grid * species.A
-        rate = self.loss_vector(z)[species.sl] * species.A
+        rate = self.loss_vector(z, pfield=pfield)[species.sl] * species.A
         length = egrid / rate
 
-        self.photon_field = mem_pfield
         return egrid, length
 
     def _phi(self, xi):

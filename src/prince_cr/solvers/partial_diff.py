@@ -76,7 +76,7 @@ class DifferentialOperator(object):
             op_matrix[row, row + np.asarray(diags)] = np.asarray(coeffs) / (denom * h)
         # Construct an operator by left multiplication of the back-substitution
         # dlnE to dE. The right energy loss has to be later multiplied in every step
-        single_op = coo_matrix(np.diag(1 / self.egrid).dot(op_matrix))
+        single_op = coo_matrix(op_matrix * (1.0 / self.egrid)[:, None])
 
         # construct the operator for the whole matrix, by repeating
         return block_diag(self.nspec * [single_op]).tocsr()

@@ -393,16 +393,6 @@ class PrinceSpecies(object):
         """
         return (self.princeidx + 1) * (self.grid_dims[grid_tag] + 1)
 
-    def indices(self, grid_tag="default"):
-        """Returns a list of all indices in the state vector.
-
-        Returns:
-          (numpy.array): array of indices in state vector :attr:`PrinceRun.phi`
-        """
-        idx = self.princeidx
-        dim = self.grid_dims[grid_tag]
-        return np.arange(idx * dim, (idx + 1) * dim)
-
 
 class SpeciesManager(object):
     """Provides a database with particle and species."""

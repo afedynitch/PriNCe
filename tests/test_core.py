@@ -39,8 +39,12 @@ class TestPriNCeRun:
         old_pf = prince_run.photon_field
         prince_run.set_photon_field(new_pf)
         assert prince_run.photon_field is new_pf
-        assert prince_run.adia_loss_rates_grid.photon_field is new_pf
+        # Sub-objects that read `photon_field` see the change via property
+        # delegation back to the run. `ContinuousAdiabaticLossRate` does not
+        # depend on the photon field.
         assert prince_run.pair_loss_rates_grid.photon_field is new_pf
+        assert prince_run.pair_loss_rates_bins.photon_field is new_pf
+        assert prince_run.int_rates.photon_field is new_pf
         # Restore
         prince_run.set_photon_field(old_pf)
 

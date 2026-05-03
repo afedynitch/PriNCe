@@ -101,9 +101,8 @@ class PriNCeRun(object):
         self.spec_man.add_grid("ph", self.ph_grid.d)
 
     def set_photon_field(self, pfield):
+        # Sub-objects (`int_rates`, `pair_loss_rates_*`) read `photon_field`
+        # via a property that delegates back to this PriNCeRun, so no fan-out
+        # is needed. `ContinuousAdiabaticLossRate` does not depend on the
+        # photon field at all.
         self.photon_field = pfield
-        self.adia_loss_rates_grid.photon_field = pfield
-        self.pair_loss_rates_grid.photon_field = pfield
-        self.adia_loss_rates_bins.photon_field = pfield
-        self.pair_loss_rates_bins.photon_field = pfield
-        self.int_rates.photon_field = pfield

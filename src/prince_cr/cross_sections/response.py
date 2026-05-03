@@ -1,8 +1,7 @@
 import numpy as np
 
 from prince_cr.util import get_2Dinterp_object, get_interp_object, info, get_AZN
-
-from .base import CrossSectionBase
+import prince_cr.config as config
 
 
 class ResponseFunction(object):
@@ -29,10 +28,16 @@ class ResponseFunction(object):
 
         self._precompute_interpolators()
 
-    # forward is_differential() to CrossSectionBase
-    # that might break in the future...
     def is_differential(self, mother, daughter):
-        return CrossSectionBase.is_differential(self, mother, daughter)
+        """True if (mother, daughter) requires a redistribution kernel.
+
+        Mirrors `CrossSectionBase.is_differential` but reads only the
+        public state copied at __init__ (`incl_diff_idcs`).
+        """
+        return (
+            daughter <= config.redist_threshold_ID
+            or (mother, daughter) in self.incl_diff_idcs
+        )
 
     def get_full(self, mother, daughter, ygrid, xgrid=None):
         """Return the full response function :math:`f(y) + g(y) + h(x,y)`
