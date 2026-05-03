@@ -105,3 +105,90 @@ def _warn_misclassified(mo: int, da: int) -> None:
         "FlukaPhotoNuclear: dropping misclassified ({0}, {1}) — daughter "
         "is not a nucleus; expected in elementary_daughters bucket".format(mo, da),
     )
+
+
+class FlukaPhotoNuclear(CrossSectionBase):
+    """γ + (Z,A) cross sections from FLUKA via prince-fluka-utils.
+
+    Replaces the old SOPHIA + PEANUT_IAS / CRP2_TALYS pair as PriNCe's
+    photo-nuclear model. One HDF5 group provides every channel: heavy
+    daughters (A_d >= 2) go into ``_incl_tab`` (boost-conserving), light
+    daughters (free nucleons + elementary species) go into
+    ``_incl_diff_tab`` (3D, redistributed in x = E_secondary / E_γ).
+
+    The HANDOVER_photo_meson.md placeholder-trick failure mode does not
+    apply here: every declared channel has a real ndarray, no
+    ``()`` / ``np.array([])`` sentinels.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Tells the interpolator we have differential channels
+        self.supports_redistributions = True
+        config.max_mass = kwargs.pop("max_mass", config.max_mass)
+        model_tag = kwargs.pop("model_tag", "FLUKA_2025")
+        CrossSectionBase.__init__(self)
+        self._load(model_tag)
+        self._optimize_and_generate_index()
+
+    def _load(self, model_tag):
+        from prince_cr.data import db_handler
+
+        info(2, "Loading FLUKA photo-nuclear cross sections.")
+        tables = db_handler.fluka_photo_nuclear_db(
+            model_tag, e_range=config.cross_section_e_range
+        )
+
+        self._egrid_tab = tables["energy_grid"]    # GeV
+        self.xbins = tables["xbins"]               # log-spaced [1e-5, 3], 200 bins
+
+        # σ_inel: (n_m, n_E)
+        for ncoid, sig in zip(
+            tables["inel_mothers"], tables["inelastic_cross_sctions"]
+        ):
+            ncoid = int(ncoid)
+            A, _, _ = get_AZN(ncoid)
+            if A > config.max_mass:
+                continue
+            self._nonel_tab[ncoid] = sig           # cm^2
+
+        # Boost-conserving: (mother_ncoid, daughter_ncoid), 2D yields (n_ch, n_E)
+        for (mo, da), yld in zip(
+            tables["mothers_daughters"], tables["fragment_yields"]
+        ):
+            mo, da = int(mo), int(da)
+            # v0 generator inconsistency: K^±, Λ, and free p/n sometimes land
+            # here. Drop them; they belong in elementary_daughters. Also drop
+            # any row where daughter mass > mother mass (unphysical; a known
+            # v0 db artefact from misrouted PDG codes and cross-isobar entries).
+            A_mo, _, _ = get_AZN(mo)
+            A_da, _, _ = get_AZN(da)
+            if not _is_nucleus(da) or A_da < 2 or A_da > A_mo:
+                _warn_misclassified(mo, da)
+                continue
+            if A_mo > config.max_mass:
+                continue
+            self._incl_tab[mo, da] = yld
+
+        # Redistributed: (mother_ncoid, daughter_pdg→ncoid), 3D yields
+        # FLUKA stores (n_E, n_x); transpose to PriNCe convention (n_x, n_E).
+        for (mo, da_pdg), yld_3d in zip(
+            tables["elementary_daughters"], tables["elementary_yields"]
+        ):
+            mo, da_pdg = int(mo), int(da_pdg)
+            da_ncoid = _pdg_to_ncoid(da_pdg)
+            if da_ncoid is None:                   # K^0_S / K^0_L drop
+                continue
+            A_mo, _, _ = get_AZN(mo)
+            if A_mo > config.max_mass:
+                continue
+            self._incl_diff_tab[mo, da_ncoid] = yld_3d.T
+
+        # Initial range = full egrid
+        self.set_range()
+        info(
+            2,
+            "FlukaPhotoNuclear loaded: {0} mothers, {1} bc channels, "
+            "{2} diff channels".format(
+                len(self._nonel_tab), len(self._incl_tab), len(self._incl_diff_tab)
+            ),
+        )
