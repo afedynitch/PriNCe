@@ -110,6 +110,20 @@ class FlukaPhotoNuclear(CrossSectionBase):
         # convention); the response builder expects dσ/dx. Divide by bin width
         # on load so _incl_diff_tab matches SOPHIA's per-density convention.
         xwidths = self.xbins[1:] - self.xbins[:-1]
+        # FLUKA stores x = E_d_lab / (E_γ + m_target), so boost-conserved free
+        # nucleons from a heavy mother peak at x_FLUKA = m_p / m_target ≈ 1/A_mo.
+        # PriNCe's kernel runs on per-nucleon energies (see cr_sources.py:
+        # AugerFitSource.injection_spectrum uses e_k = A * energy), where boost
+        # conservation maps the same channel onto x_kernel = A_mo · x_FLUKA = 1.
+        # We rescale per mother on load: log10(x_kernel) = log10(A_mo) +
+        # log10(x_FLUKA), with conservation dσ/dx_kernel = (dσ/dx_FLUKA)/A_mo.
+        # The rescaling is a fractional shift in log-bin index (same log-step
+        # in source and destination grids). Bins falling above the upper xbin
+        # edge after rescaling (rare back-emission tails, x_kernel > 3) drop.
+        # Folded only into elementary daughters; boost-conserving heavy-daughter
+        # channels stay on i_mo == i_da and don't query the x grid.
+        log_step_x = np.log10(self.xbins[1] / self.xbins[0])
+        n_x = len(xwidths)
 
         # σ_inel: (n_m, n_E). Mothers are PDG nucleus codes; bound H-1 / n-1
         # codes are folded onto canonical free p / n.
@@ -142,8 +156,9 @@ class FlukaPhotoNuclear(CrossSectionBase):
             self._incl_tab[mo, da] = yld
 
         # Redistributed: (mother_PDG, daughter_PDG); 3D yields.
-        # FLUKA stores (n_E, n_x) per-bin counts; transpose to PriNCe (n_x, n_E)
-        # and divide by xwidths so the stored value is dσ/dx (cm^2 per unit x).
+        # FLUKA stores (n_E, n_x) per-bin counts; transpose to PriNCe (n_x, n_E),
+        # divide by xwidths to get dσ/dx_FLUKA, then rescale per-mother by A_mo
+        # to land on PriNCe's per-nucleon x_kernel = A_mo · x_FLUKA convention.
         for (raw_mo, da_pdg), yld_3d in zip(
             tables["elementary_daughters"], tables["elementary_yields"]
         ):
@@ -154,7 +169,29 @@ class FlukaPhotoNuclear(CrossSectionBase):
             A_mo, _, _ = get_AZN(mo)
             if A_mo > config.max_mass:
                 continue
-            self._incl_diff_tab[mo, da_pdg] = yld_3d.T / xwidths[:, None]
+            dsig_dx = yld_3d.T / xwidths[:, None]
+            if A_mo > 1:
+                # Vectorized log-bin shift: for each kernel bin k the source bin
+                # is at fractional index (k - shift); linear-interp between
+                # neighbours and zero outside. dσ/dx_kernel = dσ/dx_FLUKA / A_mo.
+                shift = np.log10(float(A_mo)) / log_step_x
+                src_idx = np.arange(n_x) - shift
+                i_lo = np.floor(src_idx).astype(int)
+                frac = (src_idx - i_lo)[:, None]
+                i_hi = i_lo + 1
+                valid_lo = (i_lo >= 0) & (i_lo < n_x)
+                valid_hi = (i_hi >= 0) & (i_hi < n_x)
+                lo_safe = np.clip(i_lo, 0, n_x - 1)
+                hi_safe = np.clip(i_hi, 0, n_x - 1)
+                rescaled = (
+                    np.where(valid_lo[:, None], dsig_dx[lo_safe, :], 0.0)
+                    * (1.0 - frac)
+                    + np.where(valid_hi[:, None], dsig_dx[hi_safe, :], 0.0)
+                    * frac
+                ) / A_mo
+                self._incl_diff_tab[mo, da_pdg] = rescaled
+            else:
+                self._incl_diff_tab[mo, da_pdg] = dsig_dx
 
         # Initial range = full egrid
         self.set_range()
