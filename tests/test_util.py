@@ -189,31 +189,33 @@ class TestInfo:
 
 class TestGetAZN:
     def test_proton(self):
-        A, Z, N = get_AZN(101)
+        A, Z, N = get_AZN(2212)
         assert A == 1
         assert Z == 1
         assert N == 0
 
     def test_neutron(self):
-        A, Z, N = get_AZN(100)
+        A, Z, N = get_AZN(2112)
         assert A == 1
         assert Z == 0
         assert N == 1
 
     def test_helium4(self):
-        A, Z, N = get_AZN(402)
+        # PDG nuclear code: 1000000000 + Z*10000 + A*10
+        A, Z, N = get_AZN(1000020040)
         assert A == 4
         assert Z == 2
         assert N == 2
 
     def test_iron56(self):
-        A, Z, N = get_AZN(5626)
+        A, Z, N = get_AZN(1000260560)
         assert A == 56
         assert Z == 26
         assert N == 30
 
-    def test_below_100(self):
-        A, Z, N = get_AZN(50)
+    def test_non_nucleus(self):
+        # K+ (PDG 321) is not a nucleus
+        A, Z, N = get_AZN(321)
         assert A == 0
         assert Z == 0
         assert N == 0

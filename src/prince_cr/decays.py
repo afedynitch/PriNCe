@@ -3,8 +3,37 @@
 import numpy as np
 from scipy.integrate import trapezoid as trapz
 
-from prince_cr.util import info, get_AZN
+from prince_cr.util import info, get_AZN, is_nucleus
 from prince_cr.data import spec_data
+
+
+# PDG codes referenced in the channel switch below. Names mirror the PDG MC
+# numbering scheme.
+_PDG_PI_PLUS = 211
+_PDG_PI_MINUS = -211
+_PDG_MU_PLUS = -13
+_PDG_MU_MINUS = 13
+_PDG_NU_E = 12
+_PDG_NU_E_BAR = -12
+_PDG_NU_MU = 14
+_PDG_NU_MU_BAR = -14
+_PDG_PIONS = (_PDG_PI_PLUS, _PDG_PI_MINUS)
+_PDG_MUONS = (_PDG_MU_PLUS, _PDG_MU_MINUS)
+_PDG_E_NEUTRINOS = (_PDG_NU_E, _PDG_NU_E_BAR)
+_PDG_MU_NEUTRINOS = (_PDG_NU_MU, _PDG_NU_MU_BAR)
+
+
+def _nucleus_charge_step(nucleus_pdg, dZ):
+    """Return the PDG ID of a nucleus with the same A but Z shifted by ``dZ``.
+
+    Used by β±-decay channels: the daughter has the same mass number but the
+    charge changes by ±1. PDG nuclear codes encode Z with a stride of 10000
+    (``10LZZZAAAI``); free p/n have to be promoted to the nuclear form.
+    """
+    A, Z, _ = get_AZN(nucleus_pdg)
+    from prince_cr.util import make_nucleus_pdg
+
+    return make_nucleus_pdg(A, Z + dZ)
 
 
 def get_particle_channels(mo, mo_energy, da_energy):
@@ -14,7 +43,7 @@ def get_particle_channels(mo, mo_energy, da_energy):
      np.outer( da_energy , 1 / mo_energy )
 
     Args:
-      mo (int): id of the mother particle
+      mo (int): PDG id of the mother particle
       mo_energy (float): energy grid of the mother particle
       da_energy (float): energy grid of the daughter particle (same for all daughters)
     Returns:
@@ -27,8 +56,8 @@ def get_particle_channels(mo, mo_energy, da_energy):
     redist = {}
     for branching, daughters in dbentry["branchings"]:
         for da in daughters:
-            # daughter is a nucleus, we have lorentz factor conservation
-            if da > 99:
+            # daughter is a nucleus → boost conservation (Lorentz factor preserved)
+            if is_nucleus(da):
                 res = np.zeros(x_grid.shape)
                 res[x_grid == 1.0] = 1.0
             else:
@@ -44,8 +73,8 @@ def get_decay_matrix(mo, da, x_grid):
     If the channel is unknown a zero grid is returned instead of raising an error
 
     Args:
-      mo (int): index of the mother
-      da (int): index of the daughter
+      mo (int): PDG id of the mother
+      da (int): PDG id of the daughter
       x_grid (float): grid in x = E_da / E_mo on which to return the result
                       (If x is a 2D matrix only the last column is computed
                       and then repeated over the matrix assuming that the
@@ -57,79 +86,60 @@ def get_decay_matrix(mo, da, x_grid):
     info(10, "Generating decay redistribution for", mo, da)
 
     # --------------------------------
-    # pi+ to numu or pi- to nummubar
+    # pi+ → nu_mu, pi- → nu_mubar
     # --------------------------------
-    if mo in [2, 3] and da in [13, 14]:
+    if mo == _PDG_PI_PLUS and da == _PDG_NU_MU:
+        return pion_to_numu(x_grid)
+    if mo == _PDG_PI_MINUS and da == _PDG_NU_MU_BAR:
         return pion_to_numu(x_grid)
 
     # --------------------------------
-    # pi+ to mu+ or pi- to mu-
+    # pi± → μ± (helicity-mixed; helicity collapsed to 0 in the PDG scheme)
     # --------------------------------
-    elif mo in [2, 3] and da in [5, 6, 7, 8, 9, 10]:
-        # (any helicity)
-        if da in [7, 10]:
-            return pion_to_muon(x_grid)
-        # left handed, hel = -1
-        elif da in [5, 8]:
-            return pion_to_muon(x_grid) * prob_muon_hel(x_grid, -1.0)
-        # right handed, hel = 1
-        elif da in [6, 9]:
-            return pion_to_muon(x_grid) * prob_muon_hel(x_grid, 1.0)
-        else:
-            raise Exception("This should newer have happened, check if-statements above!")
+    if mo == _PDG_PI_PLUS and da == _PDG_MU_PLUS:
+        return pion_to_muon(x_grid)
+    if mo == _PDG_PI_MINUS and da == _PDG_MU_MINUS:
+        return pion_to_muon(x_grid)
 
     # --------------------------------
-    # muon to neutrino
+    # μ → ν (helicity 0; chromo's Pythia post-decay produces helicity-mixed
+    # muons, so we evaluate the standard distributions at h=0).
     # --------------------------------
-    elif mo in [5, 6, 7, 8, 9, 10] and da in [11, 12, 13, 14]:
-        # translating muon ids to helicity
-        muon_hel = {
-            5: 1.0,
-            6: -1.0,
-            7: 0.0,
-            8: 1.0,
-            9: -1.0,
-            10: 0.0,
-        }
-        hel = muon_hel[mo]
-        # muon+ to electron neutrino
-        if mo in [5, 6, 7] and da in [11]:
-            return muonplus_to_nue(x_grid, hel)
-        # muon+ to muon anti-neutrino
-        elif mo in [5, 6, 7] and da in [14]:
-            return muonplus_to_numubar(x_grid, hel)
-        # muon- to elec anti-neutrino
-        elif mo in [8, 9, 10] and da in [12]:
-            return muonplus_to_nue(x_grid, -1 * hel)
-        # muon- to muon neutrino
-        elif mo in [8, 9, 10] and da in [13]:
-            return muonplus_to_numubar(x_grid, -1 * hel)
+    if mo == _PDG_MU_PLUS and da == _PDG_NU_E:
+        return muonplus_to_nue(x_grid, 0.0)
+    if mo == _PDG_MU_PLUS and da == _PDG_NU_MU_BAR:
+        return muonplus_to_numubar(x_grid, 0.0)
+    if mo == _PDG_MU_MINUS and da == _PDG_NU_E_BAR:
+        return muonplus_to_nue(x_grid, 0.0)
+    if mo == _PDG_MU_MINUS and da == _PDG_NU_MU:
+        return muonplus_to_numubar(x_grid, 0.0)
 
     # --------------------------------
-    # neutrinos from beta decays
+    # neutrinos from beta decays of nuclei
     # --------------------------------
-
-    # beta-
-    elif mo > 99 and da == 11:
-        info(10, "nu_e from beta- decay", mo, mo - 1, da)
-        return nu_from_beta_decay(x_grid, mo, mo - 1)
-    # beta+
-    elif mo > 99 and da == 12:
-        info(10, "nubar_e from beta+ decay", mo, mo + 1, da)
-        return nu_from_beta_decay(x_grid, mo, mo + 1)
-    # neutron
-    elif mo > 99 and 99 < da < 200:
+    if is_nucleus(mo) and da == _PDG_NU_E:
+        # ν_e produced when the daughter has Z-1: electron-capture / β+-style.
+        daughter = _nucleus_charge_step(mo, -1)
+        info(10, "nu_e from β-style decay", mo, daughter, da)
+        return nu_from_beta_decay(x_grid, mo, daughter)
+    if is_nucleus(mo) and da == _PDG_NU_E_BAR:
+        # ν̄_e produced when the daughter has Z+1: β-decay.
+        daughter = _nucleus_charge_step(mo, +1)
+        info(10, "nubar_e from β-style decay", mo, daughter, da)
+        return nu_from_beta_decay(x_grid, mo, daughter)
+    # nucleus → nucleus (β-decay boost conservation)
+    if is_nucleus(mo) and is_nucleus(da):
         info(10, "beta decay boost conservation", mo, da)
         return boost_conservation(x_grid)
-    else:
-        info(
-            5,
-            "Called with unknown channel {:} to {:}, returning an empty redistribution".format(
-                mo, da
-            ),
-        )
-        # no known channel, return zeros
-        return np.zeros(x_grid.shape)
+
+    info(
+        5,
+        "Called with unknown channel {:} to {:}, returning an empty redistribution".format(
+            mo, da
+        ),
+    )
+    # no known channel, return zeros
+    return np.zeros(x_grid.shape)
 
 
 def get_decay_matrix_bin_average(mo, da, x_lower, x_upper):
@@ -161,72 +171,50 @@ def get_decay_matrix_bin_average(mo, da, x_lower, x_upper):
         x_upper = x_upper[:, -1]
         x_lower = x_lower[:, -1]
 
+    result = None
+
     # --------------------------------
-    # pi+ to numu or pi- to nummubar
+    # pi+ → nu_mu, pi- → nu_mubar
     # --------------------------------
-    if mo in [2, 3] and da in [13, 14]:
+    if mo == _PDG_PI_PLUS and da == _PDG_NU_MU:
+        result = pion_to_numu_avg(x_lower, x_upper)
+    elif mo == _PDG_PI_MINUS and da == _PDG_NU_MU_BAR:
         result = pion_to_numu_avg(x_lower, x_upper)
 
     # --------------------------------
-    # pi+ to mu+ or pi- to mu-
+    # pi± → μ± (helicity-mixed, h=0)
     # --------------------------------
-    # TODO: The helicity distr need to be averaged analyticaly
-    elif mo in [2, 3] and da in [5, 6, 7, 8, 9, 10]:
-        # (any helicity)
-        if da in [7, 10]:
-            result = pion_to_muon_avg(x_lower, x_upper)
-        # left handed, hel = -1
-        elif da in [5, 8]:
-            result = pion_to_muon_avg(x_lower, x_upper) * prob_muon_hel(x_grid, -1.0)
-        # right handed, hel = 1
-        elif da in [6, 9]:
-            result = pion_to_muon_avg(x_lower, x_upper) * prob_muon_hel(x_grid, 1.0)
-        else:
-            raise Exception("This should newer have happened, check if-statements above!")
+    elif mo == _PDG_PI_PLUS and da == _PDG_MU_PLUS:
+        result = pion_to_muon_avg(x_lower, x_upper)
+    elif mo == _PDG_PI_MINUS and da == _PDG_MU_MINUS:
+        result = pion_to_muon_avg(x_lower, x_upper)
 
     # --------------------------------
-    # muon to neutrino
+    # μ → ν (h=0, see comment above)
     # --------------------------------
-    # TODO: The following distr need to be averaged analyticaly
-    elif mo in [5, 6, 7, 8, 9, 10] and da in [11, 12, 13, 14]:
-        # translating muon ids to helicity
-        muon_hel = {
-            5: 1.0,
-            6: -1.0,
-            7: 0.0,
-            8: 1.0,
-            9: -1.0,
-            10: 0.0,
-        }
-        hel = muon_hel[mo]
-        # muon+ to electron neutrino
-        if mo in [5, 6, 7] and da in [11]:
-            result = muonplus_to_nue(x_grid, hel)
-        # muon+ to muon anti-neutrino
-        elif mo in [5, 6, 7] and da in [14]:
-            result = muonplus_to_numubar(x_grid, hel)
-        # muon- to elec anti-neutrino
-        elif mo in [8, 9, 10] and da in [12]:
-            result = muonplus_to_nue(x_grid, -1 * hel)
-        # muon- to muon neutrino
-        elif mo in [8, 9, 10] and da in [13]:
-            result = muonplus_to_numubar(x_grid, -1 * hel)
+    elif mo == _PDG_MU_PLUS and da == _PDG_NU_E:
+        result = muonplus_to_nue(x_grid, 0.0)
+    elif mo == _PDG_MU_PLUS and da == _PDG_NU_MU_BAR:
+        result = muonplus_to_numubar(x_grid, 0.0)
+    elif mo == _PDG_MU_MINUS and da == _PDG_NU_E_BAR:
+        result = muonplus_to_nue(x_grid, 0.0)
+    elif mo == _PDG_MU_MINUS and da == _PDG_NU_MU:
+        result = muonplus_to_numubar(x_grid, 0.0)
 
     # --------------------------------
     # neutrinos from beta decays
     # --------------------------------
     # TODO: The following beta decay to neutrino distr need to be averaged analyticaly
     # TODO: Also the angular averaging is done numerically still
-    # beta-
-    elif mo > 99 and da == 11:
-        info(10, "nu_e from beta+ decay", mo, mo - 1, da)
-        result = nu_from_beta_decay(x_grid, mo, mo - 1)
-    # beta+
-    elif mo > 99 and da == 12:
-        info(10, "nubar_e from beta- decay", mo, mo + 1, da)
-        result = nu_from_beta_decay(x_grid, mo, mo + 1)
-    # neutron
-    elif mo > 99 and 99 < da < 200:
+    elif is_nucleus(mo) and da == _PDG_NU_E:
+        daughter = _nucleus_charge_step(mo, -1)
+        info(10, "nu_e from β-style decay", mo, daughter, da)
+        result = nu_from_beta_decay(x_grid, mo, daughter)
+    elif is_nucleus(mo) and da == _PDG_NU_E_BAR:
+        daughter = _nucleus_charge_step(mo, +1)
+        info(10, "nubar_e from β-style decay", mo, daughter, da)
+        result = nu_from_beta_decay(x_grid, mo, daughter)
+    elif is_nucleus(mo) and is_nucleus(da):
         info(10, "beta decay boost conservation", mo, da)
         result = boost_conservation_avg(x_lower, x_upper)
     else:
@@ -261,8 +249,8 @@ def pion_to_numu(x):
     """
     res = np.zeros(x.shape)
 
-    m_muon = spec_data[7]["mass"]
-    m_pion = spec_data[2]["mass"]
+    m_muon = spec_data[_PDG_MU_PLUS]["mass"]
+    m_pion = spec_data[_PDG_PI_PLUS]["mass"]
     r = m_muon**2 / m_pion**2
     xmin = 0.0
     xmax = 1 - r
@@ -287,8 +275,8 @@ def pion_to_numu_avg(x_lower, x_upper):
     bins_width = x_upper - x_lower
     res = np.zeros(x_lower.shape)
 
-    m_muon = spec_data[7]["mass"]
-    m_pion = spec_data[2]["mass"]
+    m_muon = spec_data[_PDG_MU_PLUS]["mass"]
+    m_pion = spec_data[_PDG_PI_PLUS]["mass"]
     r = m_muon**2 / m_pion**2
     xmin = 0.0
     xmax = 1 - r
@@ -319,8 +307,8 @@ def pion_to_muon(x):
     """
     res = np.zeros(x.shape)
 
-    m_muon = spec_data[7]["mass"]
-    m_pion = spec_data[2]["mass"]
+    m_muon = spec_data[_PDG_MU_PLUS]["mass"]
+    m_pion = spec_data[_PDG_PI_PLUS]["mass"]
     r = m_muon**2 / m_pion**2
     xmin = r
     xmax = 1.0
@@ -345,8 +333,8 @@ def pion_to_muon_avg(x_lower, x_upper):
     bins_width = x_upper - x_lower
     res = np.zeros(x_lower.shape)
 
-    m_muon = spec_data[7]["mass"]
-    m_pion = spec_data[2]["mass"]
+    m_muon = spec_data[_PDG_MU_PLUS]["mass"]
+    m_pion = spec_data[_PDG_PI_PLUS]["mass"]
     r = m_muon**2 / m_pion**2
     xmin = r
     xmax = 1.0
@@ -377,8 +365,8 @@ def prob_muon_hel(x, h):
       float: probability for this helicity
     """
 
-    m_muon = spec_data[7]["mass"]
-    m_pion = spec_data[2]["mass"]
+    m_muon = spec_data[_PDG_MU_PLUS]["mass"]
+    m_pion = spec_data[_PDG_PI_PLUS]["mass"]
 
     r = m_muon**2 / m_pion**2
 
@@ -473,7 +461,7 @@ def nu_from_beta_decay(x_grid, mother, daughter, Gamma=200, angle=None):
 
     info(10, "Calculating neutrino energy from beta decay", mother, daughter)
 
-    mass_el = spec_data[20]["mass"]
+    mass_el = spec_data[11]["mass"]
     mass_mo = spec_data[mother]["mass"]
     mass_da = spec_data[daughter]["mass"]
 
@@ -482,8 +470,9 @@ def nu_from_beta_decay(x_grid, mother, daughter, Gamma=200, angle=None):
 
     A_mo, _, _ = get_AZN(mother)
 
-    if mother == 100 and daughter == 101:
-        # for this channel the masses are already nucleon masses
+    if mother == 2112 and daughter == 2212:
+        # n → p + e^- + ν_e^bar (free neutron β-decay): the masses are
+        # already nucleon masses, so the q-value is mn - mp - me.
         qval = mass_mo - mass_da - mass_el
     elif Z_da == Z_mo - 1:  # beta+ decay
         qval = mass_mo - mass_da - 2 * mass_el

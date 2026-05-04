@@ -195,23 +195,63 @@ def info(min_dbg_level, *message, **kwargs):
         print(cname + " ".join(message))
 
 
-def get_AZN(nco_id):
-    """Returns mass number :math:`A`, charge :math:`Z` and neutron
-    number :math:`N` of ``nco_id``.
+_PDG_NUCLEUS_PREFIX = 1000000000
+_PDG_PROTON = 2212
+_PDG_NEUTRON = 2112
+
+
+def is_nucleus(pdg_id):
+    """True iff ``pdg_id`` represents a nucleus (free p/n or A>=2).
+
+    PDG conventions: free proton 2212, free neutron 2112, all other nuclei
+    encoded as ``10LZZZAAAI`` (we only consider ground-state isomers,
+    L = I = 0, so the form is ``1000000000 + Z*10000 + A*10``).
+    """
+    pdg_id = int(pdg_id)
+    if pdg_id == _PDG_PROTON or pdg_id == _PDG_NEUTRON:
+        return True
+    if pdg_id // _PDG_NUCLEUS_PREFIX != 1:
+        return False
+    rest = pdg_id - _PDG_NUCLEUS_PREFIX
+    Z = (rest // 10000) % 1000
+    A = (rest // 10) % 1000
+    return Z <= A and A >= 1
+
+
+def make_nucleus_pdg(A, Z, isomer=0):
+    """Compose a nuclear PDG ID from mass / charge.
+
+    Free proton and neutron return their canonical PDG codes (2212, 2112);
+    all other ground-state nuclei use ``10LZZZAAAI`` with L = isomer = 0.
+    """
+    A = int(A)
+    Z = int(Z)
+    if A == 1 and Z == 1:
+        return _PDG_PROTON
+    if A == 1 and Z == 0:
+        return _PDG_NEUTRON
+    return _PDG_NUCLEUS_PREFIX + Z * 10000 + A * 10 + int(isomer)
+
+
+def get_AZN(pdg_id):
+    """Return ``(A, Z, N)`` for a nucleus PDG ID; ``(0, 0, 0)`` otherwise.
 
     Args:
-        nco_id (int): corsika id of nucleus/mass group
+        pdg_id (int): PDG Monte Carlo number.
+
     Returns:
-        (int,int,int): (Z,A) tuple
+        (int, int, int): mass number A, charge number Z, neutron number N.
     """
-    Z, A = 1, 1
-
-    if nco_id >= 100:
-        Z = nco_id % 100
-        A = (nco_id - Z) // 100
-    else:
-        Z, A = 0, 0
-
+    pdg_id = int(pdg_id)
+    if pdg_id == _PDG_PROTON:
+        return 1, 1, 0
+    if pdg_id == _PDG_NEUTRON:
+        return 1, 0, 1
+    if pdg_id // _PDG_NUCLEUS_PREFIX != 1:
+        return 0, 0, 0
+    rest = pdg_id - _PDG_NUCLEUS_PREFIX
+    Z = (rest // 10000) % 1000
+    A = (rest // 10) % 1000
     return A, Z, A - Z
 
 

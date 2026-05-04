@@ -1,5 +1,4 @@
 import numpy as np
-import prince_cr.config as config
 
 
 class DifferentialOperator(object):
@@ -12,11 +11,13 @@ class DifferentialOperator(object):
         self.log_width = np.log(self.ebins[1] / self.ebins[0])
 
         self.nspec = nspec
+        # Keep the FD operator as scipy CSR. Backend conversion (MKL handle,
+        # cupy CSR) is the solver's job — done at the ETD2 boundary in
+        # `propagation.UHECRPropagationSolverETD2._ensure_D_split`. The
+        # previous in-class conversion to ``cupyx.scipy.sparse.csr_matrix``
+        # collided with ETD2's `split_operator` (scipy `sp.diags` does not
+        # accept cupy arrays).
         self.operator = self.construct_differential_operator()
-        if config.linear_algebra_backend.lower() == "cupy":
-            import cupyx
-
-            self.operator = cupyx.scipy.sparse.csr_matrix(self.operator)
 
     def construct_differential_operator(self):
         from scipy.sparse import block_diag, coo_matrix

@@ -138,7 +138,7 @@ Was a stub. Now documents:
   fixed at init; only `data` is updated at runtime.
 - Non-obvious pitfalls: `tau_dec_threshold` as a resonance-style
   approximation (cf. MCEq's `force_resonance`), no public API for non-zero
-  initial state, energy vs. energy-per-nucleon, NCo species IDs.
+  initial state, energy vs. energy-per-nucleon, PDG species IDs (post-migration).
 
 This was a behavioural change in the sense that future code search/edits
 now have a real architectural reference instead of stub text.

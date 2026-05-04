@@ -12,7 +12,7 @@ class MockPrinceRun:
 
     def __init__(self, species=None, d=88):
         if species is None:
-            species = [100, 101, 402]
+            species = [2112, 2212, 1000020040]  # n, p, He-4 (PDG)
         self.cr_grid = EnergyGrid(3, 10, 8)
         self.spec_man = SpeciesManager(species, self.cr_grid.d)
         self.dim_states = self.cr_grid.d * self.spec_man.nspec
@@ -26,8 +26,10 @@ class TestEvolution:
 
         mock_run = MockPrinceRun(species=species)
         params = {}
+        from prince_cr.util import is_nucleus
+
         for s in mock_run.spec_man.known_species:
-            if s >= 100:
+            if is_nucleus(s):
                 params[s] = (2.0, 1e10, 1.0)
         return SimpleSource(mock_run, params=params, m=m)
 
@@ -113,10 +115,10 @@ class TestSimpleSource:
         from prince_cr.cr_sources import SimpleSource
 
         mock_run = MockPrinceRun()
-        params = {101: (2.0, 1e10, 1.0)}
+        params = {2212: (2.0, 1e10, 1.0)}
         src = SimpleSource(mock_run, params=params, m="flat")
         energy = np.logspace(3, 10, 50)
-        result = src.injection_spectrum(101, energy, params[101])
+        result = src.injection_spectrum(2212, energy, params[2212])
         assert result.shape == energy.shape
         assert np.all(result > 0)
 
@@ -124,7 +126,7 @@ class TestSimpleSource:
         from prince_cr.cr_sources import SimpleSource
 
         mock_run = MockPrinceRun()
-        params = {101: (2.0, 1e10, 1.0)}
+        params = {2212: (2.0, 1e10, 1.0)}
         src = SimpleSource(mock_run, params=params, m="flat")
         result = src.injection_rate(0.0)
         assert result.shape == (mock_run.dim_states,)
@@ -133,7 +135,7 @@ class TestSimpleSource:
         from prince_cr.cr_sources import SimpleSource
 
         mock_run = MockPrinceRun()
-        params = {101: (2.0, 1e10, 1.0)}
+        params = {2212: (2.0, 1e10, 1.0)}
         src = SimpleSource(mock_run, params=params, m="flat")
         assert np.any(src.injection_grid > 0)
 
@@ -143,10 +145,10 @@ class TestRigdityCutoffSource:
         from prince_cr.cr_sources import RigdityCutoffSource
 
         mock_run = MockPrinceRun()
-        params = {101: (2.0, 1e10, 1.0)}
+        params = {2212: (2.0, 1e10, 1.0)}
         src = RigdityCutoffSource(mock_run, params=params, m="flat")
         energy = np.logspace(3, 10, 50)
-        result = src.injection_spectrum(101, energy, params[101])
+        result = src.injection_spectrum(2212, energy, params[2212])
         assert result.shape == energy.shape
         assert np.all(result > 0)
 
@@ -156,10 +158,10 @@ class TestAugerFitSource:
         from prince_cr.cr_sources import AugerFitSource
 
         mock_run = MockPrinceRun()
-        params = {101: (2.0, 1e10, 1.0)}
+        params = {2212: (2.0, 1e10, 1.0)}
         src = AugerFitSource(mock_run, params=params, m="flat")
         energy = np.logspace(3, 10, 50)
-        result = src.injection_spectrum(101, energy, params[101])
+        result = src.injection_spectrum(2212, energy, params[2212])
         assert result.shape == energy.shape
         assert np.all(result > 0)
 
@@ -169,10 +171,10 @@ class TestRigidityFlexSource:
         from prince_cr.cr_sources import RigidityFlexSource
 
         mock_run = MockPrinceRun()
-        params = {101: (2.0, 1e10, 0.5, 1.0)}
+        params = {2212: (2.0, 1e10, 0.5, 1.0)}
         src = RigidityFlexSource(mock_run, params=params, m="flat")
         energy = np.logspace(3, 10, 50)
-        result = src.injection_spectrum(101, energy, params[101])
+        result = src.injection_spectrum(2212, energy, params[2212])
         assert result.shape == energy.shape
         assert np.all(result > 0)
 
@@ -184,10 +186,10 @@ class TestSpectrumSource:
         mock_run = MockPrinceRun()
         egrid = np.logspace(3, 10, 50)
         specgrid = egrid ** (-2.0)
-        params = {101: (egrid, specgrid)}
+        params = {2212: (egrid, specgrid)}
         src = SpectrumSource(mock_run, params=params, m="flat")
         energy = np.logspace(3, 10, 30)
-        result = src.injection_spectrum(101, energy, params[101])
+        result = src.injection_spectrum(2212, energy, params[2212])
         assert result.shape == energy.shape
         assert np.all(result >= 0)
 
@@ -197,9 +199,9 @@ class TestInjectionRateSingle:
         from prince_cr.cr_sources import SimpleSource
 
         mock_run = MockPrinceRun()
-        params = {101: (2.0, 1e10, 1.0)}
+        params = {2212: (2.0, 1e10, 1.0)}
         src = SimpleSource(mock_run, params=params, m="flat")
         energy = np.logspace(5, 10, 20)
-        result = src.injection_rate_single(101, energy, 0.0)
+        result = src.injection_rate_single(2212, energy, 0.0)
         assert result.shape == energy.shape
         assert np.all(result > 0)

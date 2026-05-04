@@ -1,6 +1,7 @@
 """Contains solvers, i.e. integrators, kernels, steppers, for PriNCe."""
 
 import numpy as np
+import scipy.sparse as sp
 
 from prince_cr.cosmology import H
 from prince_cr.data import PRINCE_UNITS, EnergyGrid
@@ -68,18 +69,18 @@ class UHECRPropagationResult(object):
             newstate = self.state * number
             return UHECRPropagationResult(newstate, self.egrid, self.spec_man)
 
-    def get_solution(self, nco_id):
+    def get_solution(self, pdg_id):
         """Returns the spectrum in energy per nucleon"""
-        spec = self.spec_man.ncoid2sref[nco_id]
+        spec = self.spec_man.pdgid2sref[pdg_id]
         return self.egrid, self.state[spec.lidx() : spec.uidx()]
 
-    def get_solution_scale(self, nco_id, epow=0):
+    def get_solution_scale(self, pdg_id, epow=0):
         """Returns the spectrum scaled back to total energy"""
-        spec = self.spec_man.ncoid2sref[nco_id]
+        spec = self.spec_man.pdgid2sref[pdg_id]
         egrid = spec.A * self.egrid
         return egrid, egrid**epow * self.state[spec.lidx() : spec.uidx()] / spec.A
 
-    def _check_id_grid(self, nco_ids, egrid):
+    def _check_id_grid(self, pdg_ids, egrid):
         # Take egrid from first id ( doesn't cover the range for iron for example)
         # create a common egrid or used supplied one
         if egrid is None:
@@ -91,28 +92,34 @@ class UHECRPropagationResult(object):
         else:
             com_egrid = egrid
 
-        if isinstance(nco_ids, list):
+        from prince_cr.util import is_nucleus
+
+        if isinstance(pdg_ids, list):
             pass
-        elif nco_ids == "CR":
-            nco_ids = [s for s in self.known_species if s >= 100]
-        elif nco_ids == "nu":
-            nco_ids = [s for s in self.known_species if s in [11, 12, 13, 14, 15, 16]]
-        elif nco_ids == "all":
-            nco_ids = self.known_species
-        elif isinstance(nco_ids, tuple):
-            select, vmin, vmax = nco_ids
-            nco_ids = [s for s in self.known_species if vmin <= select(s) <= vmax]
+        elif pdg_ids == "CR":
+            pdg_ids = [s for s in self.known_species if is_nucleus(s)]
+        elif pdg_ids == "nu":
+            # all (anti-)neutrinos: ν_e (12), ν_μ (14), ν_τ (16) and their CP partners.
+            pdg_ids = [
+                s for s in self.known_species
+                if s in (12, -12, 14, -14, 16, -16)
+            ]
+        elif pdg_ids == "all":
+            pdg_ids = self.known_species
+        elif isinstance(pdg_ids, tuple):
+            select, vmin, vmax = pdg_ids
+            pdg_ids = [s for s in self.known_species if vmin <= select(s) <= vmax]
 
-        return nco_ids, com_egrid
+        return pdg_ids, com_egrid
 
-    def _collect_interpolated_spectra(self, nco_ids, epow, egrid=None):
+    def _collect_interpolated_spectra(self, pdg_ids, epow, egrid=None):
         """Collect interpolated spectra in a 2D array. Used by
         get_solution_group and get_lnA"""
-        nco_ids, com_egrid = self._check_id_grid(nco_ids, egrid)
+        pdg_ids, com_egrid = self._check_id_grid(pdg_ids, egrid)
 
         # collect all the spectra in 2d array of dimension
-        spectra = np.zeros((len(nco_ids), com_egrid.size))
-        for idx, pid in enumerate(nco_ids):
+        spectra = np.zeros((len(pdg_ids), com_egrid.size))
+        for idx, pid in enumerate(pdg_ids):
             curr_egrid, curr_spec = self.get_solution_scale(pid, epow)
             mask = curr_spec > 0.0
             if np.count_nonzero(mask) > 0:
@@ -129,26 +136,26 @@ class UHECRPropagationResult(object):
                 res = np.zeros_like(com_egrid)
             spectra[idx] = np.nan_to_num(res)
 
-        return nco_ids, com_egrid, spectra
+        return pdg_ids, com_egrid, spectra
 
-    def get_solution_group(self, nco_ids, epow=3, egrid=None):
+    def get_solution_group(self, pdg_ids, epow=3, egrid=None):
         """Return the summed spectrum (in total energy) for all elements in the range"""
 
-        _, com_egrid, spectra = self._collect_interpolated_spectra(nco_ids, epow, egrid)
+        _, com_egrid, spectra = self._collect_interpolated_spectra(pdg_ids, epow, egrid)
         spectrum = spectra.sum(axis=0)
 
         return com_egrid, spectrum
 
-    def get_lnA(self, nco_ids, egrid=None):
+    def get_lnA(self, pdg_ids, egrid=None):
         """Return the average ln(A) as a function of total energy for all
         elements in the range"""
 
-        nco_ids, com_egrid, spectra = self._collect_interpolated_spectra(
-            nco_ids, 0, egrid
+        pdg_ids, com_egrid, spectra = self._collect_interpolated_spectra(
+            pdg_ids, 0, egrid
         )
 
         # get the average and variance by using the spectra as weights
-        lnA = np.array([np.log(self.spec_man.ncoid2sref[el].A) for el in nco_ids])
+        lnA = np.array([np.log(self.spec_man.pdgid2sref[el].A) for el in pdg_ids])
         total = spectra.sum(axis=0)
         with np.errstate(invalid="ignore", divide="ignore"):
             average = (lnA[:, np.newaxis] * spectra).sum(axis=0) / total
@@ -158,11 +165,11 @@ class UHECRPropagationResult(object):
 
         return com_egrid, average, variance
 
-    def get_energy_density(self, nco_id):
+    def get_energy_density(self, pdg_id):
         from scipy.integrate import trapezoid as trapz
 
-        A = self.spec_man.ncoid2sref[nco_id].A
-        return trapz(A * self.egrid * self.get_solution(nco_id), self.egrid)
+        A = self.spec_man.pdgid2sref[pdg_id].A
+        return trapz(A * self.egrid * self.get_solution(pdg_id), self.egrid)
 
 
 class UHECRPropagationSolver(object):
@@ -272,12 +279,28 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # ``self.current_z_rates`` from the base class).
         self._etd2_M_raw_diag = None
         self._etd2_M_raw_off = None
+        # MKL handle wrapping `_etd2_M_raw_off`. Built once at the first
+        # cache window and reused across subsequent windows via in-place
+        # value updates — the photo-hadronic sparsity pattern is fixed at
+        # init (see CLAUDE.md "Matrix Updates"), so MKL's optimised layout
+        # remains valid as the data values change.
+        self._etd2_M_raw_off_mkl = None
+        # Index map: for each entry in M_off.data, the position in
+        # M_raw.data it came from. Populated once at the first cache
+        # window so subsequent windows can do
+        # ``M_off.data[:] = M_raw.data[off_to_M_idx]`` without re-running
+        # split_operator + mkl_sparse_optimize.
+        self._etd2_M_off_to_M_idx = None
+        self._etd2_M_diag_to_M_idx = None
         # κ_pair(z) is expensive (CIB interpolated at dim_cr × xi_steps points).
         # κ_adia(z) is closed-form and trivially cheap, recomputed per step.
         self._etd2_kappa_pair_cached = None
         # Constant pieces, populated on first solve().
         self._etd2_D_diag = None
         self._etd2_D_off = None
+        # MKL handle wrapping `_etd2_D_off`. One-shot for the whole solve.
+        self._etd2_D_off_mkl = None
+        self._backend = config.linear_algebra_backend.lower()
 
     def _refresh_z_caches(self, z):
         """Refresh all rate-cache-window-bound pieces at z.
@@ -295,9 +318,39 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             # Zero matrix with full sparsity preserved.
             M = M.copy() if hasattr(M, "copy") else M
             M.data = np.zeros_like(M.data)
-        d_M, M_off = split_operator(M)
-        self._etd2_M_raw_diag = d_M
-        self._etd2_M_raw_off = M_off
+
+        first_window = self._etd2_M_raw_off is None
+        if first_window:
+            d_M, M_off = split_operator(M)
+            self._etd2_M_raw_diag = d_M
+            self._etd2_M_raw_off = M_off
+            self._etd2_M_off_to_M_idx, self._etd2_M_diag_to_M_idx = (
+                self._build_M_off_index_map(M, M_off)
+            )
+            if self._backend == "mkl" and config.has_mkl:
+                # optimize=False so update_data() can refresh values
+                # across cache windows without re-running mkl_sparse_optimize.
+                self._etd2_M_raw_off_mkl = self._build_mkl_handle(M_off, optimize=False)
+        else:
+            # Same sparsity pattern: refresh the values in place. The MKL
+            # handle's optimised layout is invariant under value updates.
+            M_off = self._etd2_M_raw_off
+            if not getattr(M, "has_sorted_indices", False):
+                # The index map was built against sorted M.indices, so
+                # subsequent windows must keep that invariant.
+                M.sort_indices()
+            if M_off.data.size:
+                M_off.data[:] = M.data[self._etd2_M_off_to_M_idx]
+            diag_idx = self._etd2_M_diag_to_M_idx
+            d_M = np.zeros(M.shape[0], dtype=np.float64)
+            present = diag_idx >= 0
+            d_M[present] = M.data[diag_idx[present]]
+            self._etd2_M_raw_diag = d_M
+            if self._etd2_M_raw_off_mkl is not None:
+                # Push the same data into MKL's pinned buffer (no-op if
+                # the wrapper happens to share M_off.data — keeps
+                # semantics explicit either way).
+                self._etd2_M_raw_off_mkl.update_data(M_off.data)
 
         if self.enable_pairprod_losses:
             self._etd2_kappa_pair_cached = self.pair_loss_rates_grid.loss_vector(z)
@@ -318,6 +371,118 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         d_D, D_off = split_operator(D)
         self._etd2_D_diag = d_D
         self._etd2_D_off = D_off
+
+        if self._backend == "mkl" and config.has_mkl:
+            # D is constant for the whole solve, so the MKL handle is
+            # one-shot. optimize=True picks the inspector-executor fast
+            # path; the data values never change so the internal cache
+            # is fine.
+            if self._etd2_D_off_mkl is None:
+                self._etd2_D_off_mkl = self._build_mkl_handle(D_off, optimize=True)
+
+    @staticmethod
+    def _build_M_off_index_map(M, M_off):
+        """Pre-compute index maps from M.data into M_off.data and diag.
+
+        Returns ``(off_to_M_idx, diag_to_M_idx)``:
+
+        * ``off_to_M_idx`` (length ``M_off.nnz``): for each entry of
+          ``M_off.data``, the index in ``M.data`` it came from.
+        * ``diag_to_M_idx`` (length ``M.shape[0]``): for each row r, the
+          index in ``M.data`` of the (r, r) entry, or -1 if absent.
+
+        Built once at the first cache window in O(nnz). On subsequent
+        windows the per-window cost drops to a couple of ``data[idx]``
+        gathers — typically <0.5 ms vs ~3 ms for the full
+        ``mkl_sparse_d_create_csr + mkl_sparse_set_mv_hint +
+        mkl_sparse_optimize`` rebuild.
+
+        Robust to: unsorted CSR column indices (scipy doesn't enforce
+        sorting after ``+/-/eliminate_zeros``); and to ``M_off`` being a
+        strict subset of ``M`` minus the diagonal (``eliminate_zeros``
+        may also drop off-diagonal entries that happened to be zero in
+        ``M``, though this is unusual for the photo-hadronic Jacobian).
+        """
+        if not (sp.isspmatrix_csr(M) and sp.isspmatrix_csr(M_off)):
+            raise TypeError("Index map requires CSR M and CSR M_off.")
+        if M.shape != M_off.shape:
+            raise ValueError("M and M_off shapes disagree.")
+
+        # scipy's binary ops don't guarantee per-row sorted column
+        # indices; sort both in place once so the per-row two-pointer
+        # walk below stays linear.
+        if not getattr(M, "has_sorted_indices", False):
+            M.sort_indices()
+        if not getattr(M_off, "has_sorted_indices", False):
+            M_off.sort_indices()
+
+        n = M.shape[0]
+        M_indptr = M.indptr
+        M_indices = M.indices
+        Moff_indptr = M_off.indptr
+        Moff_indices = M_off.indices
+
+        off_to_M = np.empty(M_off.nnz, dtype=np.int64)
+        diag_to_M = np.full(n, -1, dtype=np.int64)
+
+        k_off = 0
+        for r in range(n):
+            m_lo, m_hi = M_indptr[r], M_indptr[r + 1]
+            o_lo, o_hi = Moff_indptr[r], Moff_indptr[r + 1]
+            o = o_lo
+            for k in range(m_lo, m_hi):
+                col = M_indices[k]
+                if col == r:
+                    diag_to_M[r] = k
+                    continue
+                # Walk M_off forward until its column matches; entries
+                # ``eliminate_zeros`` removed are skipped silently. Both
+                # arrays are sorted ascending in column.
+                while o < o_hi and Moff_indices[o] < col:
+                    o += 1
+                if o < o_hi and Moff_indices[o] == col:
+                    off_to_M[k_off] = k
+                    k_off += 1
+                    o += 1
+            if o != o_hi:
+                # M_off has columns at this row that don't appear in M —
+                # that contradicts split_operator's contract.
+                raise RuntimeError(
+                    f"Row {r}: M_off has columns with no source in M."
+                )
+
+        if k_off != M_off.nnz:
+            raise RuntimeError(
+                f"Index map covered {k_off} of {M_off.nnz} M_off entries."
+            )
+        return off_to_M, diag_to_M
+
+    @staticmethod
+    def _build_mkl_handle(off, optimize=True):
+        """Wrap a scipy CSR/COO/etc. off-diagonal into an MklSparseMatrix.
+
+        Returns ``None`` if the matrix has zero nnz — the kernel skips the
+        SpMV in that case rather than feeding MKL an empty handle (some
+        MKL versions are squirrelly about zero-nnz CSRs). Picks BSR if
+        ``config.mkl_bsr_blocksize`` is set, else CSR.
+
+        ``optimize=True`` chooses the inspector-executor fast path —
+        ~2× faster per gemv but caches data values internally, so
+        :meth:`MklSparseMatrix.update_data` cannot refresh them. Use
+        ``False`` for matrices whose values change across cache windows
+        (PriNCe's photo-hadronic ``M_off``); ``True`` for matrices that
+        are constant for the whole solve (the FD operator ``D_off``).
+        """
+        from .. import mkl_sparse
+
+        if not sp.isspmatrix_csr(off):
+            off = off.tocsr()
+        if off.dtype != np.float64:
+            off = off.astype(np.float64)
+        if off.nnz == 0:
+            return None
+        bs = getattr(config, "mkl_bsr_blocksize", None)
+        return mkl_sparse.MklSparseMatrix(off, blocksize=bs, optimize=optimize)
 
     def _operator_at(self, z):
         """Return ``(d, apply_F)`` for the ETD2 step at redshift ``z``.
@@ -356,11 +521,19 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         else:
             b = None
 
-        M_off = self._etd2_M_raw_off
-        D_off = self._etd2_D_off if kappa is not None else None
-
         # Pre-allocate one scratch buffer for κ⊙x — reused inside apply_F.
         kx_buf = np.empty(self.dim_states) if kappa is not None else None
+
+        if self._backend == "mkl" and self._etd2_M_raw_off_mkl is not None:
+            apply_F = self._make_apply_F_mkl(kappa, dldz, b, kx_buf)
+        else:
+            apply_F = self._make_apply_F_scipy(kappa, dldz, b, kx_buf)
+
+        return d, apply_F
+
+    def _make_apply_F_scipy(self, kappa, dldz, b, kx_buf):
+        M_off = self._etd2_M_raw_off
+        D_off = self._etd2_D_off if kappa is not None else None
 
         def apply_F(x, out):
             np.copyto(out, M_off.dot(x))
@@ -371,7 +544,89 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             if b is not None:
                 np.add(out, b, out=out)
 
-        return d, apply_F
+        return apply_F
+
+    def _make_apply_F_mkl(self, kappa, dldz, b, kx_buf):
+        """Build an MKL-backed ``apply_F(x, out)``.
+
+        Per call:
+
+          out = M_off · x                                (mkl gemv α=1, β=0)
+          if kappa: kx_buf = κ ⊙ x; out += D_off · kx_buf (mkl gemv α=1, β=1)
+          out *= dldz; if b: out += b
+
+        ``etd2_step`` calls ``apply_F`` twice per ETD2 step against four
+        persistent buffers (state, F_phi, a, F_a) plus kx_buf. We memoise
+        the ctypes pointer for each ndarray by ``id`` so we don't redo
+        ``arr.ctypes.data_as`` on every step. The buffers come from
+        ``etd2._step_buffers`` and live for the whole solve, so the
+        cached pointers stay valid across the integration loop.
+        """
+        from ctypes import POINTER, c_double
+
+        mkl_M = self._etd2_M_raw_off_mkl
+        mkl_D = self._etd2_D_off_mkl if kappa is not None else None
+
+        # Pre-box the only two (alpha, beta) constants we ever use,
+        # avoiding ~5 µs of ``c_double(...)`` per gemv in the hot loop.
+        # Sanity-check the M_off SpMV via the gemv_ctargs path on the
+        # first call only — if MKL is going to fail it'll do so loudly
+        # there. Subsequent calls go through gemv_preboxed.
+        alpha_box = c_double(1.0)
+        beta_zero = c_double(0.0)
+        beta_one = c_double(1.0)
+        mkl_M_op = mkl_M.gemv_preboxed
+        mkl_D_op = mkl_D.gemv_preboxed if mkl_D is not None else None
+
+        ptr_cache = {}
+
+        def get_p(arr):
+            key = id(arr)
+            p = ptr_cache.get(key)
+            if p is None:
+                p = arr.ctypes.data_as(POINTER(c_double))
+                ptr_cache[key] = p
+            return p
+
+        kx_p = get_p(kx_buf) if kappa is not None else None
+
+        def apply_F(x, out):
+            x_p = get_p(x)
+            out_p = get_p(out)
+            mkl_M_op(alpha_box, x_p, beta_zero, out_p)
+            if kappa is not None:
+                np.multiply(kappa, x, out=kx_buf)
+                mkl_D_op(alpha_box, kx_p, beta_one, out_p)
+            np.multiply(out, dldz, out=out)
+            if b is not None:
+                np.add(out, b, out=out)
+
+        return apply_F
+
+    def close(self):
+        """Release backend resources (currently: MKL sparse handles).
+
+        Idempotent. Safe to call repeatedly and safe to skip — Python
+        reference-counting eventually frees the handles via
+        ``MklSparseMatrix.__del__``, but the underlying MKL-internal
+        optimised-layout memory only drops on explicit
+        ``mkl_sparse_destroy``. Calling ``close()`` between long-running
+        runs avoids accumulating that memory.
+        """
+        for attr in ("_etd2_M_raw_off_mkl", "_etd2_D_off_mkl"):
+            h = getattr(self, attr, None)
+            if h is not None:
+                try:
+                    h.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def solve(
         self,
@@ -397,7 +652,17 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
 
         state = np.zeros(self.dim_states)
         # Force first-step rebuild of the cached photo-hadronic matrix.
+        # Drop the M_off cache too: a fresh ``_refresh_z_caches`` will
+        # rebuild it (and the MKL handle + index maps) from the current
+        # rate matrix, then keep the same handle alive across all this
+        # solve's cache windows via in-place data updates.
         self.current_z_rates = None
+        self._etd2_M_raw_off = None
+        self._etd2_M_off_to_M_idx = None
+        self._etd2_M_diag_to_M_idx = None
+        if self._etd2_M_raw_off_mkl is not None:
+            self._etd2_M_raw_off_mkl.close()
+            self._etd2_M_raw_off_mkl = None
         self._ensure_D_split()
 
         self.pre_step_hook(self.initial_z)

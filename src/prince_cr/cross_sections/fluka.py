@@ -15,71 +15,34 @@ from __future__ import annotations
 
 import numpy as np
 
-from prince_cr.util import info, get_AZN
+from prince_cr.util import info, get_AZN, is_nucleus
 import prince_cr.config as config
 
 from .base import CrossSectionBase
 
 
-# -- PDG → PriNCe ncoid mapping (TEMPORARY SHIM) -----------------------------
-#
-# The FLUKA db's elementary_daughters column stores PDG codes. PriNCe's
-# internal indexing uses Neucosma ncoids. This table bridges the two.
-#
-# **Remove this entire block in the next session when PriNCe migrates to
-# PDG natively across data.py / base.py / spec_data.** The mapping is
-# load-only — once the rest of PriNCe speaks PDG, FlukaPhotoNuclear can
-# pass elementary_daughters through unchanged.
-#
-# Muon helicity: chromo's Pythia post-decay produces helicity-mixed muons,
-# so PDG ±13 maps to PriNCe's helicity-0 slots (7 for μ+, 10 for μ-).
-# Helicity-resolved analytical decays remain available through decays.py
-# for any test that needs them.
-#
-# K^0_S (310) and K^0_L (130) have no ncoid slot in particle_data.ppo;
-# return None and let the caller drop these channels with a warning.
-_PDG_TO_NCOID = {
-    22:    0,    # gamma
-    11:    20,   # e-
-    -11:   21,   # e+
-    13:    10,   # mu- (helicity 0)
-    -13:   7,    # mu+ (helicity 0)
-    12:    11,   # nu_e
-    -12:   12,   # nu_ebar
-    14:    13,   # nu_mu
-    -14:   14,   # nu_mubar
-    16:    15,   # nu_tau
-    -16:   16,   # nu_taubar
-    211:   2,    # pi+
-    -211:  3,    # pi-
-    111:   4,    # pi0
-    321:   50,   # K+
-    -321:  51,   # K-
-    130:   None, # K^0_L — no PriNCe slot
-    310:   None, # K^0_S — no PriNCe slot
-    2212:  101,  # p
-    2112:  100,  # n
+# The FLUKA db (prince-fluka-utils v1+) stores nucleus mothers / daughters as
+# PDG nuclear codes (``10LZZZAAAI``) and elementary daughters as standard PDG
+# codes. The only normalisation needed is mapping the bound H-1 / n-1 codes
+# (``1000010010`` / ``1000000010``) onto PriNCe's canonical free-nucleon
+# codes (``2212`` / ``2112``); everything else passes through unchanged.
+_BOUND_NUCLEON_TO_FREE = {
+    1000010010: 2212,  # H-1 nucleus → free proton
+    1000000010: 2112,  # n-1 nucleus → free neutron
 }
 
 
-def _pdg_to_ncoid(pdg: int):
-    """Convert PDG code → PriNCe ncoid. Returns None for unmapped codes
-    (K^0_S, K^0_L, plus anything outside the elementary-species set).
-    """
-    return _PDG_TO_NCOID.get(int(pdg))
+def _normalize_pdg(pdg_id: int) -> int:
+    """Collapse the bound-nucleon variants onto canonical free-nucleon codes."""
+    pdg_id = int(pdg_id)
+    return _BOUND_NUCLEON_TO_FREE.get(pdg_id, pdg_id)
 
 
-def _is_nucleus(ncoid: int) -> bool:
-    """True iff ``ncoid`` is plausibly a nucleus in PriNCe's ncoid scheme.
-
-    PriNCe encodes nuclei as ``100 * A + Z`` with ``Z <= A``. Anything
-    below 100, or with ``Z > A``, is not a nucleus.
-    """
-    if ncoid < 100:
-        return False
-    A = ncoid // 100
-    Z = ncoid % 100
-    return Z <= A
+# K^0_S (310) and K^0_L (130) have no spec_data entry on the PriNCe side,
+# and the FLUKA db routes them through elementary_daughters. We drop them
+# at load time with a warning so the mass numbers/charge bookkeeping stays
+# consistent. Once we add neutral kaons to spec_data this set can shrink.
+_PDG_DROPPED_ELEMENTARY = frozenset({130, 310})
 
 
 # Tracks (mo, da) pairs already warned about so repeated loads in the same
@@ -143,48 +106,55 @@ class FlukaPhotoNuclear(CrossSectionBase):
 
         self._egrid_tab = tables["energy_grid"]    # GeV
         self.xbins = tables["xbins"]               # log-spaced [1e-5, 3], 200 bins
+        # FLUKA db stores elementary yields as σ_inel · P(x_bin) (count-per-bin
+        # convention); the response builder expects dσ/dx. Divide by bin width
+        # on load so _incl_diff_tab matches SOPHIA's per-density convention.
+        xwidths = self.xbins[1:] - self.xbins[:-1]
 
-        # σ_inel: (n_m, n_E)
-        for ncoid, sig in zip(
+        # σ_inel: (n_m, n_E). Mothers are PDG nucleus codes; bound H-1 / n-1
+        # codes are folded onto canonical free p / n.
+        for raw_mo, sig in zip(
             tables["inel_mothers"], tables["inelastic_cross_sctions"]
         ):
-            ncoid = int(ncoid)
-            A, _, _ = get_AZN(ncoid)
+            mo = _normalize_pdg(raw_mo)
+            A, _, _ = get_AZN(mo)
             if A > config.max_mass:
                 continue
-            self._nonel_tab[ncoid] = sig           # cm^2
+            self._nonel_tab[mo] = sig              # cm^2
 
-        # Boost-conserving: (mother_ncoid, daughter_ncoid), 2D yields (n_ch, n_E)
-        for (mo, da), yld in zip(
+        # Boost-conserving: (mother_PDG, daughter_PDG); 2D yields (n_ch, n_E)
+        for (raw_mo, raw_da), yld in zip(
             tables["mothers_daughters"], tables["fragment_yields"]
         ):
-            mo, da = int(mo), int(da)
-            # v0 generator inconsistency: K^±, Λ, and free p/n sometimes land
-            # here. Drop them; they belong in elementary_daughters. Also drop
-            # any row where daughter mass > mother mass (unphysical; a known
-            # v0 db artefact from misrouted PDG codes and cross-isobar entries).
+            mo = _normalize_pdg(raw_mo)
+            da = _normalize_pdg(raw_da)
+            # Generator artefacts: K^±, Λ, and free p/n sometimes land here.
+            # Drop them; they belong in elementary_daughters. Also drop any
+            # row where daughter mass > mother mass (unphysical; cross-isobar
+            # mis-routing is a known v0/v1 db artefact).
             A_mo, _, _ = get_AZN(mo)
             A_da, _, _ = get_AZN(da)
-            if not _is_nucleus(da) or A_da < 2 or A_da > A_mo:
-                _warn_misclassified(mo, da)
+            if not is_nucleus(da) or A_da < 2 or A_da > A_mo:
+                _warn_misclassified(int(raw_mo), int(raw_da))
                 continue
             if A_mo > config.max_mass:
                 continue
             self._incl_tab[mo, da] = yld
 
-        # Redistributed: (mother_ncoid, daughter_pdg→ncoid), 3D yields
-        # FLUKA stores (n_E, n_x); transpose to PriNCe convention (n_x, n_E).
-        for (mo, da_pdg), yld_3d in zip(
+        # Redistributed: (mother_PDG, daughter_PDG); 3D yields.
+        # FLUKA stores (n_E, n_x) per-bin counts; transpose to PriNCe (n_x, n_E)
+        # and divide by xwidths so the stored value is dσ/dx (cm^2 per unit x).
+        for (raw_mo, da_pdg), yld_3d in zip(
             tables["elementary_daughters"], tables["elementary_yields"]
         ):
-            mo, da_pdg = int(mo), int(da_pdg)
-            da_ncoid = _pdg_to_ncoid(da_pdg)
-            if da_ncoid is None:                   # K^0_S / K^0_L drop
+            da_pdg = int(da_pdg)
+            if da_pdg in _PDG_DROPPED_ELEMENTARY:   # K^0_S / K^0_L
                 continue
+            mo = _normalize_pdg(raw_mo)
             A_mo, _, _ = get_AZN(mo)
             if A_mo > config.max_mass:
                 continue
-            self._incl_diff_tab[mo, da_ncoid] = yld_3d.T
+            self._incl_diff_tab[mo, da_pdg] = yld_3d.T / xwidths[:, None]
 
         # Initial range = full egrid
         self.set_range()

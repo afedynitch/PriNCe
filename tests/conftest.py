@@ -31,8 +31,8 @@ config.max_mass = 14
 
 # FLUKA db lives in a sibling repo during v0 development. Production users
 # either copy the file into data_dir or override this path themselves.
-config.fluka_db_path = "/Users/anatoli/devel_mac/prince-fluka-utils"
-config.fluka_db_fname = "prince_db_v0.h5"
+config.fluka_db_path = "/ceph/sharedfs/work/SATORI/anatoli/devel/UH-UHECR-Fluka-Prince/runs/2026-05-04_pfu-v1-smoke"
+config.fluka_db_fname = "prince_db_v1_smoke.h5"
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -108,8 +108,8 @@ def cached_prince_run():
         _cfg.x_cut = 1e-4
         _cfg.x_cut_proton = 1e-2
         _cfg.tau_dec_threshold = np.inf
-        _cfg.fluka_db_path = "/Users/anatoli/devel_mac/prince-fluka-utils"
-        _cfg.fluka_db_fname = "prince_db_v0.h5"
+        _cfg.fluka_db_path = "/ceph/sharedfs/work/SATORI/anatoli/devel/UH-UHECR-Fluka-Prince/runs/2026-05-04_pfu-v1-smoke"
+        _cfg.fluka_db_fname = "prince_db_v1_smoke.h5"
         pf_full = photonfields.CombinedPhotonField(
             [photonfields.CMBPhotonSpectrum, photonfields.CIBGilmore2D]
         )
@@ -157,9 +157,9 @@ def bench_propagation():
 BASELINE_FILE = Path(__file__).resolve().parent / "data" / "baseline_state.npz"
 
 AUGER_BASELINE_PARAMS = {
-    101: (0.96, 10**9.68, 20.0),
-    402: (0.96, 10**9.68, 50.0),
-    1407: (0.96, 10**9.68, 30.0),
+    2212:       (0.96, 10**9.68, 20.0),  # proton
+    1000020040: (0.96, 10**9.68, 50.0),  # He-4
+    1000070140: (0.96, 10**9.68, 30.0),  # N-14
 }
 
 

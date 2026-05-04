@@ -34,7 +34,10 @@ def test_e2e_solver_runs(prince_run_m14):
         AugerFitSource(
             run,
             norm=1e-50,
-            params={101: (0.96, 10**9.68, 20.0), 402: (0.96, 10**9.68, 50.0)},
+            params={
+                2212: (0.96, 10**9.68, 20.0),         # proton
+                1000020040: (0.96, 10**9.68, 50.0),    # He-4
+            },
         )
     )
     solver.solve(dz=1e-2, verbose=False, summary=False, progressbar=False)
@@ -42,8 +45,8 @@ def test_e2e_solver_runs(prince_run_m14):
     state = solver.state
     assert np.all(np.isfinite(state)), "solver state contains NaN/inf"
 
-    # Proton bin: state vector slice for ncoid 101
-    p_species = run.spec_man.ncoid2sref[101]
+    # Proton bin: state vector slice for PDG 2212
+    p_species = run.spec_man.pdgid2sref[2212]
     proton_state = state[p_species.sl]
     assert proton_state.shape[0] == run.cr_grid.d
     # Allow zeros at energies where injection is below threshold; require

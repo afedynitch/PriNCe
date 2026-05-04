@@ -4,7 +4,7 @@ import numpy as np
 from scipy.integrate import trapezoid as trapz
 
 from prince_cr.data import PRINCE_UNITS
-from prince_cr.util import info
+from prince_cr.util import info, is_nucleus
 import prince_cr.config as config
 
 using_cupy = False
@@ -76,7 +76,7 @@ class PhotoNuclearInteractionRate(object):
 
         batch_dim = 0
         for specid in self.spec_man.known_species:
-            if specid < 100:
+            if not is_nucleus(specid):
                 continue
             # Add the main diagonal self-couplings (absoption)
             batch_dim += dcr
@@ -148,7 +148,7 @@ class PhotoNuclearInteractionRate(object):
         self._assert_log_grids_compatible()
 
         spec_man = self.spec_man
-        sp_id_ref = spec_man.ncoid2sref
+        sp_id_ref = spec_man.pdgid2sref
         resp = self.cross_sections.resp
         m_pr = PRINCE_UNITS.m_proton
 
@@ -225,7 +225,7 @@ class PhotoNuclearInteractionRate(object):
         import itertools
 
         for moid, daid in itertools.product(known_species_rev, known_species_rev):
-            if moid < 100:
+            if not is_nucleus(moid):
                 continue
 
             has_nonel = moid == daid
@@ -275,7 +275,7 @@ class PhotoNuclearInteractionRate(object):
                     res[diag, diag, :] -= nonel_tile
 
                 # x-cut filter (depends only on (i_mo, i_da))
-                cut_low = x_cut_proton if daid == 101 else x_cut
+                cut_low = x_cut_proton if daid == 2212 else x_cut
                 cuts2d = np.logical_and(xl_2d >= cut_low, xl_2d <= 1)
 
                 # Extract kept rows and the corresponding (row, col) indices
@@ -415,7 +415,7 @@ class PhotoNuclearInteractionRate(object):
         """Returns energy loss length in cm
         (convenience function for plotting)
         """
-        species = self.spec_man.ncoid2sref[pid]
+        species = self.spec_man.pdgid2sref[pid]
         egrid = self.e_cosmicray.grid * species.A
         rate = (
             -1
@@ -502,7 +502,7 @@ class ContinuousAdiabaticLossRate(_ContinuousLossRateBase):
         """Returns energy loss length in cm
         (convenience function for plotting)
         """
-        species = self.spec_man.ncoid2sref[pid]
+        species = self.spec_man.pdgid2sref[pid]
 
         egrid = self.energy_vector[species.sl] * species.A
         rate = self.loss_vector(z)[species.sl] * species.A
@@ -596,7 +596,7 @@ class ContinuousPairProductionLossRate(_ContinuousLossRateBase):
         """Returns energy loss length in cm
         (convenience function for plotting)
         """
-        species = self.spec_man.ncoid2sref[pid]
+        species = self.spec_man.pdgid2sref[pid]
 
         egrid = self.e_cosmicray.grid * species.A
         rate = self.loss_vector(z, pfield=pfield)[species.sl] * species.A

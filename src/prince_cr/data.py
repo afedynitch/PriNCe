@@ -7,19 +7,109 @@ import scipy.constants as spc
 import h5py
 
 
-from prince_cr.util import convert_to_namedtuple, info
+from prince_cr.util import convert_to_namedtuple, info, make_nucleus_pdg
 import prince_cr.config as config
 
-#: Dictionary containing particle properties, like mass, charge
-#: lifetime or branching ratios
+
+# Boundary translation: the legacy ``particle_data.ppo`` is keyed by Neucosma
+# (NCo) IDs (proton=101, neutron=100, A*100+Z for nuclei; small integers for
+# light particles). PriNCe runs entirely in PDG IDs internally, so we translate
+# once at module load and never look at NCo again.
+#
+# Helicity-resolved muon NCo slots (5/6/8/9) collapse onto PDG ±13 — chromo's
+# Pythia post-decay produces helicity-mixed muons, and the production FLUKA
+# pipeline never populates the helicity-resolved slots. Helicity-0 NCo slots
+# (7 = μ+, 10 = μ-) carry the canonical entries; the duplicates are dropped.
+_NCO_TO_PDG_LIGHT = {
+    0:   22,    # gamma
+    2:   211,   # pi+
+    3:  -211,   # pi-
+    4:   111,   # pi0
+    7:  -13,    # mu+ (helicity 0)
+    10:  13,    # mu-  (helicity 0)
+    11:  12,    # nu_e
+    12: -12,    # nu_ebar
+    13:  14,    # nu_mu
+    14: -14,    # nu_mubar
+    15:  16,    # nu_tau
+    16: -16,    # nu_taubar
+    20:  11,    # e-
+    21: -11,    # e+
+    50:  321,   # K+
+    51: -321,   # K-
+    100: 2112,  # neutron
+    101: 2212,  # proton
+}
+# Helicity-resolved slots map onto the helicity-0 PDG codes (collapsed).
+_NCO_HELICITY_RESOLVED_TO_PDG = {5: -13, 6: -13, 8: 13, 9: 13}
+
+
+def _nco_to_pdg(nco_id):
+    """Translate a single NCo ID (int) to its PDG equivalent.
+
+    Nuclei (NCo >= 200, encoded as 100*A + Z) become 10LZZZAAAI ground-state
+    PDG codes via :func:`prince_cr.util.make_nucleus_pdg`. Free p/n use the
+    canonical 2212/2112 codes. Light particles use the table above. The
+    helicity-resolved muon slots collapse onto PDG ±13.
+    """
+    nco_id = int(nco_id)
+    if nco_id in _NCO_TO_PDG_LIGHT:
+        return _NCO_TO_PDG_LIGHT[nco_id]
+    if nco_id in _NCO_HELICITY_RESOLVED_TO_PDG:
+        return _NCO_HELICITY_RESOLVED_TO_PDG[nco_id]
+    if nco_id >= 100:
+        Z = nco_id % 100
+        A = (nco_id - Z) // 100
+        return make_nucleus_pdg(A, Z)
+    raise KeyError("Unknown NCo ID {0} in spec_data translation".format(nco_id))
+
+
+def _translate_spec_data(nco_keyed):
+    """Return a PDG-keyed copy of the legacy NCo-keyed ``particle_data.ppo``.
+
+    Recursively rewrites daughter IDs in each entry's ``branchings`` list and
+    rewrites the ``non_nuclear_species`` index list. Helicity-resolved muon
+    duplicates collapse onto the ±13 entry; later writes are no-ops because
+    the data is identical (mass/lifetime/branchings agree by construction).
+    """
+    pdg_keyed = {}
+    for key, value in nco_keyed.items():
+        if isinstance(key, str):
+            if key == "non_nuclear_species":
+                pdg_keyed[key] = sorted({_nco_to_pdg(p) for p in value})
+            else:
+                pdg_keyed[key] = value
+            continue
+        new_key = _nco_to_pdg(key)
+        new_entry = dict(value)
+        new_branchings = []
+        for branching, daughters in value.get("branchings", []):
+            new_daughters = [_nco_to_pdg(d) for d in daughters]
+            new_branchings.append((branching, new_daughters))
+        new_entry["branchings"] = new_branchings
+        pdg_keyed[new_key] = new_entry
+    return pdg_keyed
+
+
+#: Dictionary containing particle properties, keyed by PDG ID. Loaded from the
+#: NCo-keyed legacy pickle and translated on import.
 try:
     with open(path.join(config.data_dir, "particle_data.ppo"), "rb") as _f:
-        spec_data = pickle.load(_f)
+        _raw = pickle.load(_f)
 except UnicodeDecodeError:
     with open(path.join(config.data_dir, "particle_data.ppo"), "rb") as _f:
-        spec_data = pickle.load(_f, encoding="latin1")
+        _raw = pickle.load(_f, encoding="latin1")
+    spec_data = _translate_spec_data(_raw)
 except FileNotFoundError:
     info(0, 'Warning, particle database "particle_data.ppo" file not found.')
+    spec_data = {}
+else:
+    spec_data = _translate_spec_data(_raw)
+finally:
+    try:
+        del _raw
+    except NameError:
+        pass
 
 
 # Default units in Prince are ***cm, s, GeV***
@@ -280,6 +370,12 @@ class EnergyGrid(object):
         )
 
 
+_PDG_MESONS = frozenset({211, -211, 111, 321, -321})
+_PDG_CHARGED_LEPTONS = frozenset({11, -11, 13, -13, 15, -15})
+_PDG_NEUTRINOS = frozenset({12, -12, 14, -14, 16, -16})
+_PDG_GAMMA = 22
+
+
 class PrinceSpecies(object):
     """Bundles different particle properties for simplified
     availability of particle properties in :class:`prince_cr.core.PriNCeRun`.
@@ -291,24 +387,17 @@ class PrinceSpecies(object):
     """
 
     @staticmethod
-    def calc_AZN(nco_id):
-        """Returns mass number :math:`A`, charge :math:`Z` and neutron
-        number :math:`N` of ``nco_id``."""
-        Z, A = 1, 1
+    def calc_AZN(pdg_id):
+        """Returns ``(A, Z, N)`` for a nucleus PDG ID; ``(0, 0, 0)`` otherwise."""
+        from prince_cr.util import get_AZN
 
-        if nco_id >= 100:
-            Z = nco_id % 100
-            A = (nco_id - Z) // 100
-        else:
-            Z, A = 0, 0
+        return get_AZN(pdg_id)
 
-        return A, Z, A - Z
+    def __init__(self, pdgid, princeidx, d):
+        info(5, "Initializing new species", pdgid)
 
-    def __init__(self, ncoid, princeidx, d):
-        info(5, "Initializing new species", ncoid)
-
-        #: Neucosma ID of particle
-        self.ncoid = ncoid
+        #: PDG Monte Carlo ID of particle
+        self.pdgid = int(pdgid)
         #: (bool) particle is a hadron (meson or baryon)
         self.is_hadron = False
         #: (bool) particle is a meson
@@ -350,41 +439,45 @@ class PrinceSpecies(object):
         self._init_species()
 
     def _init_species(self):
-        """Fill all class attributes with values from
-        :var:`spec_data`, depending on ncoid."""
-        ncoid = self.ncoid
-        dbentry = spec_data[ncoid]
+        """Fill all class attributes with values from :var:`spec_data`,
+        dispatching on the PDG ID's particle class.
+        """
+        from prince_cr.util import is_nucleus, get_AZN
 
-        if ncoid < 200:
-            self.is_nucleus = False
-            if ncoid == 0:
-                self.is_em = True
-            elif ncoid in [100, 101]:
+        pdgid = self.pdgid
+        dbentry = spec_data[pdgid]
+
+        if is_nucleus(pdgid):
+            self.is_nucleus = True
+            self.A, self.Z, self.N = get_AZN(pdgid)
+            if self.A == 1:  # free p / n
                 self.is_hadron = True
                 self.is_baryon = True
-                self.is_nucleus = True
-                self.A, self.Z, self.N = self.calc_AZN(ncoid)
-            elif ncoid in [2, 3, 4, 50]:
-                self.is_hadron = True
-                self.is_meson = True
-            else:
-                self.is_lepton = True
-                if ncoid in [20, 21]:
-                    self.is_em = True
-                elif ncoid in [7, 10]:
-                    self.is_alias = True
-        else:
-            self.is_nucleus = True
-            self.A, self.Z, self.N = self.calc_AZN(ncoid)
+        elif pdgid == _PDG_GAMMA:
+            self.is_em = True
+        elif pdgid in _PDG_MESONS:
+            self.is_hadron = True
+            self.is_meson = True
+        elif pdgid in _PDG_CHARGED_LEPTONS:
+            self.is_lepton = True
+            if abs(pdgid) == 11:  # e±
+                self.is_em = True
+            elif abs(pdgid) == 13:  # μ±
+                self.is_alias = True
+        elif pdgid in _PDG_NEUTRINOS:
+            self.is_lepton = True
 
         self.AZN = self.A, self.Z, self.N
 
-        if ncoid <= config.redist_threshold_ID:
+        # All non-nuclei (and free p/n) get redistributed; A>=2 nuclei are
+        # boost-conserving. The free nucleon case is the same in PDG and NCo:
+        # PriNCe stores p/n yields differentially (x = E_da/E_γ).
+        if (not self.is_nucleus) or self.A == 1:
             self.has_redist = True
 
         if "name" not in dbentry:
-            info(5, "Name for species", ncoid, "not defined")
-            self.sname = "nucleus_{0}".format(ncoid)
+            info(5, "Name for species", pdgid, "not defined")
+            self.sname = "nucleus_{0}".format(pdgid)
         else:
             self.sname = dbentry["name"]
 
@@ -443,64 +536,61 @@ class PrinceSpecies(object):
 class SpeciesManager(object):
     """Provides a database with particle and species."""
 
-    def __init__(self, ncoid_list, ed):
+    def __init__(self, pdgid_list, ed):
         # (dict) Dimension of primary grid
         self.grid_dims = {"default": ed}
         # Particle index shortcuts
-        #: (dict) Converts Neucosma ID to index in state vector
-        self.ncoid2princeidx = {}
+        #: (dict) Converts PDG ID to index in state vector
+        self.pdgid2princeidx = {}
         #: (dict) Converts particle name to index in state vector
         self.sname2princeidx = {}
-        #: (dict) Converts Neucosma ID to reference of
-        # :class:`data.PrinceSpecies`
-        self.ncoid2sref = {}
+        #: (dict) Converts PDG ID to reference of :class:`data.PrinceSpecies`
+        self.pdgid2sref = {}
         #: (dict) Converts particle name to reference of
         #:class:`data.PrinceSpecies`
         self.sname2sref = {}
         #: (dict) Converts prince index to reference of
         #:class:`data.PrinceSpecies`
         self.princeidx2sref = {}
-        #: (dict) Converts index in state vector to Neucosma ID
-        self.princeidx2ncoid = {}
+        #: (dict) Converts index in state vector to PDG ID
+        self.princeidx2pdgid = {}
         #: (dict) Converts index in state vector to reference
         # of :class:`data.PrinceSpecies`
         self.princeidx2pname = {}
         #: (int) Total number of species
         self.nspec = 0
 
-        self._gen_species(ncoid_list)
+        self._gen_species(pdgid_list)
         self._init_species_tables()
 
-    def _gen_species(self, ncoid_list):
+    def _gen_species(self, pdgid_list):
         info(4, "Generating list of species.")
 
-        # ncoid_list += spec_data["non_nuclear_species"]
-
         # Make sure list is unique and sorted
-        ncoid_list = sorted(list(set(ncoid_list)))
+        pdgid_list = sorted(list(set(pdgid_list)))
 
         self.species_refs = []
         # Define position in state vector (princeidx) by simply
-        # incrementing it with the (sorted) list of Neucosma IDs
-        for princeidx, ncoid in enumerate(ncoid_list):
-            info(4, "Appending species {0} at position {1}".format(ncoid, princeidx))
+        # incrementing it with the (sorted) list of PDG IDs
+        for princeidx, pdgid in enumerate(pdgid_list):
+            info(4, "Appending species {0} at position {1}".format(pdgid, princeidx))
             self.species_refs.append(
-                PrinceSpecies(ncoid, princeidx, self.grid_dims["default"])
+                PrinceSpecies(pdgid, princeidx, self.grid_dims["default"])
             )
 
-        self.known_species = [s.ncoid for s in self.species_refs]
-        self.redist_species = [s.ncoid for s in self.species_refs if s.has_redist]
+        self.known_species = [s.pdgid for s in self.species_refs]
+        self.redist_species = [s.pdgid for s in self.species_refs if s.has_redist]
         self.boost_conserv_species = [
-            s.ncoid for s in self.species_refs if not s.has_redist
+            s.pdgid for s in self.species_refs if not s.has_redist
         ]
 
     def _init_species_tables(self):
         for s in self.species_refs:
-            self.ncoid2princeidx[s.ncoid] = s.princeidx
+            self.pdgid2princeidx[s.pdgid] = s.princeidx
             self.sname2princeidx[s.sname] = s.princeidx
-            self.princeidx2ncoid[s.princeidx] = s.ncoid
+            self.princeidx2pdgid[s.princeidx] = s.pdgid
             self.princeidx2pname[s.princeidx] = s.sname
-            self.ncoid2sref[s.ncoid] = s
+            self.pdgid2sref[s.pdgid] = s
             self.princeidx2sref[s.princeidx] = s
             self.sname2sref[s.sname] = s
 
@@ -522,7 +612,7 @@ class SpeciesManager(object):
         ident = 3 * " "
         for s in self.species_refs:
             str_out += s.sname + "\n" + ident
-            str_out += "NCO id : " + str(s.ncoid) + "\n" + ident
+            str_out += "PDG id : " + str(s.pdgid) + "\n" + ident
             str_out += "PriNCe idx : " + str(s.princeidx) + "\n\n"
 
         return str_out

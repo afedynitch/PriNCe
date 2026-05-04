@@ -12,6 +12,18 @@ from prince_cr.data import (
 )
 
 
+# Common PDG IDs used throughout the tests.
+PDG_GAMMA = 22
+PDG_E_MINUS = 11
+PDG_E_PLUS = -11
+PDG_NU_E = 12
+PDG_PI_PLUS = 211
+PDG_PROTON = 2212
+PDG_NEUTRON = 2112
+PDG_HE4 = 1000020040
+PDG_N14 = 1000070140
+
+
 class TestInterpolatorWrapper:
     def test_basic_call(self):
         from scipy.interpolate import RegularGridInterpolator
@@ -93,55 +105,55 @@ class TestPrinceSpeciesVariants:
     """Test PrinceSpecies with different particle types to cover all branches."""
 
     def test_photon_species(self):
-        """ncoid 0: electromagnetic particle"""
-        species = [0, 101]
+        """PDG 22: gamma (electromagnetic particle)"""
+        species = [PDG_GAMMA, PDG_PROTON]
         sm = SpeciesManager(species, 10)
-        photon = sm.ncoid2sref[0]
+        photon = sm.pdgid2sref[PDG_GAMMA]
         assert photon.is_em is True
         assert photon.is_nucleus is False
         assert photon.has_redist is True
 
     def test_meson_species(self):
-        """ncoid 2: pion (meson)"""
-        species = [2, 101]
+        """PDG 211: pi+ (meson)"""
+        species = [PDG_PI_PLUS, PDG_PROTON]
         sm = SpeciesManager(species, 10)
-        pion = sm.ncoid2sref[2]
+        pion = sm.pdgid2sref[PDG_PI_PLUS]
         assert pion.is_hadron is True
         assert pion.is_meson is True
         assert pion.is_baryon is False
         assert pion.has_redist is True
 
     def test_lepton_species(self):
-        """ncoid 20: electron (lepton, em)"""
-        species = [20, 101]
+        """PDG 11: e- (lepton, em)"""
+        species = [PDG_E_MINUS, PDG_PROTON]
         sm = SpeciesManager(species, 10)
-        electron = sm.ncoid2sref[20]
+        electron = sm.pdgid2sref[PDG_E_MINUS]
         assert electron.is_lepton is True
         assert electron.is_em is True
         assert electron.has_redist is True
 
     def test_positron_species(self):
-        """ncoid 21: positron (lepton, em)"""
-        species = [21, 101]
+        """PDG -11: e+ (lepton, em)"""
+        species = [PDG_E_PLUS, PDG_PROTON]
         sm = SpeciesManager(species, 10)
-        positron = sm.ncoid2sref[21]
+        positron = sm.pdgid2sref[PDG_E_PLUS]
         assert positron.is_lepton is True
         assert positron.is_em is True
 
     def test_neutrino_species(self):
-        """ncoid 11: electron neutrino (lepton, not em)"""
-        species = [11, 101]
+        """PDG 12: nu_e (lepton, not em)"""
+        species = [PDG_NU_E, PDG_PROTON]
         sm = SpeciesManager(species, 10)
-        nu = sm.ncoid2sref[11]
+        nu = sm.pdgid2sref[PDG_NU_E]
         assert nu.is_lepton is True
         assert nu.is_em is False
         assert nu.is_nucleus is False
 
     def test_neutron_species(self):
-        """ncoid 100: neutron (baryon, nucleus)"""
-        species = [100, 101]
+        """PDG 2112: free neutron (baryon, nucleus)"""
+        species = [PDG_NEUTRON, PDG_PROTON]
         sm = SpeciesManager(species, 10)
-        neutron = sm.ncoid2sref[100]
+        neutron = sm.pdgid2sref[PDG_NEUTRON]
         assert neutron.is_hadron is True
         assert neutron.is_baryon is True
         assert neutron.is_nucleus is True
@@ -150,30 +162,31 @@ class TestPrinceSpeciesVariants:
         assert neutron.N == 1
 
     def test_heavy_nucleus(self):
-        """ncoid 1407: nitrogen-14"""
-        species = [101, 1407]
+        """PDG 1000070140: nitrogen-14"""
+        species = [PDG_PROTON, PDG_N14]
         sm = SpeciesManager(species, 10)
-        n14 = sm.ncoid2sref[1407]
+        n14 = sm.pdgid2sref[PDG_N14]
         assert n14.is_nucleus is True
         assert n14.A == 14
         assert n14.Z == 7
         assert n14.N == 7
 
     def test_lbin_ubin(self):
-        species = [100, 101]
+        species = [PDG_NEUTRON, PDG_PROTON]
         sm = SpeciesManager(species, 10)
-        proton = sm.ncoid2sref[101]
+        proton = sm.pdgid2sref[PDG_PROTON]
         lbin = proton.lbin()
         ubin = proton.ubin()
         assert ubin - lbin == 11  # d + 1 = 10 + 1
 
     def test_calc_AZN_static(self):
-        A, Z, N = PrinceSpecies.calc_AZN(402)
+        A, Z, N = PrinceSpecies.calc_AZN(PDG_HE4)
         assert A == 4
         assert Z == 2
         assert N == 2
 
-        A, Z, N = PrinceSpecies.calc_AZN(50)
+        # K+ (PDG 321) is not a nucleus
+        A, Z, N = PrinceSpecies.calc_AZN(321)
         assert A == 0
         assert Z == 0
         assert N == 0
@@ -181,38 +194,38 @@ class TestPrinceSpeciesVariants:
 
 class TestSpeciesManagerExtra:
     def test_repr(self):
-        species = [100, 101]
+        species = [PDG_NEUTRON, PDG_PROTON]
         sm = SpeciesManager(species, 10)
         r = repr(sm)
-        assert "NCO id" in r
+        assert "PDG id" in r
         assert "PriNCe idx" in r
 
     def test_redist_species(self):
-        species = [11, 20, 100, 101, 402]
+        species = [PDG_NU_E, PDG_E_MINUS, PDG_NEUTRON, PDG_PROTON, PDG_HE4]
         sm = SpeciesManager(species, 10)
-        # Species <= 101 should have has_redist = True
-        assert 11 in sm.redist_species
-        assert 20 in sm.redist_species
-        # Nuclei > 101 don't have redistribution
-        assert 402 in sm.boost_conserv_species
+        # Non-nuclei and free p/n should have has_redist = True
+        assert PDG_NU_E in sm.redist_species
+        assert PDG_E_MINUS in sm.redist_species
+        # Heavy nuclei (A>=2) are boost-conserving
+        assert PDG_HE4 in sm.boost_conserv_species
 
     def test_sname_lookups(self):
-        species = [100, 101]
+        species = [PDG_NEUTRON, PDG_PROTON]
         sm = SpeciesManager(species, 10)
         for spec in sm.species_refs:
             assert spec.sname in sm.sname2princeidx
             assert spec.sname in sm.sname2sref
 
     def test_princeidx_lookups(self):
-        species = [100, 101]
+        species = [PDG_NEUTRON, PDG_PROTON]
         sm = SpeciesManager(species, 10)
         for idx in range(len(species)):
-            assert idx in sm.princeidx2ncoid
+            assert idx in sm.princeidx2pdgid
             assert idx in sm.princeidx2sref
             assert idx in sm.princeidx2pname
 
     def test_add_grid_propagates(self):
-        species = [100, 101]
+        species = [PDG_NEUTRON, PDG_PROTON]
         sm = SpeciesManager(species, 10)
         sm.add_grid("ph", 20)
         for spec in sm.species_refs:

@@ -22,6 +22,23 @@ from prince_cr.decays import (
 from prince_cr.data import spec_data  # noqa: E402
 
 
+# PDG IDs used in the test cases.
+PDG_PI_PLUS = 211
+PDG_PI_MINUS = -211
+PDG_MU_PLUS = -13
+PDG_MU_MINUS = 13
+PDG_NU_E = 12
+PDG_NU_E_BAR = -12
+PDG_NU_MU = 14
+PDG_NU_MU_BAR = -14
+PDG_KAON_PLUS = 321
+PDG_KAON_MINUS = -321
+PDG_PROTON = 2212
+PDG_NEUTRON = 2112
+PDG_HE3 = 1000020030
+PDG_TRITIUM = 1000010030
+
+
 class TestPionToNumu:
     def test_shape_preserved(self):
         x = np.linspace(0, 1.5, 100)
@@ -34,8 +51,8 @@ class TestPionToNumu:
         np.testing.assert_array_equal(result, [0.0, 0.0])
 
     def test_nonzero_inside_range(self):
-        m_muon = spec_data[7]["mass"]
-        m_pion = spec_data[2]["mass"]
+        m_muon = spec_data[PDG_MU_PLUS]["mass"]
+        m_pion = spec_data[PDG_PI_PLUS]["mass"]
         r = m_muon**2 / m_pion**2
         x = np.array([0.5 * (1 - r)])  # inside [0, 1-r]
         result = pion_to_numu(x)
@@ -70,8 +87,8 @@ class TestPionToMuon:
         assert result.shape == x.shape
 
     def test_nonzero_inside_range(self):
-        m_muon = spec_data[7]["mass"]
-        m_pion = spec_data[2]["mass"]
+        m_muon = spec_data[PDG_MU_PLUS]["mass"]
+        m_pion = spec_data[PDG_PI_PLUS]["mass"]
         r = m_muon**2 / m_pion**2
         x = np.array([(r + 1.0) / 2.0])  # inside [r, 1]
         result = pion_to_muon(x)
@@ -94,8 +111,8 @@ class TestPionToMuonAvg:
 
 class TestProbMuonHel:
     def test_shape(self):
-        m_muon = spec_data[7]["mass"]
-        m_pion = spec_data[2]["mass"]
+        m_muon = spec_data[PDG_MU_PLUS]["mass"]
+        m_pion = spec_data[PDG_PI_PLUS]["mass"]
         r = m_muon**2 / m_pion**2
         # Only use x values in valid range (r, 1]
         x = np.linspace(r + 0.01, 1.0, 50)
@@ -103,8 +120,8 @@ class TestProbMuonHel:
         assert result.shape == x.shape
 
     def test_helicity_values(self):
-        m_muon = spec_data[7]["mass"]
-        m_pion = spec_data[2]["mass"]
+        m_muon = spec_data[PDG_MU_PLUS]["mass"]
+        m_pion = spec_data[PDG_PI_PLUS]["mass"]
         r = m_muon**2 / m_pion**2
         x = np.array([(r + 1.0) / 2.0])
         p_plus = prob_muon_hel(x, 1.0)
@@ -158,97 +175,62 @@ class TestGetDecayMatrix:
 
     def test_pion_to_numu(self):
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        result = get_decay_matrix(2, 13, x_grid)
+        result = get_decay_matrix(PDG_PI_PLUS, PDG_NU_MU, x_grid)
         assert result.shape == x_grid.shape
         assert np.any(result > 0)
 
-    def test_pion_to_muon_any_hel(self):
+    def test_pion_minus_to_numubar(self):
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        result = get_decay_matrix(2, 7, x_grid)
+        result = get_decay_matrix(PDG_PI_MINUS, PDG_NU_MU_BAR, x_grid)
         assert result.shape == x_grid.shape
+        assert np.any(result > 0)
 
-    def test_pion_to_muon_left_hel(self):
-        m_muon = spec_data[7]["mass"]
-        m_pion = spec_data[2]["mass"]
-        r = m_muon**2 / m_pion**2
-        # Use 1D array in valid range only (x <= 1 to avoid prob_muon_hel 2D bug)
-        x_1d = np.linspace(r + 0.01, 0.99, 20)
-        result = get_decay_matrix(2, 5, x_1d)
-        assert result.shape == x_1d.shape
-
-    def test_pion_to_muon_right_hel(self):
-        m_muon = spec_data[7]["mass"]
-        m_pion = spec_data[2]["mass"]
-        r = m_muon**2 / m_pion**2
-        x_1d = np.linspace(r + 0.01, 0.99, 20)
-        result = get_decay_matrix(2, 6, x_1d)
-        assert result.shape == x_1d.shape
+    def test_pion_to_muon_helicity_mixed(self):
+        x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
+        result = get_decay_matrix(PDG_PI_PLUS, PDG_MU_PLUS, x_grid)
+        assert result.shape == x_grid.shape
 
     def test_muon_to_nue(self):
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        # muon+ (hel any) to electron neutrino
-        result = get_decay_matrix(7, 11, x_grid)
+        # μ+ → ν_e (helicity-mixed, h=0)
+        result = get_decay_matrix(PDG_MU_PLUS, PDG_NU_E, x_grid)
         assert result.shape == x_grid.shape
 
     def test_muon_to_numubar(self):
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        # muon+ (hel any) to muon anti-neutrino
-        result = get_decay_matrix(7, 14, x_grid)
+        # μ+ → ν̄_μ
+        result = get_decay_matrix(PDG_MU_PLUS, PDG_NU_MU_BAR, x_grid)
         assert result.shape == x_grid.shape
 
     def test_muonminus_to_nuebar(self):
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        result = get_decay_matrix(10, 12, x_grid)
+        result = get_decay_matrix(PDG_MU_MINUS, PDG_NU_E_BAR, x_grid)
         assert result.shape == x_grid.shape
 
     def test_muonminus_to_numu(self):
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        result = get_decay_matrix(10, 13, x_grid)
-        assert result.shape == x_grid.shape
-
-    def test_muon_left_to_nue(self):
-        x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        result = get_decay_matrix(5, 11, x_grid)
-        assert result.shape == x_grid.shape
-
-    def test_muonminus_left_to_nuebar(self):
-        x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        result = get_decay_matrix(8, 12, x_grid)
+        result = get_decay_matrix(PDG_MU_MINUS, PDG_NU_MU, x_grid)
         assert result.shape == x_grid.shape
 
     def test_nucleus_to_nucleus(self):
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        # neutron beta decay: nucleus 100 -> 101 (boost conservation)
-        result = get_decay_matrix(100, 101, x_grid)
+        # neutron β decay: n → p (boost conservation)
+        result = get_decay_matrix(PDG_NEUTRON, PDG_PROTON, x_grid)
         assert result.shape == x_grid.shape
 
-    def test_beta_minus_neutrino(self):
-        # Beta- decay: use tritium (301) -> He-3 (302), emits nu_e (da=11)
-        # 301 - 1 = 300 (Z = 0), but that's wrong. Use 302 -> 303 or similar
-        # Actually the code does mo-1 for beta-, so use a nucleus where mo-1 exists
-        # For example 302 (He-3) beta: daughter=301
-        # Just check that it enters the beta- branch without crashing
-        x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        # Use the nucleus 302 (He-3, A=3 Z=2), daughter 301 (tritium)
-        try:
-            result = get_decay_matrix(302, 11, x_grid)
-            assert result.shape == x_grid.shape
-        except (KeyError, Exception):
-            # Some nuclei may not be in spec_data
-            pass
-
-    def test_beta_plus_neutrino(self):
-        # Beta+ decay: use nucleus where mo+1 exists
+    def test_beta_decay_branch(self):
+        # Hits the nucleus → ν_e_bar β-decay branch (Z+1 daughter).
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
         try:
-            result = get_decay_matrix(301, 12, x_grid)
+            result = get_decay_matrix(PDG_HE3, PDG_NU_E_BAR, x_grid)
             assert result.shape == x_grid.shape
         except (KeyError, Exception):
+            # Some intermediate nuclei may not be in spec_data
             pass
 
     def test_unknown_channel(self):
         x_grid = np.outer(np.linspace(0.01, 2, 20), np.ones(5))
-        result = get_decay_matrix(50, 51, x_grid)
+        result = get_decay_matrix(PDG_KAON_PLUS, PDG_KAON_MINUS, x_grid)
         np.testing.assert_array_equal(result, np.zeros(x_grid.shape))
 
 
@@ -258,7 +240,7 @@ class TestGetDecayMatrixBinAverage:
         dx = x[1] - x[0]
         xl = x - dx / 2
         xu = x + dx / 2
-        result = get_decay_matrix_bin_average(2, 13, xl, xu)
+        result = get_decay_matrix_bin_average(PDG_PI_PLUS, PDG_NU_MU, xl, xu)
         assert result.shape == x.shape
 
     def test_pion_to_numu_2d(self):
@@ -267,7 +249,7 @@ class TestGetDecayMatrixBinAverage:
         dx = 0.05
         xl = x_grid - dx / 2
         xu = x_grid + dx / 2
-        result = get_decay_matrix_bin_average(2, 13, xl, xu)
+        result = get_decay_matrix_bin_average(PDG_PI_PLUS, PDG_NU_MU, xl, xu)
         assert result.shape == x_grid.shape
 
     def test_pion_to_muon_2d(self):
@@ -276,79 +258,43 @@ class TestGetDecayMatrixBinAverage:
         dx = 0.05
         xl = x_grid - dx / 2
         xu = x_grid + dx / 2
-        result = get_decay_matrix_bin_average(2, 7, xl, xu)
+        result = get_decay_matrix_bin_average(PDG_PI_PLUS, PDG_MU_PLUS, xl, xu)
         assert result.shape == x_grid.shape
-
-    def test_pion_to_muon_left_hel(self):
-        m_muon = spec_data[7]["mass"]
-        m_pion = spec_data[2]["mass"]
-        r = m_muon**2 / m_pion**2
-        x = np.linspace(r + 0.01, 1, 20)
-        dx = x[1] - x[0]
-        result = get_decay_matrix_bin_average(2, 5, x - dx / 2, x + dx / 2)
-        assert result.shape == x.shape
-
-    def test_pion_to_muon_right_hel(self):
-        m_muon = spec_data[7]["mass"]
-        m_pion = spec_data[2]["mass"]
-        r = m_muon**2 / m_pion**2
-        x = np.linspace(r + 0.01, 1, 20)
-        dx = x[1] - x[0]
-        result = get_decay_matrix_bin_average(2, 6, x - dx / 2, x + dx / 2)
-        assert result.shape == x.shape
 
     def test_muon_to_nue(self):
         x = np.linspace(0.05, 1, 20)
         dx = x[1] - x[0]
-        result = get_decay_matrix_bin_average(7, 11, x - dx / 2, x + dx / 2)
+        result = get_decay_matrix_bin_average(PDG_MU_PLUS, PDG_NU_E, x - dx / 2, x + dx / 2)
         assert result.shape == x.shape
 
     def test_muon_to_numubar(self):
         x = np.linspace(0.05, 1, 20)
         dx = x[1] - x[0]
-        result = get_decay_matrix_bin_average(7, 14, x - dx / 2, x + dx / 2)
+        result = get_decay_matrix_bin_average(PDG_MU_PLUS, PDG_NU_MU_BAR, x - dx / 2, x + dx / 2)
         assert result.shape == x.shape
 
     def test_muonminus_to_nuebar(self):
         x = np.linspace(0.05, 1, 20)
         dx = x[1] - x[0]
-        result = get_decay_matrix_bin_average(10, 12, x - dx / 2, x + dx / 2)
+        result = get_decay_matrix_bin_average(PDG_MU_MINUS, PDG_NU_E_BAR, x - dx / 2, x + dx / 2)
         assert result.shape == x.shape
 
     def test_muonminus_to_numu(self):
         x = np.linspace(0.05, 1, 20)
         dx = x[1] - x[0]
-        result = get_decay_matrix_bin_average(10, 13, x - dx / 2, x + dx / 2)
+        result = get_decay_matrix_bin_average(PDG_MU_MINUS, PDG_NU_MU, x - dx / 2, x + dx / 2)
         assert result.shape == x.shape
-
-    def test_beta_minus_neutrino(self):
-        x = np.linspace(0.01, 2, 20)
-        dx = x[1] - x[0]
-        try:
-            result = get_decay_matrix_bin_average(302, 11, x - dx / 2, x + dx / 2)
-            assert result.shape == x.shape
-        except (KeyError, Exception):
-            pass
-
-    def test_beta_plus_neutrino(self):
-        x = np.linspace(0.01, 2, 20)
-        dx = x[1] - x[0]
-        try:
-            result = get_decay_matrix_bin_average(301, 12, x - dx / 2, x + dx / 2)
-            assert result.shape == x.shape
-        except (KeyError, Exception):
-            pass
 
     def test_boost_conservation(self):
         x = np.linspace(0.5, 1.5, 20)
         dx = x[1] - x[0]
-        result = get_decay_matrix_bin_average(100, 101, x - dx / 2, x + dx / 2)
+        result = get_decay_matrix_bin_average(PDG_NEUTRON, PDG_PROTON, x - dx / 2, x + dx / 2)
         assert result.shape == x.shape
 
     def test_unknown_channel(self):
         x = np.linspace(0.05, 1, 20)
         dx = x[1] - x[0]
-        result = get_decay_matrix_bin_average(50, 51, x - dx / 2, x + dx / 2)
+        result = get_decay_matrix_bin_average(PDG_KAON_PLUS, PDG_KAON_MINUS, x - dx / 2, x + dx / 2)
         np.testing.assert_array_equal(result, np.zeros(x.shape))
 
 
@@ -356,7 +302,7 @@ class TestGetParticleChannels:
     def test_pion_plus(self):
         mo_energy = np.logspace(0, 3, 20)
         da_energy = np.logspace(0, 3, 20)
-        x_grid, redist = get_particle_channels(2, mo_energy, da_energy)
+        x_grid, redist = get_particle_channels(PDG_PI_PLUS, mo_energy, da_energy)
         assert x_grid.shape == (20, 20)
         assert isinstance(redist, dict)
         assert len(redist) > 0
@@ -365,11 +311,11 @@ class TestGetParticleChannels:
 class TestNuFromBetaDecay:
     def test_neutron_decay(self):
         x = np.linspace(0.001, 2.0, 50)
-        result = nu_from_beta_decay(x, 100, 101)
+        result = nu_from_beta_decay(x, PDG_NEUTRON, PDG_PROTON)
         assert result.shape == x.shape
 
     def test_with_angle(self):
         x = np.linspace(0.001, 2.0, 50)
         angle = np.array([0.5])
-        result = nu_from_beta_decay(x, 100, 101, angle=angle)
+        result = nu_from_beta_decay(x, PDG_NEUTRON, PDG_PROTON, angle=angle)
         assert len(result) == len(x)

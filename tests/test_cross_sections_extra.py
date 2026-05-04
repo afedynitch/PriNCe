@@ -12,13 +12,13 @@ class TestFlukaAccessors:
     """Base-class accessor smoke tests, exercised through FlukaPhotoNuclear."""
 
     def test_nonel_proton(self, fluka):
-        egrid, cs = fluka.nonel(101)
+        egrid, cs = fluka.nonel(2212)
         assert len(egrid) > 0
         assert len(cs) > 0
         assert np.all(cs >= 0)
 
     def test_nonel_He4(self, fluka):
-        egrid, cs = fluka.nonel(402)
+        egrid, cs = fluka.nonel(1000020040)
         assert len(egrid) > 0
         assert np.all(cs >= 0)
 
@@ -48,23 +48,23 @@ class TestFlukaAccessors:
         fluka._range = orig
 
     def test_nonel_scale_A(self, fluka):
-        egrid, cs = fluka.nonel_scale(101)
-        A = get_AZN(101)[0]
-        egrid2, cs2 = fluka.nonel(101)
+        egrid, cs = fluka.nonel_scale(2212)
+        A = get_AZN(2212)[0]
+        egrid2, cs2 = fluka.nonel(2212)
         np.testing.assert_allclose(cs, cs2 / A)
 
     def test_nonel_scale_custom(self, fluka):
-        egrid, cs = fluka.nonel_scale(101, scale=2.0)
-        egrid2, cs2 = fluka.nonel(101)
+        egrid, cs = fluka.nonel_scale(2212, scale=2.0)
+        egrid2, cs2 = fluka.nonel(2212)
         np.testing.assert_allclose(cs, cs2 * 2.0)
 
     def test_is_differential_redistributed(self, fluka):
-        # Pion daughter (ncoid 2) is redistributed — ID <= redist_threshold_ID (101)
-        assert fluka.is_differential(101, 2) is True
+        # Pion daughter (PDG 211 = π+) is redistributed (non-nucleus).
+        assert fluka.is_differential(2212, 211) is True
 
     def test_is_differential_boost_conserving(self, fluka):
-        # He-4 → He-3: 302 > redist_threshold_ID and not in incl_diff_idcs
-        assert fluka.is_differential(402, 302) is False
+        # He-4 → He-3: heavy nucleus daughter, A>=2 → boost-conserving.
+        assert fluka.is_differential(1000020040, 1000020030) is False
 
 
 class TestResponseFunction:
@@ -77,7 +77,7 @@ class TestResponseFunction:
 
     def test_get_channel_nonel(self, fluka):
         resp = fluka.resp
-        ygr, integral = resp.get_channel(101)
+        ygr, integral = resp.get_channel(2212)
         assert len(ygr) > 0
         assert len(integral) > 0
 
@@ -90,10 +90,10 @@ class TestResponseFunction:
 
     def test_get_channel_scale(self, fluka):
         resp = fluka.resp
-        ygr, cs = resp.get_channel_scale(101)
+        ygr, cs = resp.get_channel_scale(2212)
         assert len(ygr) > 0
 
     def test_get_channel_scale_custom(self, fluka):
         resp = fluka.resp
-        ygr, cs = resp.get_channel_scale(101, scale=2.0)
+        ygr, cs = resp.get_channel_scale(2212, scale=2.0)
         assert len(ygr) > 0

@@ -1,7 +1,7 @@
 """Unit tests for the FLUKA photo-nuclear loader and FlukaPhotoNuclear class.
 
-The v0 db lives at /Users/anatoli/devel_mac/prince-fluka-utils/prince_db_v0.h5;
-conftest.py points config.fluka_db_path at the prince-fluka-utils repo root.
+The v0 db lives at config.fluka_db_path / config.fluka_db_fname; conftest.py
+points these at the locally available smoke db.
 """
 
 from __future__ import annotations
@@ -74,53 +74,29 @@ def test_fluka_photo_nuclear_db_missing_file_raises():
         cfg.fluka_db_fname = saved_fname
 
 
-def test_pdg_to_ncoid_known_mappings():
-    """Every elementary PDG → known PriNCe ncoid; K^0_S/K^0_L → None."""
-    from prince_cr.cross_sections.fluka import _pdg_to_ncoid
+def test_pdg_helpers_round_trip():
+    """is_nucleus + make_nucleus_pdg + get_AZN agree on round-trip identities."""
+    from prince_cr.util import is_nucleus, make_nucleus_pdg, get_AZN
 
-    expected = {
-        22: 0,            # gamma
-        11: 20, -11: 21,  # e-, e+
-        13: 10, -13: 7,   # mu- (helicity-0), mu+ (helicity-0)
-        12: 11, -12: 12,  # nu_e, nu_ebar
-        14: 13, -14: 14,  # nu_mu, nu_mubar
-        16: 15, -16: 16,  # nu_tau, nu_taubar
-        211: 2, -211: 3,  # pi+, pi-
-        111: 4,           # pi0
-        321: 50, -321: 51,  # K+, K-
-        130: None, 310: None,  # K^0_L, K^0_S — no ncoid slot
-        2212: 101, 2112: 100,  # p, n
-    }
-    for pdg, ncoid in expected.items():
-        assert _pdg_to_ncoid(pdg) == ncoid, f"pdg={pdg}"
+    # Free p / n
+    assert is_nucleus(2212) is True
+    assert is_nucleus(2112) is True
+    # Heavy nuclei
+    assert is_nucleus(make_nucleus_pdg(4, 2)) is True   # He-4
+    assert is_nucleus(make_nucleus_pdg(56, 26)) is True  # Fe-56
+    assert is_nucleus(make_nucleus_pdg(238, 92)) is True  # U-238
 
-
-def test_pdg_to_ncoid_unknown_returns_none():
-    """Unknown PDG codes return None (caller drops them)."""
-    from prince_cr.cross_sections.fluka import _pdg_to_ncoid
-    assert _pdg_to_ncoid(99999) is None
-
-
-def test_is_nucleus_basic():
-    """ncoid >= 100 with consistent A/Z is a nucleus."""
-    from prince_cr.cross_sections.fluka import _is_nucleus
-
-    assert _is_nucleus(101) is True   # p
-    assert _is_nucleus(100) is True   # n
-    assert _is_nucleus(402) is True   # He-4
-    assert _is_nucleus(5626) is True  # Fe-56
     # Non-nuclei
-    assert _is_nucleus(50) is False    # K+ ncoid (Z=50 nonsensical for our use)
-    assert _is_nucleus(0) is False     # gamma
-    assert _is_nucleus(2) is False     # pi+
-    # PDG K+ (321) read as ncoid would mean Z=21, A=3 — Z > A is unphysical
-    assert _is_nucleus(321) is False
-    # PDG Lambda (3122) read as ncoid would mean Z=22, A=31 — physical-looking
-    # but we don't expect PDG codes >100 in mothers_daughters; sanity bound
-    # is that Z must be <= A. 3122 has A=31, Z=22 — that's physical, but Lambda
-    # has no PriNCe ncoid slot anyway. _is_nucleus is a coarse filter; the real
-    # check is whether the (mo, da) pair makes physical sense, which the
-    # downstream warning catches.
+    assert is_nucleus(22) is False     # γ
+    assert is_nucleus(11) is False     # e-
+    assert is_nucleus(211) is False    # π+
+    assert is_nucleus(321) is False    # K+
+    assert is_nucleus(13) is False     # μ-
+
+    # Round trip
+    for A, Z in [(4, 2), (14, 7), (56, 26), (238, 92)]:
+        pdg = make_nucleus_pdg(A, Z)
+        assert get_AZN(pdg) == (A, Z, A - Z)
 
 
 def test_warn_misclassified_dedupes():
@@ -156,7 +132,6 @@ def test_fluka_photo_nuclear_loads_basic_shapes():
         assert sig.shape == cs._egrid_tab.shape, f"nonel[{mo}] shape={sig.shape}"
 
     # _incl_diff_tab values: shape (n_x, n_E) per channel
-    n_E = cs._egrid_tab.shape[0]
     n_x = cs.xbins.shape[0] - 1
     for (mo, da), arr in cs._incl_diff_tab.items():
         # After _optimize_and_generate_index, values may be ndarrays or tuples
@@ -166,32 +141,24 @@ def test_fluka_photo_nuclear_loads_basic_shapes():
 
 
 def test_fluka_photo_nuclear_filters_misclassified():
-    """v0 db has rows like (101, 321) [proton→K+] in mothers_daughters;
-    FlukaPhotoNuclear drops them and warns once per pair."""
+    """The loader drops any (mo, da) pair whose daughter is non-nuclear, free
+    p/n, or A_da > A_mo. After load, every daughter in _incl_tab is a heavy
+    nucleus (A>=2). On a clean db no warnings are emitted; on a v0-style db
+    with mis-routed rows at least one warning fires.
+    """
     from prince_cr.cross_sections import FlukaPhotoNuclear
     from prince_cr.cross_sections import fluka as fluka_mod
+    from prince_cr.util import is_nucleus, get_AZN
 
     fluka_mod._WARNED.clear()
     cs = FlukaPhotoNuclear()
 
-    # No (101, 50) [proton → K+ via PDG 321 → ncoid 50] in _incl_tab
-    # because 50 is not a nucleus per _is_nucleus
     for mo, da in cs._incl_tab:
-        assert _is_nucleus_or_self_check(da), (
+        assert is_nucleus(da), (
             f"non-nuclear daughter {da} found in _incl_tab (mother {mo})"
         )
-
-    # At least one warning was emitted
-    assert len(fluka_mod._WARNED) >= 1
-
-
-def _is_nucleus_or_self_check(ncoid):
-    """Inline copy of the contract: nuclei have ncoid >= 100 with Z <= A."""
-    if ncoid < 100:
-        return False
-    A = ncoid // 100
-    Z = ncoid % 100
-    return Z <= A and A >= 2  # we additionally require A >= 2 in mothers_daughters
+        A_da, _, _ = get_AZN(da)
+        assert A_da >= 2, f"free nucleon {da} routed through _incl_tab"
 
 
 def test_fluka_photo_nuclear_max_mass_truncation():

@@ -13,7 +13,7 @@ from prince_cr.util import info
 
 class CosmicRaySource(object, metaclass=ABCMeta):
     def __init__(
-        self, prince_run, ncoids=None, params=None, norm=1.0, m="flat", *args, **kwargs
+        self, prince_run, pdgids=None, params=None, norm=1.0, m="flat", *args, **kwargs
     ):
         # read out standard information from core class
         self.cr_grid = prince_run.cr_grid.grid
@@ -24,8 +24,8 @@ class CosmicRaySource(object, metaclass=ABCMeta):
         # read out the input parameters, this is a dictionary with particle ids as key
         # the parameters are interpreted by each child class.
         self.params = params
-        self.ncoids = np.array(ncoids if ncoids is not None else list(params.keys()))
-        self.ncoids.sort()
+        self.pdgids = np.array(pdgids if pdgids is not None else list(params.keys()))
+        self.pdgids.sort()
         self.source_evo_m = m
         self._compute_injection_grid()
 
@@ -35,14 +35,14 @@ class CosmicRaySource(object, metaclass=ABCMeta):
         Assumes that the injection is factorized in E and z"""
         self.injection_grid = np.zeros(self.dim_states)
 
-        for pid in self.ncoids:
+        for pid in self.pdgids:
             if pid in self.params:
                 params = self.params[pid]
             else:
                 params = params
 
             info(4, "Injecting particle {:} with parameters {:}".format(pid, params))
-            inj_spec = self.spec_man.ncoid2sref[pid]
+            inj_spec = self.spec_man.pdgid2sref[pid]
             self.injection_grid[inj_spec.sl] = self.injection_spectrum(
                 pid, self.cr_grid, params
             )
@@ -56,14 +56,14 @@ class CosmicRaySource(object, metaclass=ABCMeta):
         Returns:
             float array: tuple with integrated number and luminosity for each species
         """
-        num_int = np.zeros_like(self.ncoids, dtype=np.float)
-        lum_int = np.zeros_like(self.ncoids, dtype=np.float)
+        num_int = np.zeros_like(self.pdgids, dtype=np.float)
+        lum_int = np.zeros_like(self.pdgids, dtype=np.float)
 
         from scipy.integrate import trapezoid as trapz
 
-        for idx, pid in enumerate(self.ncoids):
+        for idx, pid in enumerate(self.pdgids):
             # get the inection for the species and subsitute back from E_A =  E / A to E
-            s = self.spec_man.ncoid2sref[pid]
+            s = self.spec_man.pdgid2sref[pid]
             A = s.A
             egrid = self.cr_grid * A
             injec = self.injection_grid[s.sl] / A
@@ -172,7 +172,7 @@ class SimpleSource(CosmicRaySource):
 
     def injection_spectrum(self, pid, energy, params):
         gamma, emax, norm = params
-        inj_spec = self.spec_man.ncoid2sref[pid]
+        inj_spec = self.spec_man.pdgid2sref[pid]
         emax = emax / inj_spec.A
         result = norm * energy ** (-gamma) * np.exp(-energy / emax)
 
@@ -189,7 +189,7 @@ class RigdityCutoffSource(CosmicRaySource):
 
     def injection_spectrum(self, pid, energy, params):
         spectral_index, rcut, relnorm = params
-        inj_spec = self.spec_man.ncoid2sref[pid]
+        inj_spec = self.spec_man.pdgid2sref[pid]
         A = float(inj_spec.A)
         emax = rcut * inj_spec.Z
         e_k = A * energy
@@ -212,7 +212,7 @@ class AugerFitSource(CosmicRaySource):
 
     def injection_spectrum(self, pid, energy, params):
         spectral_index, rcut, relnorm = params
-        inj_spec = self.spec_man.ncoid2sref[pid]
+        inj_spec = self.spec_man.pdgid2sref[pid]
         A = float(inj_spec.A)
         emax = rcut * inj_spec.Z
         e_k = A * energy
@@ -237,7 +237,7 @@ class RigidityFlexSource(CosmicRaySource):
 
     def injection_spectrum(self, pid, energy, params):
         spectral_index, rcut, alpha, relnorm = params
-        inj_spec = self.spec_man.ncoid2sref[pid]
+        inj_spec = self.spec_man.pdgid2sref[pid]
         A = float(inj_spec.A)
         emax = rcut * inj_spec.Z**alpha
         e_k = A * energy
@@ -260,7 +260,7 @@ class SpectrumSource(CosmicRaySource):
 
     def injection_spectrum(self, pid, energy, params):
         egrid, specgrid = params
-        inj_spec = self.spec_man.ncoid2sref[pid]
+        inj_spec = self.spec_man.pdgid2sref[pid]
         egrid = egrid / inj_spec.A
         specgrid = specgrid * inj_spec.A
         result = np.interp(energy, egrid, specgrid, left=0.0, right=0.0)

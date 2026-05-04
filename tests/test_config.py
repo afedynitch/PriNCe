@@ -65,8 +65,10 @@ class TestConfigConstants:
     def test_max_mass(self):
         assert config.max_mass > 0
 
-    def test_redist_threshold_ID(self):
-        assert isinstance(config.redist_threshold_ID, int)
+    def test_ignore_particles_pdg(self):
+        # Default ignore list is in PDG codes (e- = 11, e+ = -11).
+        for pid in config.ignore_particles:
+            assert isinstance(pid, int)
 
     def test_x_cut(self):
         assert config.x_cut >= 0

@@ -5,7 +5,7 @@ import pickle as pickle
 
 from prince_cr import cross_sections, data, interaction_rates
 from prince_cr.data import EnergyGrid
-from prince_cr.util import info, get_AZN
+from prince_cr.util import info, get_AZN, is_nucleus
 import prince_cr.config as config
 
 
@@ -61,7 +61,7 @@ class PriNCeRun(object):
             ]
         # Disable photo-meson production
         if not config.secondaries:
-            system_species = [s for s in system_species if s >= 100]
+            system_species = [s for s in system_species if is_nucleus(s)]
         # Remove particles that are explicitly excluded
         for pid in config.ignore_particles:
             if pid in system_species:

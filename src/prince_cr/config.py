@@ -1,5 +1,6 @@
 """PriNCe configuration module."""
 
+import os
 import os.path as path
 import platform
 import sys
@@ -94,12 +95,6 @@ tau_dec_threshold = np.inf  # All unstable particles decay
 # tau_dec_threshold = 0.  # None unstable particles decay
 # tau_dec_threshold = 850. # This value is for stable neutrons
 
-#: Particle ID for which redistribution functions are needed to be taken into
-#: account. The default value is 101 (proton). All particles with smaller
-#: IDs, i.e. neutrinos, pions, muons etc., will have energy redistributions.
-#: For larger IDs (nuclei) the boost conservation is employed.
-redist_threshold_ID = 101
-
 #: Cut on energy redistribution functions
 #: Resitribution below this x value are set to 0.
 #: "x_cut" : 0.,
@@ -121,11 +116,11 @@ cross_section_e_range = None
 
 # Include secondaries like photons and neutrinos
 secondaries = True
-# List of specific particles to ignore
+# List of specific particles to ignore (PDG codes). e- = 11, e+ = -11.
 ignore_particles = [
-    20,
-    21,
-]  # (we ignore photons and electrons, as their physics is not fully implemented)
+    11,
+    -11,
+]  # (we ignore electrons / positrons; their physics is not fully implemented)
 
 # ===========================================================================
 # Parameters of numerical integration
@@ -199,16 +194,43 @@ if debug_level >= 2:
     print(f"Auto-detected {kernel_config} solver.")
 
 
-def set_mkl_threads(nthreads):
-    global MKL_threads, mkl
-    from ctypes import byref, c_int, cdll
+def _load_mkl():
+    """Lazily load ``libmkl_rt`` exactly once and cache it on ``mkl``.
 
-    mkl = cdll.LoadLibrary(mkl_path)
-    # Set number of threads
+    Splitting the load from :func:`set_mkl_threads` matters because the
+    ``MklSparseMatrix`` wrappers in :mod:`prince_cr.mkl_sparse` pin their
+    own reference to the cdll handle. Re-loading the library on every
+    thread-count change would leave already-built wrappers tied to a
+    stale ``cdll`` while the global ``mkl`` pointed at a fresh one — a
+    subtle source of cross-handle bugs. Pinning the global to a single
+    cdll for the lifetime of the process keeps every wrapper looking at
+    the same symbol table. Pattern lifted from MCEq.
+    """
+    global mkl
+    if mkl is not None or not has_mkl:
+        return
+    from ctypes import cdll
+
+    mkl = cdll.LoadLibrary(os.fspath(mkl_path))
+
+
+def set_mkl_threads(nthreads):
+    """Set the MKL thread count (loads ``libmkl_rt`` on first call).
+
+    Idempotent on the library side: only ``mkl_set_num_threads`` is
+    called on subsequent invocations. The cached cdll handle is
+    preserved, so handles in ``MklSparseMatrix`` wrappers stay valid
+    across thread-count changes.
+    """
+    global MKL_threads
+    from ctypes import byref, c_int
+
+    _load_mkl()
     MKL_threads = nthreads
-    mkl.mkl_set_num_threads(byref(c_int(nthreads)))
-    if debug_level >= 5:
-        print(f"MKL threads limited to {nthreads}")
+    if mkl is not None:
+        mkl.mkl_set_num_threads(byref(c_int(nthreads)))
+        if debug_level >= 5:
+            print(f"MKL threads limited to {nthreads}")
 
 
 if has_mkl:

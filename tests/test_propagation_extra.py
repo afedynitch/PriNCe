@@ -59,7 +59,7 @@ class TestUHECRPropagationSolverInit:
         solver = _solver(UHECRPropagationSolverETD2, prince_run)
         src = SimpleSource(
             prince_run,
-            params={101: (2.0, 1e10, 1.0)},
+            params={2212: (2.0, 1e10, 1.0)},
             m="flat",
         )
         solver.add_source_class(src)
@@ -94,7 +94,7 @@ class TestInjection:
     def test_single_source(self, prince_run):
         solver = _solver(UHECRPropagationSolverETD2, prince_run)
         solver.add_source_class(
-            SimpleSource(prince_run, params={101: (2.0, 1e10, 1.0)}, m="flat")
+            SimpleSource(prince_run, params={2212: (2.0, 1e10, 1.0)}, m="flat")
         )
         result = solver.injection(0.01, 0.5)
         assert result.shape == (prince_run.dim_states,)
@@ -102,10 +102,10 @@ class TestInjection:
     def test_multiple_sources(self, prince_run):
         solver = _solver(UHECRPropagationSolverETD2, prince_run)
         solver.add_source_class(
-            SimpleSource(prince_run, params={101: (2.0, 1e10, 1.0)}, m="flat")
+            SimpleSource(prince_run, params={2212: (2.0, 1e10, 1.0)}, m="flat")
         )
         solver.add_source_class(
-            SimpleSource(prince_run, params={101: (2.5, 1e11, 0.5)}, m="flat")
+            SimpleSource(prince_run, params={2212: (2.5, 1e11, 0.5)}, m="flat")
         )
         result = solver.injection(0.01, 0.5)
         assert result.shape == (prince_run.dim_states,)
@@ -132,7 +132,7 @@ class TestETD2SolverOptions:
         solver.add_source_class(
             SimpleSource(
                 prince_run,
-                params={101: (2.0, 1e10, 1e-50)},
+                params={2212: (2.0, 1e10, 1e-50)},
                 m="flat",
             )
         )

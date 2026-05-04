@@ -10,8 +10,20 @@ from prince_cr.util import (
     info,
     bin_widths,
     get_AZN,
+    is_nucleus,
 )
 import prince_cr.config as config
+
+
+def _is_redistributed(pdg_id):
+    """True iff secondaries of this PDG ID are stored differentially in
+    ``x = E_secondary / E_γ`` (free p/n and all elementary species), False
+    if they are boost-conserving (heavy nuclei A>=2).
+    """
+    A, _, _ = get_AZN(pdg_id)
+    if A >= 2:
+        return False
+    return True
 
 
 class CrossSectionBase(object, metaclass=ABCMeta):
@@ -140,18 +152,14 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         mother/daughter combination should return non-zero redistribution matrices.
 
         Args:
-            mother (bool): Neucosma ID of mother particle
-            daughter (bool): Neucosma ID of daughter particle
+            mother (int): PDG ID of mother particle
+            daughter (int): PDG ID of daughter particle
 
         Returns:
             (bool): ``True`` if the model has this particular redistribution function
         """
-        # info(10, mother, daughter, " asking for redist")
-        # if not self.supports_redistributions:
-        #     info(10, mother, daughter, " model doesn't support redist")
-        #     return False
         if (
-            daughter <= config.redist_threshold_ID
+            _is_redistributed(daughter)
             or (mother, daughter) in self.incl_diff_idcs
         ):
             info(60, "Daughter requires redistribution.", mother, daughter)
@@ -202,7 +210,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         self._update_indices()
 
         for mo, da in self.incl_idcs:
-            if da >= 100 and get_AZN(da)[0] > get_AZN(mo)[0]:
+            if is_nucleus(da) and get_AZN(da)[0] > get_AZN(mo)[0]:
                 raise Exception(
                     "Daughter {0} heavier than mother {1}. Physics??".format(da, mo)
                 )
@@ -226,7 +234,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                 self.known_species.append(da)
 
         for mo, da in list(self._incl_diff_tab.keys()):
-            if da >= 100 and get_AZN(da)[0] > get_AZN(mo)[0]:
+            if is_nucleus(da) and get_AZN(da)[0] > get_AZN(mo)[0]:
                 raise Exception(
                     "Daughter {0} heavier than mother {1}. Physics??".format(da, mo)
                 )
@@ -247,7 +255,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         self.known_diff_channels = sorted(list(set(self.known_diff_channels)))
 
         for sp in self.known_species:
-            if sp >= 100 and (sp, sp) not in self.known_diff_channels:
+            if is_nucleus(sp) and (sp, sp) not in self.known_diff_channels:
                 self.known_bc_channels.append((mo, mo))
             if (mo, mo) not in self.reactions[mo]:
                 self.reactions[mo].append((mo, mo))
@@ -255,12 +263,6 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         # Make sure the indices are up to date
         self._update_indices()
 
-        # Count numbers of channels for statistics
-        # Count number of incl channels for activated nuclear species
-        # n_incl = np.sum([
-        #     len(self.reactions[mother])
-        #     for mother in self.spec_man.known_species if mother >= 100
-        # ])
 
     def _reduce_channels(self):
         """Follows decay chains until all inclusive reactions point to

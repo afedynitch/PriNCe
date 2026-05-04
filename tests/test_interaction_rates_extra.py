@@ -47,7 +47,7 @@ class TestPhotoNuclearInteractionRate:
 
     def test_single_interaction_length(self, prince_run):
         egrid, length = prince_run.int_rates.single_interaction_length(
-            101, 0.0, pfield=prince_run.photon_field
+            2212, 0.0, pfield=prince_run.photon_field
         )
         assert len(egrid) > 0
         assert len(length) > 0
@@ -73,7 +73,7 @@ class TestContinuousAdiabaticLossRate:
         assert lv.shape == (prince_run.dim_bins,)
 
     def test_single_loss_length(self, prince_run):
-        egrid, length = prince_run.adia_loss_rates_grid.single_loss_length(101, 0.0)
+        egrid, length = prince_run.adia_loss_rates_grid.single_loss_length(2212, 0.0)
         assert len(egrid) > 0
         assert len(length) > 0
         assert np.all(np.isfinite(length))
@@ -94,7 +94,7 @@ class TestContinuousPairProductionLossRate:
 
     def test_single_loss_length(self, prince_run):
         egrid, length = prince_run.pair_loss_rates_grid.single_loss_length(
-            101, 0.0, pfield=prince_run.photon_field
+            2212, 0.0, pfield=prince_run.photon_field
         )
         assert len(egrid) > 0
         assert len(length) > 0

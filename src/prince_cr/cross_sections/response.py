@@ -1,7 +1,8 @@
 import numpy as np
 
 from prince_cr.util import get_2Dinterp_object, get_interp_object, info, get_AZN
-import prince_cr.config as config
+
+from .base import _is_redistributed
 
 
 class ResponseFunction(object):
@@ -35,7 +36,7 @@ class ResponseFunction(object):
         public state copied at __init__ (`incl_diff_idcs`).
         """
         return (
-            daughter <= config.redist_threshold_ID
+            _is_redistributed(daughter)
             or (mother, daughter) in self.incl_diff_idcs
         )
 

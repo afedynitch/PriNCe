@@ -49,14 +49,14 @@ class TestPriNCeRun:
         prince_run.set_photon_field(old_pf)
 
     def test_with_species_list(self, pf, cs):
-        """Test PriNCeRun with explicit species_list."""
+        """Test PriNCeRun with explicit species_list (PDG IDs)."""
         run = core.PriNCeRun(
             max_mass=4,
             photon_field=pf,
             cross_sections=cs,
-            species_list=[101, 402],
+            species_list=[2212, 1000020040],  # p, He-4
         )
-        assert 101 in run.spec_man.known_species
+        assert 2212 in run.spec_man.known_species
 
     def test_invalid_grid_scale_raises(self, pf, cs):
         old_scale = config.grid_scale
@@ -66,16 +66,18 @@ class TestPriNCeRun:
         config.grid_scale = old_scale
 
     def test_without_secondaries(self, pf, cs):
+        from prince_cr.util import is_nucleus
+
         old_sec = config.secondaries
         config.secondaries = False
         run = core.PriNCeRun(max_mass=4, photon_field=pf, cross_sections=cs)
-        # All species should be >= 100 (no secondaries)
-        assert all(s >= 100 for s in run.spec_man.known_species)
+        # All species should be nuclei (no elementary secondaries).
+        assert all(is_nucleus(s) for s in run.spec_man.known_species)
         config.secondaries = old_sec
 
     def test_ignore_particles(self, pf, cs):
         old_ignore = config.ignore_particles
-        config.ignore_particles = [20, 21, 0]
+        config.ignore_particles = [11, -11, 22]  # PDG: e-, e+, γ
         run = core.PriNCeRun(max_mass=4, photon_field=pf, cross_sections=cs)
         for pid in config.ignore_particles:
             assert pid not in run.spec_man.known_species

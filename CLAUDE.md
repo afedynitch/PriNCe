@@ -161,7 +161,13 @@ The database download is handled automatically by `config.py` on first import.
 
 2. **Redshift Convention**: Integration runs from `initial_z` (high) to `final_z` (low), i.e., backward in time from emission to observation.
 
-3. **Species IDs**: Particles use NCo IDs - proton is 101, neutron is 100, nuclei are A*100+Z. Secondaries (photons, neutrinos) are <100.
+3. **Species IDs**: Particles use **PDG Monte Carlo IDs** throughout. Free proton is 2212, free neutron is 2112; all other ground-state nuclei are
+   `1000000000 + Z*10000 + A*10` (so He-4 = 1000020040, Fe-56 = 1000260560, U-238 = 1000922380). Light secondaries follow the standard PDG codes
+   (γ = 22, e± = ±11, μ± = ∓13, ν_e = 12, ν̄_e = -12, ν_μ = 14, ν̄_μ = -14, π+ = 211, π- = -211, π0 = 111, K± = ±321). Use the helpers
+   `prince_cr.util.is_nucleus(pdg)`, `make_nucleus_pdg(A, Z)`, and `get_AZN(pdg)` (returns `(A, Z, N)` for nuclei, `(0, 0, 0)` otherwise) instead
+   of arithmetic on the IDs. The legacy NCo scheme survives only as a one-shot translation in `prince_cr/data.py`, which converts the
+   `particle_data.ppo` keys + branching daughter IDs to PDG at module load. `cross_sections/fluka.py` only normalises the FLUKA db's bound
+   H-1/n-1 codes (`1000010010` / `1000000010`) onto canonical free-nucleon codes (`2212` / `2112`); everything else passes through.
 
 4. **Index Mapping**: `SpeciesManager` provides `lidx()`/`uidx()` for grid indices and `lbin()`/`ubin()` for bin edges. These are critical for slicing state vectors correctly.
 

@@ -13,7 +13,7 @@ _cr_lo, _cr_hi, _cr_bpd = config.cosmic_ray_grid
 
 @pytest.fixture
 def spec_man():
-    species = [100, 101, 402]
+    species = [2112, 2212, 1000020040]  # n, p, He-4
     d = int((_cr_hi - _cr_lo) * _cr_bpd)
     return SpeciesManager(species, d)
 
@@ -38,17 +38,17 @@ class TestUHECRPropagationResult:
 
     def test_known_species(self, result):
         ks = result.known_species
-        assert 100 in ks
-        assert 101 in ks
-        assert 402 in ks
+        assert 2112 in ks
+        assert 2212 in ks
+        assert 1000020040 in ks
 
     def test_get_solution(self, result):
-        e, sol = result.get_solution(101)
+        e, sol = result.get_solution(2212)
         assert e.shape == result.egrid.shape
         assert sol.shape == result.egrid.shape
 
     def test_get_solution_scale(self, result):
-        e, sol = result.get_solution_scale(101, epow=3)
+        e, sol = result.get_solution_scale(2212, epow=3)
         assert len(e) == len(result.egrid)
 
     def test_add(self, result, spec_man, egrid):
@@ -68,7 +68,7 @@ class TestUHECRPropagationResult:
 
     def test_add_different_species_raises(self, result, egrid):
         d = int((_cr_hi - _cr_lo) * _cr_bpd)
-        sm2 = SpeciesManager([100, 101], d)
+        sm2 = SpeciesManager([2112, 2212], d)
         state2 = np.random.rand(sm2.nspec * d) * 1e-20
         result2 = UHECRPropagationResult(state2, egrid, sm2)
         with pytest.raises((Exception, ValueError)):
@@ -95,7 +95,7 @@ class TestUHECRPropagationResult:
         np.testing.assert_array_equal(restored.egrid, result.egrid)
 
     def test_get_solution_group(self, result):
-        e, spec = result.get_solution_group([100, 101, 402], epow=3)
+        e, spec = result.get_solution_group([2112, 2212, 1000020040], epow=3)
         assert len(e) > 0
         assert len(spec) == len(e)
 
@@ -108,22 +108,22 @@ class TestUHECRPropagationResult:
         assert len(e) > 0
 
     def test_get_lnA(self, result):
-        e, avg, var = result.get_lnA([100, 101, 402])
+        e, avg, var = result.get_lnA([2112, 2212, 1000020040])
         assert len(e) > 0
         assert len(avg) == len(e)
         assert len(var) == len(e)
 
     def test_get_energy_density(self, result):
-        ed = result.get_energy_density(101)
+        ed = result.get_energy_density(2212)
         assert np.all(np.isfinite(ed))
 
     def test_check_id_grid_with_egrid(self, result):
         custom_egrid = np.logspace(3, 14, 50)
-        ids, e = result._check_id_grid([101], custom_egrid)
+        ids, e = result._check_id_grid([2212], custom_egrid)
         np.testing.assert_array_equal(e, custom_egrid)
 
     def test_check_id_grid_none(self, result):
-        ids, e = result._check_id_grid([101], None)
+        ids, e = result._check_id_grid([2212], None)
         assert len(e) > 0
 
     def test_check_id_grid_nu(self, result):
@@ -134,7 +134,7 @@ class TestUHECRPropagationResult:
     def test_check_id_grid_tuple(self, result):
         # Select species with A between 1 and 4
         def selector(s):
-            return result.spec_man.ncoid2sref[s].A
+            return result.spec_man.pdgid2sref[s].A
 
         ids, e = result._check_id_grid((selector, 1, 4), None)
         assert len(ids) > 0
