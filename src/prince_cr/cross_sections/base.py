@@ -604,11 +604,24 @@ class _DecayChainReducer(object):
             return branching_ratio * dec_dist.dot(diff_dist)
         return diff_dist[0], branching_ratio * dec_dist.dot(diff_dist[1])
 
-    def follow(self, first_mo, da, csection, reclev=0):
+    #: Hard cap on chain depth. Even acyclic β-chains in nature don't exceed
+    #: ~20 hops (U-238 → Pb-206 is 14); anything deeper is almost certainly
+    #: a cycle that escaped the visited-set check, or a pathology in the
+    #: tabulated decay db. Treated as a stable terminal at the cap.
+    _MAX_CHAIN_DEPTH = 64
+
+    def follow(self, first_mo, da, csection, reclev=0, visited=None):
         """Recurse into `da`'s decay chain, anchored on `first_mo`.
 
         Either records `csection` against a stable terminal daughter, or
         delegates to `_recurse_into_daughters` to walk one more level.
+
+        ``visited`` carries the set of unstable daughters already walked
+        on the current branch so we can detect A→…→A cycles introduced
+        by the tabulated FLUKA decay db (adjacent isobar pairs sometimes
+        carry both β⁻ and β⁺ entries that loop back). On a cycle hit we
+        record the entry as stable terminal — flux-preserving and a
+        better approximation than running the chain to numerical death.
         """
         info(10, self._dbg_indent(reclev), "Entering with", first_mo, da)
 
@@ -624,7 +637,40 @@ class _DecayChainReducer(object):
             self._record_stable(first_mo, da, csection, reclev)
             return
 
-        self._recurse_into_daughters(first_mo, da, csection, reclev)
+        if reclev >= self._MAX_CHAIN_DEPTH:
+            import warnings
+            warnings.warn(
+                "Decay chain depth {0} reached on PDG {1} (primary mother "
+                "{2}); recording as terminal stable to break runaway. "
+                "Natural β-chains shouldn't exceed ~20 hops — check the "
+                "tabulated decay db for corrupted half_lives or missing "
+                "stable terminals.".format(reclev, da, first_mo),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._record_stable(first_mo, da, csection, reclev)
+            return
+
+        if visited is None:
+            visited = frozenset()
+        if da in visited:
+            import warnings
+            warnings.warn(
+                "Decay-chain CYCLE at PDG {0} (primary mother {1}). "
+                "Visited so far: {2}. Treating as terminal stable. "
+                "This is a pathology in the tabulated decay db — adjacent "
+                "isobars carrying both β⁻ and β⁺ entries that loop back, "
+                "or a hand-coded branching that points back into a "
+                "FLUKA-tabulated chain. Investigate.".format(
+                    da, first_mo, sorted(visited),
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._record_stable(first_mo, da, csection, reclev)
+            return
+
+        self._recurse_into_daughters(first_mo, da, csection, reclev, visited | {da})
 
     def _record_stable(self, first_mo, da, csection, reclev):
         """Terminal arm: daughter is stable. Route to the right output dict."""
@@ -645,11 +691,12 @@ class _DecayChainReducer(object):
             )
             self.new_incl_tab[(first_mo, da)] = csection
 
-    def _recurse_into_daughters(self, first_mo, da, csection, reclev):
+    def _recurse_into_daughters(self, first_mo, da, csection, reclev, visited):
         """Recursive arm: daughter is unstable. For each branching, recurse on
         each chained daughter, scaling the cross section by the branching
         ratio and convolving with the decay distribution if the chained
-        daughter requires x-redistribution.
+        daughter requires x-redistribution. ``visited`` is forwarded so the
+        cycle check in ``follow`` sees the chain prefix this call extends.
         """
         for br, daughters in spec_data[da]["branchings"]:
             info(
@@ -672,9 +719,13 @@ class _DecayChainReducer(object):
                             br,
                         ),
                         reclev + 1,
+                        visited,
                     )
                 else:
-                    self.follow(first_mo, chained_daughter, br * csection, reclev + 1)
+                    self.follow(
+                        first_mo, chained_daughter, br * csection,
+                        reclev + 1, visited,
+                    )
 
 
 if __name__ == "__main__":

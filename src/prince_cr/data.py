@@ -180,35 +180,45 @@ def pythia_hadron_db():
         }
 
 
+def fluka_photo_nuclear_inel_mothers():
+    """Return the `inel_mothers` array from `/photo_nuclear/FLUKA_2025/`,
+    or None if the db file isn't present at `config.fluka_db_path`. Used
+    to fill in `spec_data` entries for stable mothers that aren't carried
+    by either the legacy ppo or the FLUKA decay group."""
+    fpath = path.join(config.fluka_db_path, config.fluka_db_fname)
+    if not path.isfile(fpath):
+        return None
+    with h5py.File(fpath, "r") as f:
+        if "photo_nuclear/FLUKA_2025/inel_mothers" not in f:
+            return None
+        return f["photo_nuclear/FLUKA_2025/inel_mothers"][:]
+
+
 _LN2 = float(np.log(2.0))
 
 
-def _heuristic_beta_branching(mo_pdg):
-    """Best-effort branchings for an unstable nucleus that the FLUKA decay
-    db has *no* explicit channels for (SPDCEV failures — ~4% of mothers).
-
-    Direction picked from neutron excess: β⁻ if Z < A/2, β⁺ otherwise.
-    Returns a `[(mult, [da])]` list in the same shape PriNCe's chain
-    reducer expects, with the nuclear daughter, an electron(/positron),
-    and the matching neutrino as separate one-daughter entries (so each
-    can be followed independently)."""
-    from prince_cr.util import get_AZN, make_nucleus_pdg
-
-    A, Z, _ = get_AZN(mo_pdg)
-    if A < 1 or Z is None or Z < 0:
-        return None
-    if Z * 2 < A:                                 # n-rich → β⁻
-        return [
-            (1.0, [make_nucleus_pdg(A, Z + 1)]),  # nucleus(Z+1)
-            (1.0, [-12]),                         # ν̄_e
-            (1.0, [11]),                          # e⁻
-        ]
-    else:                                         # p-rich → β⁺ / EC
-        return [
-            (1.0, [make_nucleus_pdg(A, Z - 1)]),  # nucleus(Z−1)
-            (1.0, [12]),                          # ν_e
-            (1.0, [-11]),                         # e⁺
-        ]
+# Hand-curated branchings for FLUKA decay db mothers that ship with
+# *no* explicit channels (SPDCEV failures, ~4% of the catalog). Keeping
+# the override set narrow — broader auto-heuristics (β±-direction from
+# neutron excess) cause infinite chain-reducer recursion on heavy
+# mothers because successive β steps land on other empty-channel
+# mothers and cycle. Mothers absent from this table that have empty
+# FLUKA channels are treated as stable terminals at module load
+# (lifetime forced to inf), which preserves flux but loses their
+# decay output — acceptable for ~100 mostly-heavy SPDCEV-failed
+# species (A > 56) on UHECR propagation timescales. Add an entry here
+# for any species whose decay chain is needed and whose daughters are
+# already stable / in particle_data.ppo so the reducer terminates.
+_HANDCODED_BRANCHINGS = {
+    # Tritium ³H → ³He + e⁻ + ν̄_e (half-life 12.3 yr; chromo SPDCEV
+    # fails at the low-Q β endpoint). Daughter ³He is stable, so the
+    # chain reducer terminates after one hop.
+    1000010030: [
+        (1.0, [1000020030]),  # ³He
+        (1.0, [-12]),         # ν̄_e
+        (1.0, [11]),          # e⁻
+    ],
+}
 
 
 def _merge_tabulated_decays(spec_data):
@@ -262,9 +272,17 @@ def _merge_tabulated_decays(spec_data):
                 _TABULATED_DECAY_DX[(mo_pdg, da_pdg)] = yld / xw
 
             if not branchings and lifetime != np.inf:
-                heuristic = _heuristic_beta_branching(mo_pdg)
-                if heuristic:
-                    branchings = heuristic
+                if mo_pdg in _HANDCODED_BRANCHINGS:
+                    branchings = _HANDCODED_BRANCHINGS[mo_pdg]
+                else:
+                    # SPDCEV-failed / no explicit channels and not in the
+                    # hand-coded table: force stable so the chain reducer
+                    # terminates here. Better than dropping flux entirely
+                    # (`branchings=[] + lifetime<inf` discards csection in
+                    # `_recurse_into_daughters`) and avoids the cycle the
+                    # broader β-direction heuristic would induce on heavy
+                    # nuclei whose chain hops through other empty mothers.
+                    lifetime = np.inf
 
             if mo_pdg in spec_data:
                 spec_data[mo_pdg]["lifetime"] = lifetime
@@ -310,6 +328,49 @@ def _merge_tabulated_decays(spec_data):
 
             if mo_pdg in spec_data and branchings:
                 spec_data[mo_pdg]["branchings"] = branchings
+
+    # Synthesize stable-mother spec_data entries for photo-nuclear mothers
+    # that the legacy ppo doesn't carry (everything beyond A=56 stable, plus
+    # the bound H-1 / n-1 codes) and that aren't in the FLUKA decay db
+    # (which only tabulates unstable species). Without this, the chain
+    # reducer's `_reduce_channels` drops these mothers via
+    # `mother not in spec_data` and the kernel never sees them.
+    inel_mothers = fluka_photo_nuclear_inel_mothers()
+    if inel_mothers is not None:
+        from prince_cr.util import get_AZN
+        # mass / charge constants (kept local to avoid forward refs to UNITS)
+        m_nucleon = (
+            float(fluka["rest_masses"][0]) / max(int(get_AZN(int(fluka["decay_mothers"][0]))[0]), 1)
+            if fluka is not None and len(fluka["decay_mothers"])
+            else 0.93827208816
+        )
+        # bound H-1 (1000010010) gets remapped to free p (2212) in the
+        # photo-nuclear loader (`_normalize_pdg`); ensure both forms have
+        # entries. n-1 (1000000010) is filtered upstream — never appears.
+        bound_to_free = {1000010010: 2212, 1000000010: 2112}
+        n_added = 0
+        for raw in inel_mothers:
+            keys = {int(raw)}
+            if int(raw) in bound_to_free:
+                keys.add(bound_to_free[int(raw)])
+            for mo_pdg in keys:
+                if mo_pdg in spec_data:
+                    continue
+                A, Z, _ = get_AZN(mo_pdg)
+                if A is None or Z is None:
+                    continue
+                spec_data[mo_pdg] = {
+                    "mass": float(A) * m_nucleon,
+                    "stable": True,
+                    "lifetime": np.inf,
+                    "incomplete": False,
+                    "charge": int(Z),
+                    "branchings": [],
+                }
+                n_added += 1
+        if n_added:
+            info(2, "Synthesized {0} stable spec_data entries from photo-nuclear "
+                    "inel_mothers".format(n_added))
 
     info(
         2,
