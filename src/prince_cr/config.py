@@ -136,6 +136,19 @@ MKL_threads = 32
 # Sparse matrix-vector product from "CUPY"|"MKL"|"scipy"
 linear_algebra_backend = "MKL"
 
+# MKL Sparse BLAS block size for the photo-hadronic ``M_off`` matrix.
+# ``None`` keeps it CSR; an integer ≥ 2 stores it as BSR with that
+# block size (auto-padding the matrix). Default ``None``: Stage 1.1's
+# per-op micro-bench found BSR(bs=2) ~5 % faster per SpMV than CSR
+# no-opt at production grid, but the per-cycle data refresh from PriNCe's
+# 1D CSR ``M_off.data`` into the BSR's flattened block layout costs
+# ~11 ms via fancy-index scatter (vs ~1 ms ``np.copyto`` for CSR). At
+# W=10 SpMVs/window the scatter overhead crushes the per-op gain. The
+# infrastructure (sort_indices + CSR→BSR index map in
+# :class:`prince_cr.mkl_sparse.MklSparseMatrix`) is preserved for hosts
+# or update cadences (W ≥ ~30) where BSR's per-op win could pay off.
+mkl_bsr_blocksize = None
+
 # When True AND ``linear_algebra_backend == "MKL"``, route the rate-
 # cache-rebuild dense matvec through MKL CBLAS DGEMV so it shares MKL's
 # threadpool with the Sparse BLAS path. **Default is False** because on

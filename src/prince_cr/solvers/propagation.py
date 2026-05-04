@@ -11,6 +11,11 @@ import prince_cr.config as config
 from .partial_diff import DifferentialOperator
 
 
+# Sentinel for ``_build_mkl_handle(blocksize=...)`` so callers can ask
+# for ``None`` (force CSR) without colliding with "use the config default".
+_DEFAULT = object()
+
+
 class UHECRPropagationResult(object):
     """Reduced version of solver class, that only holds the result vector and defined add and multiply"""
 
@@ -378,7 +383,12 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             # path; the data values never change so the internal cache
             # is fine.
             if self._etd2_D_off_mkl is None:
-                self._etd2_D_off_mkl = self._build_mkl_handle(D_off, optimize=True)
+                # Force CSR for D_off: it's small, constant for the whole
+                # solve, and the BSR sweet spot wasn't measured for this
+                # sparsity. CSR opt=True is already fast for it.
+                self._etd2_D_off_mkl = self._build_mkl_handle(
+                    D_off, optimize=True, blocksize=None
+                )
 
     @staticmethod
     def _build_M_off_index_map(M, M_off):
@@ -458,13 +468,12 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         return off_to_M, diag_to_M
 
     @staticmethod
-    def _build_mkl_handle(off, optimize=True):
+    def _build_mkl_handle(off, optimize=True, blocksize=_DEFAULT):
         """Wrap a scipy CSR/COO/etc. off-diagonal into an MklSparseMatrix.
 
         Returns ``None`` if the matrix has zero nnz — the kernel skips the
         SpMV in that case rather than feeding MKL an empty handle (some
-        MKL versions are squirrelly about zero-nnz CSRs). Picks BSR if
-        ``config.mkl_bsr_blocksize`` is set, else CSR.
+        MKL versions are squirrelly about zero-nnz CSRs).
 
         ``optimize=True`` chooses the inspector-executor fast path —
         ~2× faster per gemv but caches data values internally, so
@@ -472,6 +481,12 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         ``False`` for matrices whose values change across cache windows
         (PriNCe's photo-hadronic ``M_off``); ``True`` for matrices that
         are constant for the whole solve (the FD operator ``D_off``).
+
+        ``blocksize`` defaults to ``config.mkl_bsr_blocksize`` (currently 2,
+        the photo-hadronic sweet spot). Pass ``None`` to force CSR
+        regardless of the global default — used for matrices like the FD
+        operator where the BSR sweet spot wasn't measured and CSR opt=True
+        is already fast.
         """
         from .. import mkl_sparse
 
@@ -481,8 +496,9 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             off = off.astype(np.float64)
         if off.nnz == 0:
             return None
-        bs = getattr(config, "mkl_bsr_blocksize", None)
-        return mkl_sparse.MklSparseMatrix(off, blocksize=bs, optimize=optimize)
+        if blocksize is _DEFAULT:
+            blocksize = getattr(config, "mkl_bsr_blocksize", None)
+        return mkl_sparse.MklSparseMatrix(off, blocksize=blocksize, optimize=optimize)
 
     def _operator_at(self, z):
         """Return ``(d, apply_F)`` for the ETD2 step at redshift ``z``.

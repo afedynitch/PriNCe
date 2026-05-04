@@ -114,7 +114,17 @@ class MklSparseMatrix:
             n_padded = csr.shape[0]
             self.n_padded = n_padded
 
+            # Save the (padded) CSR layout for the CSR→BSR-flat index
+            # map below, so :meth:`update_data` can scatter a 1D CSR
+            # data buffer into the BSR's pinned 3D data array.
+            self._csr_nnz = csr.nnz
+
             B = csr.tobsr(blocksize=(blocksize, blocksize))
+            # ``tobsr`` does NOT guarantee sorted block-column indices;
+            # sort once so the per-block-row searchsorted in the
+            # CSR→BSR index map below sees a sorted slice. ``sort_indices``
+            # also reorders ``B.data`` to match.
+            B.sort_indices()
             data = np.ascontiguousarray(B.data, dtype=np.float64)
             indices = B.indices.astype(np.int32, copy=False)
             indptr = B.indptr.astype(np.int32, copy=False)
@@ -122,6 +132,31 @@ class MklSparseMatrix:
             self._indices = indices
             self._indptr = indptr
             self.nnz = data.size
+
+            # Map each (padded-)CSR entry k to the flat position in
+            # ``data`` (= n_blocks_nonzero * bs * bs). Within block-row
+            # br, B.indices is sorted, so per-row searchsorted finds
+            # the block index. flat = block_idx * bs² + intra_r·bs + intra_c.
+            row_idx = np.repeat(
+                np.arange(n_padded, dtype=np.int64), np.diff(csr.indptr)
+            )
+            col_idx = csr.indices.astype(np.int64, copy=False)
+            block_row = row_idx // blocksize
+            block_col = col_idx // blocksize
+            intra = (row_idx % blocksize) * blocksize + (col_idx % blocksize)
+            n_block_rows = n_padded // blocksize
+            block_pos = np.empty(csr.nnz, dtype=np.int64)
+            for br in range(n_block_rows):
+                lo, hi = int(B.indptr[br]), int(B.indptr[br + 1])
+                if lo == hi:
+                    continue
+                mask = block_row == br
+                if not mask.any():
+                    continue
+                block_pos[mask] = lo + np.searchsorted(
+                    B.indices[lo:hi], block_col[mask]
+                )
+            self._csr_to_bsr_flat = block_pos * (blocksize * blocksize) + intra
 
             handle = c_void_p()
             n_blocks = c_int(n_padded // blocksize)
@@ -177,8 +212,15 @@ class MklSparseMatrix:
         expected.
 
         Args:
-          new_data (np.ndarray): float64 values, length ``self._data.size``.
-            For BSR mode this includes the block-internal padding zeros.
+          new_data (np.ndarray): float64 values. Two accepted shapes:
+
+            * For CSR handles or for BSR with the full padded layout:
+              length ``self._data.size``.
+            * For BSR handles fed with 1D CSR data: length ``self._csr_nnz``
+              (the original padded CSR.nnz, set at construction). The
+              method then scatters the entries into the BSR's flat
+              data buffer via the pre-computed CSR→BSR index map; padded
+              positions inside blocks stay zero.
         """
         if self._handle is None:
             raise RuntimeError(
@@ -190,13 +232,27 @@ class MklSparseMatrix:
                 "construction; mkl_sparse_optimize caches data values "
                 "internally and ignores in-place mutations."
             )
+        if new_data.dtype != np.float64:
+            new_data = new_data.astype(np.float64)
+        if (
+            self.blocksize is not None
+            and new_data.size == getattr(self, "_csr_nnz", -1)
+            and new_data.size != self._data.size
+        ):
+            # 1D CSR data → BSR flat data scatter. MKL's pinned buffer
+            # is reused (no reallocation), so the address stays valid.
+            self._data.flat[self._csr_to_bsr_flat] = new_data
+            return
         if new_data.size != self._data.size:
             raise ValueError(
                 f"update_data size mismatch: got {new_data.size}, "
                 f"expected {self._data.size}"
+                + (
+                    f" or {self._csr_nnz} (1D CSR data)"
+                    if self.blocksize is not None
+                    else ""
+                )
             )
-        if new_data.dtype != np.float64:
-            new_data = new_data.astype(np.float64)
         # In-place: preserves the buffer address that MKL has pinned.
         np.copyto(self._data, new_data)
 
