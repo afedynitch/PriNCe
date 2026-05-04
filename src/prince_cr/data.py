@@ -197,28 +197,40 @@ def fluka_photo_nuclear_inel_mothers():
 _LN2 = float(np.log(2.0))
 
 
-# Hand-curated branchings for FLUKA decay db mothers that ship with
-# *no* explicit channels (SPDCEV failures, ~4% of the catalog). Keeping
-# the override set narrow — broader auto-heuristics (β±-direction from
-# neutron excess) cause infinite chain-reducer recursion on heavy
-# mothers because successive β steps land on other empty-channel
-# mothers and cycle. Mothers absent from this table that have empty
-# FLUKA channels are treated as stable terminals at module load
-# (lifetime forced to inf), which preserves flux but loses their
-# decay output — acceptable for ~100 mostly-heavy SPDCEV-failed
-# species (A > 56) on UHECR propagation timescales. Add an entry here
-# for any species whose decay chain is needed and whose daughters are
-# already stable / in particle_data.ppo so the reducer terminates.
-_HANDCODED_BRANCHINGS = {
-    # Tritium ³H → ³He + e⁻ + ν̄_e (half-life 12.3 yr; chromo SPDCEV
-    # fails at the low-Q β endpoint). Daughter ³He is stable, so the
-    # chain reducer terminates after one hop.
-    1000010030: [
-        (1.0, [1000020030]),  # ³He
-        (1.0, [-12]),         # ν̄_e
-        (1.0, [11]),          # e⁻
-    ],
-}
+def _heuristic_beta_branching(mo_pdg):
+    """β±-direction last-resort branching for unstable FLUKA decay
+    mothers whose chromo / SPDCEV sampling failed (empty channels in
+    the db). Direction picked from neutron excess: β⁻ if Z·2 < A
+    (n-rich), else β⁺ / EC. Returns the same `[(mult, [da])]` shape
+    PriNCe's chain reducer expects, with the nuclear daughter, an
+    electron(/positron), and the matching neutrino as separate
+    one-daughter entries.
+
+    Use of this heuristic is FUDGE — every invocation should fire
+    a `RuntimeWarning` so the gap is visible. The proper fix is at
+    db-build time in prince-fluka-utils (rerun chromo's decay sampler
+    until SPDCEV succeeds, or add the missing isotope's branching
+    info from PDG / NNDC by hand into the schema). Cycle detection
+    in `_DecayChainReducer.follow` (base.py) catches the case where
+    successive heuristic steps land on other empty-channel mothers
+    and chain back."""
+    from prince_cr.util import get_AZN, make_nucleus_pdg
+
+    A, Z, _ = get_AZN(mo_pdg)
+    if A < 1 or Z is None or Z < 0:
+        return None
+    if Z * 2 < A:                                 # n-rich → β⁻
+        return [
+            (1.0, [make_nucleus_pdg(A, Z + 1)]),  # nucleus(Z+1)
+            (1.0, [-12]),                         # ν̄_e
+            (1.0, [11]),                          # e⁻
+        ]
+    else:                                         # p-rich → β⁺ / EC
+        return [
+            (1.0, [make_nucleus_pdg(A, Z - 1)]),  # nucleus(Z−1)
+            (1.0, [12]),                          # ν_e
+            (1.0, [-11]),                         # e⁺
+        ]
 
 
 def _merge_tabulated_decays(spec_data):
@@ -237,6 +249,17 @@ def _merge_tabulated_decays(spec_data):
     if fluka is None and pythia is None:
         info(2, "Tabulated decay db not found; using legacy spec_data only")
         return
+
+    # Coverage gap accumulators — surfaced as a single RuntimeWarning at
+    # the end of the merge so the operator sees the full list at once
+    # instead of one warning per channel. Two categories:
+    #   - heuristic_fallback: unstable FLUKA mother with empty channels;
+    #     β-direction heuristic guessed a daughter (chromo / SPDCEV
+    #     failure — fix at db-build).
+    #   - heuristic_unparseable: half-life finite but PDG can't be parsed
+    #     into A,Z (shouldn't happen in practice; logged just in case).
+    _heuristic_fallback_mothers = []
+    _heuristic_unparseable = []
 
     if fluka is not None:
         _TABULATED_DECAY_XBINS = fluka["xbins"]
@@ -272,16 +295,14 @@ def _merge_tabulated_decays(spec_data):
                 _TABULATED_DECAY_DX[(mo_pdg, da_pdg)] = yld / xw
 
             if not branchings and lifetime != np.inf:
-                if mo_pdg in _HANDCODED_BRANCHINGS:
-                    branchings = _HANDCODED_BRANCHINGS[mo_pdg]
+                heur = _heuristic_beta_branching(mo_pdg)
+                if heur is not None:
+                    branchings = heur
+                    _heuristic_fallback_mothers.append(
+                        (mo_pdg, half_life, branchings[0][1][0])
+                    )
                 else:
-                    # SPDCEV-failed / no explicit channels and not in the
-                    # hand-coded table: force stable so the chain reducer
-                    # terminates here. Better than dropping flux entirely
-                    # (`branchings=[] + lifetime<inf` discards csection in
-                    # `_recurse_into_daughters`) and avoids the cycle the
-                    # broader β-direction heuristic would induce on heavy
-                    # nuclei whose chain hops through other empty mothers.
+                    _heuristic_unparseable.append((mo_pdg, half_life))
                     lifetime = np.inf
 
             if mo_pdg in spec_data:
@@ -372,10 +393,57 @@ def _merge_tabulated_decays(spec_data):
             info(2, "Synthesized {0} stable spec_data entries from photo-nuclear "
                     "inel_mothers".format(n_added))
 
+    # Surface coverage gaps as a single RuntimeWarning so the operator
+    # sees the full list of fudges at module load (instead of silently
+    # carrying them or one warning per channel). Each entry is an
+    # unstable nucleus that the FLUKA decay db couldn't sample (mostly
+    # chromo SPDCEV failures); the β-direction heuristic guesses a
+    # daughter to keep the chain reducer from running into a sink. The
+    # proper fix is at db-build time — rerun chromo's decay sampler
+    # for these mothers, or hand-extend the schema with PDG/NNDC
+    # branching info. See wiki/open-questions.md.
+    if _heuristic_fallback_mothers:
+        import warnings
+        from prince_cr.util import get_AZN
+        # Compact tabular summary, sorted by half-life ascending.
+        _heuristic_fallback_mothers.sort(key=lambda x: x[1])
+        lines = []
+        for pdg, hl, da in _heuristic_fallback_mothers:
+            A, Z, _ = get_AZN(pdg)
+            lines.append(
+                "  PDG={0}  A={1} Z={2}  half_life={3:.3e}s  "
+                "→ heuristic daughter PDG={4}".format(pdg, A, Z, hl, da)
+            )
+        warnings.warn(
+            "FLUKA decay db has empty channels for {0} unstable nuclei "
+            "(SPDCEV / sampling failures). Falling back to β-direction "
+            "heuristic per-mother — this is a FUDGE; verify the chain "
+            "reducer doesn't hit cycle warnings downstream and fix at "
+            "the next prince-fluka-utils rebuild:\n{1}".format(
+                len(_heuristic_fallback_mothers), "\n".join(lines)
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    if _heuristic_unparseable:
+        import warnings
+        warnings.warn(
+            "FLUKA decay db has empty channels for {0} mothers whose PDG "
+            "couldn't be parsed into (A,Z); forcing stable terminal: "
+            "{1}".format(len(_heuristic_unparseable), _heuristic_unparseable),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     info(
         2,
         "Tabulated FLUKA/Pythia decays merged: "
-        "{0} (mo,da) channels".format(len(_TABULATED_DECAY_DX)),
+        "{0} (mo,da) channels{1}".format(
+            len(_TABULATED_DECAY_DX),
+            "; {0} heuristic fallbacks".format(len(_heuristic_fallback_mothers))
+                if _heuristic_fallback_mothers else "",
+        ),
     )
 
 

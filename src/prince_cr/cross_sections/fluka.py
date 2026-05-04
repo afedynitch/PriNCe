@@ -136,6 +136,20 @@ class FlukaPhotoNuclear(CrossSectionBase):
                 continue
             self._nonel_tab[mo] = sig              # cm^2
 
+        # Set of primary mothers (under the max_mass cap, post-normalisation)
+        # so we can detect daughter-only species below: photo-nuclear daughters
+        # without their own σ_inel cause `KeyError` in
+        # `interaction_rates._estimate_batch_matrix` because the kernel adds
+        # them to `known_species` but never to `reactions`. v1 db's write-time
+        # filter (`prince-fluka-utils/schema.py:_filter_boost_keys`) only
+        # drops daughters outside `inel_mothers ∪ ELEMENTARY_PDGS` for the
+        # production-cap (max_mass=56); at higher caps these slip through.
+        primary_mothers = set(self._nonel_tab.keys())
+        # Audit of daughter-only species we drop as a stop-gap, surfaced as
+        # a `RuntimeWarning` after the load (FUDGE — proper fix is at the
+        # next prince-fluka-utils db rebuild).
+        _daughter_only_dropped: dict[int, int] = {}
+
         # Boost-conserving: (mother_PDG, daughter_PDG); 2D yields (n_ch, n_E)
         for (raw_mo, raw_da), yld in zip(
             tables["mothers_daughters"], tables["fragment_yields"]
@@ -153,7 +167,41 @@ class FlukaPhotoNuclear(CrossSectionBase):
                 continue
             if A_mo > config.max_mass:
                 continue
+            # Daughter-only species: not a primary mother → kernel KeyError.
+            # Drop with audit. Free nucleons (2212/2112) reach this code path
+            # via `_normalize_pdg` only when raw_da was 1000010010/1000000010,
+            # but those failed the `A_da >= 2` filter above; otherwise the
+            # post-normalisation `da` is always nuclear here.
+            if da not in primary_mothers:
+                _daughter_only_dropped[da] = _daughter_only_dropped.get(da, 0) + 1
+                continue
             self._incl_tab[mo, da] = yld
+
+        if _daughter_only_dropped:
+            import warnings
+            ranked = sorted(_daughter_only_dropped.items(), key=lambda x: -x[1])
+            preview = ", ".join(
+                "PDG={0}({1} ch)".format(pdg, n) for pdg, n in ranked[:15]
+            )
+            warnings.warn(
+                "Photo-nuclear db has {0} daughter-only nuclear species "
+                "(appear in mothers_daughters but absent from inel_mothers "
+                "at max_mass={1}); dropping {2} mother→daughter rows as a "
+                "stop-gap to keep `interaction_rates._estimate_batch_matrix` "
+                "from KeyError. Top offenders: {3}{4}. Proper fix: extend "
+                "the write-time filter in "
+                "`prince-fluka-utils/schema.py:_filter_boost_keys` past the "
+                "A=56 production cap, OR rerun the FLUKA decay generator "
+                "after photo-nuclear so the missing isotopes get covered.".format(
+                    len(_daughter_only_dropped),
+                    config.max_mass,
+                    sum(_daughter_only_dropped.values()),
+                    preview,
+                    "" if len(ranked) <= 15 else " (+{0} more)".format(len(ranked) - 15),
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         # Redistributed: (mother_PDG, daughter_PDG); 3D yields.
         # FLUKA stores (n_E, n_x) per-bin counts; transpose to PriNCe (n_x, n_E),
