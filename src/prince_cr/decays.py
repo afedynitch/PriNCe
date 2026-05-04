@@ -23,6 +23,24 @@ _PDG_E_NEUTRINOS = (_PDG_NU_E, _PDG_NU_E_BAR)
 _PDG_MU_NEUTRINOS = (_PDG_NU_MU, _PDG_NU_MU_BAR)
 
 
+def _tabulated_decay_avg(dndx, tab_xbins, x_grid):
+    """Evaluate a tabulated dN/dx at the bin midpoints `x_grid`.
+
+    `dndx` is per-decay dN/dx on `tab_xbins` (n_x bins). Both FLUKA and
+    Pythia decay tables share PriNCe's per-nucleon x convention so
+    `tab_xbins` are the same edges as `prince_cr.cross_sections.xbins` and
+    no rebinning is needed beyond a log-x interpolation. Out-of-range
+    `x_grid` points return 0.0 (left/right defaults of `np.interp`).
+    """
+    tab_xc = 0.5 * (tab_xbins[1:] + tab_xbins[:-1])
+    log_xc = np.log10(tab_xc)
+    flat = np.asarray(x_grid).ravel()
+    safe = np.where(flat > 0.0, flat, tab_xc[0] * 0.5)
+    log_x = np.log10(safe)
+    res = np.interp(log_x, log_xc, dndx, left=0.0, right=0.0)
+    return res.reshape(np.shape(x_grid))
+
+
 def _nucleus_charge_step(nucleus_pdg, dZ):
     """Return the PDG ID of a nucleus with the same A but Z shifted by ``dZ``.
 
@@ -174,9 +192,21 @@ def get_decay_matrix_bin_average(mo, da, x_lower, x_upper):
     result = None
 
     # --------------------------------
+    # Tabulated FLUKA / Pythia (preferred — populated at module load by
+    # data._merge_tabulated_decays from /decays/FLUKA_DECAY_2025/ and
+    # /decays/PYTHIA_HADRON_2025/). Both groups share PriNCe's per-nucleon
+    # x convention: nuclei -> x = E_d_rest/m_N, hadrons -> x = E_d_rest/m_mo.
+    # --------------------------------
+    from prince_cr.data import _TABULATED_DECAY_DX, _TABULATED_DECAY_XBINS
+    if (mo, da) in _TABULATED_DECAY_DX and _TABULATED_DECAY_XBINS is not None:
+        result = _tabulated_decay_avg(
+            _TABULATED_DECAY_DX[(mo, da)], _TABULATED_DECAY_XBINS, x_grid
+        )
+
+    # --------------------------------
     # pi+ → nu_mu, pi- → nu_mubar
     # --------------------------------
-    if mo == _PDG_PI_PLUS and da == _PDG_NU_MU:
+    elif mo == _PDG_PI_PLUS and da == _PDG_NU_MU:
         result = pion_to_numu_avg(x_lower, x_upper)
     elif mo == _PDG_PI_MINUS and da == _PDG_NU_MU_BAR:
         result = pion_to_numu_avg(x_lower, x_upper)

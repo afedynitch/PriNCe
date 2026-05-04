@@ -112,6 +112,218 @@ finally:
         pass
 
 
+# ----------------------------------------------------------------------------
+# Tabulated decay backend (FLUKA + Pythia).
+#
+# The v1 prince-fluka-utils db carries two decay groups:
+#   /decays/FLUKA_DECAY_2025/   — 2813 nuclear mothers (β±/EC/α, …)
+#   /decays/PYTHIA_HADRON_2025/ —  10 hadron mothers   (μ±, π±, π⁰, K±, K⁰_S/L, n)
+# Both store per-decay light-secondary yields on the shared xbins
+# (`x = E_total_rest / m_nucleon` for FLUKA, `x = E_total_rest / m_parent`
+# for Pythia — both happen to coincide with PriNCe's per-nucleon kernel x
+# convention, see `cross_sections/fluka.py` for the photo-nuclear analogue).
+#
+# At module load we merge the tabulated info into `spec_data` (overriding
+# legacy `particle_data.ppo` entries where they exist, e.g. tritium is
+# `stable=True` in the ppo) and stash dN/dx tables in `_TABULATED_DECAY_DX`
+# for `decays.get_decay_matrix_bin_average` to dispatch into.
+# ----------------------------------------------------------------------------
+
+#: (mother_pdg, daughter_pdg) -> ndarray dN/dx per decay on `_TABULATED_DECAY_XBINS`.
+_TABULATED_DECAY_DX: dict = {}
+#: Shared xbins for the tabulated decay grid (FLUKA decay = Pythia = photo-nuclear).
+_TABULATED_DECAY_XBINS = None
+
+
+def fluka_decay_db():
+    """Read `/decays/FLUKA_DECAY_2025/` from the FLUKA db. Returns a dict, or
+    None if the db file isn't present at `config.fluka_db_path`."""
+    fpath = path.join(config.fluka_db_path, config.fluka_db_fname)
+    if not path.isfile(fpath):
+        return None
+    with h5py.File(fpath, "r") as f:
+        if "decays/FLUKA_DECAY_2025" not in f:
+            return None
+        g = f["decays/FLUKA_DECAY_2025"]
+        return {
+            "decay_mothers":     g["decay_mothers"][:],
+            "half_lives":        g["half_lives"][:],
+            "rest_masses":       g["rest_masses"][:],
+            "nuclear_daughters": g["nuclear_daughters"][:],
+            "branching_ratios":  g["branching_ratios"][:],
+            "light_daughters":   g["light_daughters"][:],
+            "light_yields":      g["light_yields"][:],
+            "xbins":             g["xbins"][:],
+            "n_decays_per_mother":
+                int(g.attrs.get("n_decays_per_mother", 1)),
+        }
+
+
+def pythia_hadron_db():
+    """Read `/decays/PYTHIA_HADRON_2025/` from the FLUKA db. Returns a dict,
+    or None if the db file isn't present at `config.fluka_db_path`."""
+    fpath = path.join(config.fluka_db_path, config.fluka_db_fname)
+    if not path.isfile(fpath):
+        return None
+    with h5py.File(fpath, "r") as f:
+        if "decays/PYTHIA_HADRON_2025" not in f:
+            return None
+        g = f["decays/PYTHIA_HADRON_2025"]
+        return {
+            "decay_mothers":   g["decay_mothers"][:],
+            "rest_masses":     g["rest_masses"][:],
+            "light_daughters": g["light_daughters"][:],
+            "light_yields":    g["light_yields"][:],
+            "xbins":           g["xbins"][:],
+            "n_decays_per_mother":
+                int(g.attrs.get("n_decays_per_mother", 1)),
+        }
+
+
+_LN2 = float(np.log(2.0))
+
+
+def _heuristic_beta_branching(mo_pdg):
+    """Best-effort branchings for an unstable nucleus that the FLUKA decay
+    db has *no* explicit channels for (SPDCEV failures — ~4% of mothers).
+
+    Direction picked from neutron excess: β⁻ if Z < A/2, β⁺ otherwise.
+    Returns a `[(mult, [da])]` list in the same shape PriNCe's chain
+    reducer expects, with the nuclear daughter, an electron(/positron),
+    and the matching neutrino as separate one-daughter entries (so each
+    can be followed independently)."""
+    from prince_cr.util import get_AZN, make_nucleus_pdg
+
+    A, Z, _ = get_AZN(mo_pdg)
+    if A < 1 or Z is None or Z < 0:
+        return None
+    if Z * 2 < A:                                 # n-rich → β⁻
+        return [
+            (1.0, [make_nucleus_pdg(A, Z + 1)]),  # nucleus(Z+1)
+            (1.0, [-12]),                         # ν̄_e
+            (1.0, [11]),                          # e⁻
+        ]
+    else:                                         # p-rich → β⁺ / EC
+        return [
+            (1.0, [make_nucleus_pdg(A, Z - 1)]),  # nucleus(Z−1)
+            (1.0, [12]),                          # ν_e
+            (1.0, [-11]),                         # e⁺
+        ]
+
+
+def _merge_tabulated_decays(spec_data):
+    """Override `spec_data[mo]` lifetimes / branchings from the tabulated
+    decay groups, and populate `_TABULATED_DECAY_DX` for the chain reducer
+    to convolve light-secondary distributions against.
+
+    Silently no-ops if `config.fluka_db_path` doesn't resolve to a file
+    or if the decay groups are missing. `spec_data` mass / charge fields
+    are preserved from the legacy ppo where they exist.
+    """
+    global _TABULATED_DECAY_XBINS
+
+    fluka = fluka_decay_db()
+    pythia = pythia_hadron_db()
+    if fluka is None and pythia is None:
+        info(2, "Tabulated decay db not found; using legacy spec_data only")
+        return
+
+    if fluka is not None:
+        _TABULATED_DECAY_XBINS = fluka["xbins"]
+        xb = fluka["xbins"]
+        xw = xb[1:] - xb[:-1]
+        nd_mo = fluka["nuclear_daughters"][:, 0]
+        nd_da = fluka["nuclear_daughters"][:, 1]
+        ld_mo = fluka["light_daughters"][:, 0]
+        ld_da = fluka["light_daughters"][:, 1]
+
+        for i, mo_raw in enumerate(fluka["decay_mothers"]):
+            mo_pdg = int(mo_raw)
+            half_life = float(fluka["half_lives"][i])
+            lifetime = (
+                half_life / _LN2
+                if np.isfinite(half_life) and half_life > 0
+                else np.inf
+            )
+
+            branchings = []
+            for ch in np.where(nd_mo == mo_raw)[0]:
+                branchings.append(
+                    (float(fluka["branching_ratios"][ch]),
+                     [int(nd_da[ch])])
+                )
+            for ch in np.where(ld_mo == mo_raw)[0]:
+                yld = fluka["light_yields"][ch]
+                mult = float(yld.sum())   # per-bin yield is already per-decay
+                if mult <= 0.0:
+                    continue
+                da_pdg = int(ld_da[ch])
+                branchings.append((mult, [da_pdg]))
+                _TABULATED_DECAY_DX[(mo_pdg, da_pdg)] = yld / xw
+
+            if not branchings and lifetime != np.inf:
+                heuristic = _heuristic_beta_branching(mo_pdg)
+                if heuristic:
+                    branchings = heuristic
+
+            if mo_pdg in spec_data:
+                spec_data[mo_pdg]["lifetime"] = lifetime
+                spec_data[mo_pdg]["stable"] = (lifetime == np.inf)
+                if branchings:
+                    spec_data[mo_pdg]["branchings"] = branchings
+            else:
+                # Unknown to the legacy ppo (e.g. exotic isotopes). Synthesize
+                # a minimal entry from the FLUKA rest-mass + PDG-derived charge.
+                from prince_cr.util import get_AZN
+                _, Z, _ = get_AZN(mo_pdg)
+                spec_data[mo_pdg] = {
+                    "mass": float(fluka["rest_masses"][i]),
+                    "stable": (lifetime == np.inf),
+                    "lifetime": lifetime,
+                    "incomplete": False,
+                    "charge": int(Z) if Z is not None else 0,
+                    "branchings": branchings,
+                }
+
+    if pythia is not None:
+        if _TABULATED_DECAY_XBINS is None:
+            _TABULATED_DECAY_XBINS = pythia["xbins"]
+        xb = pythia["xbins"]
+        xw = xb[1:] - xb[:-1]
+        ld_mo = pythia["light_daughters"][:, 0]
+        ld_da = pythia["light_daughters"][:, 1]
+
+        # Pythia carries no lifetime field; PDG values from particle_data.ppo
+        # are kept. We only overwrite the branching list with Pythia's actual
+        # tabulated final-state composition + dN/dx tables.
+        for mo_raw in pythia["decay_mothers"]:
+            mo_pdg = int(mo_raw)
+            branchings = []
+            for ch in np.where(ld_mo == mo_raw)[0]:
+                yld = pythia["light_yields"][ch]
+                mult = float(yld.sum())
+                if mult <= 0.0:
+                    continue
+                da_pdg = int(ld_da[ch])
+                branchings.append((mult, [da_pdg]))
+                _TABULATED_DECAY_DX[(mo_pdg, da_pdg)] = yld / xw
+
+            if mo_pdg in spec_data and branchings:
+                spec_data[mo_pdg]["branchings"] = branchings
+
+    info(
+        2,
+        "Tabulated FLUKA/Pythia decays merged: "
+        "{0} (mo,da) channels".format(len(_TABULATED_DECAY_DX)),
+    )
+
+
+try:
+    _merge_tabulated_decays(spec_data)
+except Exception as _exc:                                        # noqa: BLE001
+    info(0, "Could not merge tabulated decays: {0}".format(_exc))
+
+
 # Default units in Prince are ***cm, s, GeV***
 # Define here all constants and unit conversions and use
 # throughout the code. Don't write c=2.99.. whatever.
