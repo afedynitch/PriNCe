@@ -306,6 +306,10 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # MKL handle wrapping `_etd2_D_off`. One-shot for the whole solve.
         self._etd2_D_off_mkl = None
         self._backend = config.linear_algebra_backend.lower()
+        # Stage 1.5 hybrid lookahead state. Populated at solve() start
+        # when ``config.use_cupy_dense_lookahead`` is True; reset after.
+        self._lookahead_anchors = None
+        self._next_anchor_idx = 0
 
     def _refresh_z_caches(self, z):
         """Refresh all rate-cache-window-bound pieces at z.
@@ -363,6 +367,12 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             self._etd2_kappa_pair_cached = None
 
         self.current_z_rates = z
+
+        # Stage 1.5: dispatch the next anchor's GPU dense matvec in the
+        # background while this cache window's ETD2 steps run on CPU. The
+        # consume happens inside the next ``_refresh_z_caches`` call via
+        # ``had_int_rates._try_consume_for(z)``.
+        self._schedule_next_lookahead_anchor()
 
     def _ensure_D_split(self):
         """Compute and cache the FD operator's diagonal/off-diagonal split."""
@@ -466,6 +476,46 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 f"Index map covered {k_off} of {M_off.nnz} M_off entries."
             )
         return off_to_M, diag_to_M
+
+    # ------------------------------------------------------------------
+    # Stage 1.5: deterministic-grid lookahead for GPU dense matvec
+    # ------------------------------------------------------------------
+    def _compute_lookahead_anchors(self, z_grid):
+        """Predict the redshifts at which ``_refresh_z_caches`` will fire.
+
+        ETD2 walks ``z_grid[:-1]`` with ``operator_at(z_k)``; the cache
+        invalidates whenever ``|z - last_anchor| > recomp_z_threshold``.
+        That contract is deterministic — anchor[0] is z_grid[0]; each
+        subsequent anchor is the first grid point with abs(Δ) above
+        threshold from the previous anchor. The list returned here
+        feeds the GPU-dgemv lookahead.
+        """
+        anchors = []
+        last = None
+        thr = self.recomp_z_threshold
+        for z in z_grid[:-1]:
+            if last is None or abs(z - last) > thr:
+                anchors.append(float(z))
+                last = z
+        return anchors
+
+    def _lookahead_active(self):
+        return (
+            getattr(config, "use_cupy_dense_lookahead", False)
+            and config.has_cupy
+            and self._lookahead_anchors is not None
+        )
+
+    def _schedule_next_lookahead_anchor(self):
+        """Dispatch the upcoming anchor's GPU rebuild, if lookahead is on."""
+        if not self._lookahead_active():
+            return
+        idx = self._next_anchor_idx
+        if idx >= len(self._lookahead_anchors):
+            return
+        z_next = self._lookahead_anchors[idx]
+        self.had_int_rates.schedule_rebuild(z_next)
+        self._next_anchor_idx = idx + 1
 
     @staticmethod
     def _build_mkl_handle(off, optimize=True, blocksize=_DEFAULT):
@@ -681,10 +731,35 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             self._etd2_M_raw_off_mkl = None
         self._ensure_D_split()
 
+        # Stage 1.5 lookahead bookkeeping. Compute the cache-window
+        # anchor schedule from the deterministic z_grid + threshold,
+        # drop any stale GPU rebuild from a previous solve, and
+        # prime the first anchor before entering the integrate loop —
+        # the first ``_refresh_z_caches`` call will consume it.
+        if (
+            getattr(config, "use_cupy_dense_lookahead", False)
+            and config.has_cupy
+        ):
+            self._lookahead_anchors = self._compute_lookahead_anchors(z_grid)
+            self._next_anchor_idx = 0
+            self.had_int_rates.drop_pending()
+            self._schedule_next_lookahead_anchor()
+            info(2, f"ETD2 Stage 1.5: scheduled {len(self._lookahead_anchors)} "
+                    "GPU dense-matvec anchors for lookahead.")
+        else:
+            self._lookahead_anchors = None
+            self._next_anchor_idx = 0
+
         self.pre_step_hook(self.initial_z)
 
         info(2, f"ETD2: integrating with {len(z_grid) - 1} steps of dz≈{dz_step:.2e}")
         integrate(state, z_grid, operator_at=self._operator_at)
+
+        # Done with the solve — clear lookahead state.
+        if self._lookahead_anchors is not None:
+            self.had_int_rates.drop_pending()
+            self._lookahead_anchors = None
+            self._next_anchor_idx = 0
 
         self.post_step_hook(self.final_z)
         self.state = state

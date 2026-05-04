@@ -136,6 +136,17 @@ MKL_threads = 32
 # Sparse matrix-vector product from "CUPY"|"MKL"|"scipy"
 linear_algebra_backend = "MKL"
 
+# When True, the ETD2 solver uploads ``_batch_matrix`` to GPU once at
+# the first cache rebuild and routes the dense cache-rebuild matvec
+# through cupy on a non-blocking stream. Combined with deterministic
+# z-grid lookahead in the solver, the GPU dgemv for cache anchor k+1
+# overlaps with the CPU's ETD2 steps in cache window k. Per-step
+# SpMVs and state buffers stay on host/MKL (Stage 1.5 hybrid; full
+# cupy port is Stage 2). Default False — enable explicitly when
+# ``has_cupy`` is True and a working CUDA runtime is on the dynamic
+# linker path. See wiki/methods/prince-mkl-cupy-backend.md § Stage 1.5.
+use_cupy_dense_lookahead = False
+
 # MKL Sparse BLAS block size for the photo-hadronic ``M_off`` matrix.
 # ``None`` keeps it CSR; an integer ≥ 2 stores it as BSR with that
 # block size (auto-padding the matrix). Default ``None``: Stage 1.1's
