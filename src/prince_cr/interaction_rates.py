@@ -381,6 +381,26 @@ class PhotoNuclearInteractionRate(object):
                     cupy.array(self.photon_vector(z, pfield=pfield), dtype=np.float32),
                     out=self._batch_vec,
                 )
+            elif (
+                config.linear_algebra_backend.lower() == "mkl"
+                and config.has_mkl
+                and config.mkl is not None
+                and getattr(config, "use_mkl_dense_matvec", True)
+            ):
+                # Route through MKL CBLAS DGEMV so the dense matvec
+                # shares MKL's threadpool with the Sparse BLAS path. On
+                # Zen 2 this avoids the OpenBLAS-vs-MKL oversubscription
+                # that capped Stage 1's whole-solve at t=4. See
+                # wiki/methods/prince-mkl-cupy-backend.md § Stage 1.1.
+                from . import mkl_dense
+
+                mkl_dense.dgemv_y_eq_Ax(
+                    self._batch_matrix,
+                    np.ascontiguousarray(
+                        self.photon_vector(z, pfield=pfield), dtype=np.float64
+                    ),
+                    self._batch_vec,
+                )
             else:
                 np.dot(
                     self._batch_matrix,

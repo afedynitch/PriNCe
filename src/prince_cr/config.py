@@ -136,6 +136,19 @@ MKL_threads = 32
 # Sparse matrix-vector product from "CUPY"|"MKL"|"scipy"
 linear_algebra_backend = "MKL"
 
+# When True AND ``linear_algebra_backend == "MKL"``, route the rate-
+# cache-rebuild dense matvec through MKL CBLAS DGEMV so it shares MKL's
+# threadpool with the Sparse BLAS path. **Default is False** because on
+# AMD Zen 2 + Intel MKL 2026, ``cblas_dgemv`` is dispatched as a serial
+# kernel regardless of ``mkl_set_num_threads`` (MKL's L2 BLAS heuristic
+# treats DGEMV as memory-bandwidth-bound and skips parallelization);
+# OpenBLAS DGEMV at the same shape parallelizes ~14× faster end-to-end.
+# See wiki § Stage 1.1 / Stage 1.2. The cleaner answer is to pair
+# OpenBLAS threads to MKL via ``threadpoolctl``, OR replace OpenBLAS
+# with AOCL-BLIS via a numpy-with-AOCL build. This flag is preserved
+# for hosts where MKL DGEMV does parallelize (e.g. Intel CPUs).
+use_mkl_dense_matvec = False
+
 
 # Check for CUPY library for GPU support
 try:
@@ -221,6 +234,14 @@ def set_mkl_threads(nthreads):
     called on subsequent invocations. The cached cdll handle is
     preserved, so handles in ``MklSparseMatrix`` wrappers stay valid
     across thread-count changes.
+
+    Note: this only configures MKL's threadpool. numpy/scipy in the
+    default venv link against bundled OpenBLAS, which keeps a
+    *separate* threadpool that defaults to all physical cores. When
+    both pools are active simultaneously (e.g. ETD2 doing MKL Sparse
+    SpMV and OpenBLAS DGEMV in the same step) they oversubscribe Zen 2
+    cores. Use :func:`set_thread_count` instead for the common case
+    where you want both pools sized to the same N.
     """
     global MKL_threads
     from ctypes import byref, c_int
@@ -231,6 +252,44 @@ def set_mkl_threads(nthreads):
         mkl.mkl_set_num_threads(byref(c_int(nthreads)))
         if debug_level >= 5:
             print(f"MKL threads limited to {nthreads}")
+
+
+def set_thread_count(nthreads):
+    """Size both MKL and the underlying numpy/scipy BLAS pool to ``nthreads``.
+
+    On hosts where numpy is bundled-OpenBLAS (the default venv on
+    this project), this is what you want when running ETD2 with the
+    MKL backend: the per-step SpMV uses MKL's pool and the dense
+    cache-rebuild matvec uses OpenBLAS. Sized together, total threads
+    stay bounded; sized independently, they fight over Zen 2 cores
+    (Stage 1.1 wiki has the bench).
+
+    Effect:
+
+    * Calls :func:`set_mkl_threads(nthreads)`.
+    * Calls ``threadpoolctl.threadpool_limits(nthreads, "blas")`` so
+      OpenBLAS / MKL inside numpy / scipy / accelerate libraries all
+      respect the same cap.
+
+    No-op on the BLAS side if :mod:`threadpoolctl` is missing — falls
+    back to the historical behaviour with a warning.
+    """
+    set_mkl_threads(nthreads)
+    try:
+        from threadpoolctl import threadpool_limits
+
+        threadpool_limits(limits=int(nthreads), user_api="blas")
+        if debug_level >= 5:
+            print(f"BLAS (OpenBLAS/MKL inside numpy) threads limited to {nthreads}")
+    except ImportError:
+        import warnings
+
+        warnings.warn(
+            "threadpoolctl not installed — set_thread_count fell back to "
+            "set_mkl_threads only; OpenBLAS thread count unaffected. "
+            "`pip install threadpoolctl` to fix.",
+            stacklevel=2,
+        )
 
 
 if has_mkl:
