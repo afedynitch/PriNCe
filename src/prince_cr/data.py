@@ -7,8 +7,116 @@ import scipy.constants as spc
 import h5py
 
 
-from prince_cr.util import convert_to_namedtuple, info, make_nucleus_pdg
+from prince_cr.util import convert_to_namedtuple, info, make_nucleus_pdg, get_AZN
 import prince_cr.config as config
+
+
+# v2-sparse CSR layout (mirrors prince-fluka-utils' `_pack_csr_dataset`):
+#   <name>           [2, total_nnz] float64   (data row 0; col indices row 1)
+#   <name>_indptrs   [n_ch, n_rows+1] int64
+#   <name>_len_data  [n_ch] int64             (per-channel nnz)
+#   <name>.attrs:    mat_shape, format='v2-sparse'
+# Reader rebuilds each channel's CSR -> dense ndarray on demand. With
+# `channels=...`, only those rows of indptrs and the corresponding slices
+# of the values dataset are read, so `max_mass` filtering pays I/O only
+# for the channels it keeps.
+def _read_csr_yields(grp, name, *, channels=None):
+    """Return a dense ndarray for `grp/name` (always v2-sparse).
+
+    `channels` selects which channel rows to materialise (in the given
+    order). v1 dense db files are no longer supported — regenerate the
+    db with prince-fluka-utils ≥ d5c8a4f.
+    """
+    ds = grp[name]
+    fmt = ds.attrs.get("format")
+    if fmt != b"v2-sparse" and fmt != "v2-sparse":
+        raise RuntimeError(
+            f"FLUKA db dataset {grp.name}/{name} is not v2-sparse "
+            f"(format={fmt!r}). Regenerate with prince-fluka-utils ≥ "
+            f"d5c8a4f; v1 dense db files are no longer read."
+        )
+
+    from scipy.sparse import csr_matrix
+
+    indptrs_ds = grp[name + "_indptrs"]
+    len_data = np.asarray(grp[name + "_len_data"][:], dtype=np.int64)
+    mat_shape_attr = tuple(int(x) for x in ds.attrs["mat_shape"])
+    is_vector = (len(mat_shape_attr) == 1)
+    csr_shape = (1, mat_shape_attr[0]) if is_vector else mat_shape_attr
+
+    n_ch_total = len(len_data)
+    if channels is None:
+        ch_indices = np.arange(n_ch_total, dtype=np.int64)
+    else:
+        ch_indices = np.asarray(list(channels), dtype=np.int64)
+
+    if ch_indices.size == 0:
+        return np.zeros((0, *mat_shape_attr), dtype=np.float64)
+
+    n_rows = 1 if is_vector else mat_shape_attr[0]
+    n_cols = mat_shape_attr[-1]
+
+    # Build a contiguous packed buffer for the requested channels only:
+    # concatenate each selected channel's `mat[:, off:off+n]` slice plus the
+    # corresponding indptr row. The resulting big CSR has shape
+    # (n_ch_sel * n_rows, n_cols) and decodes to dense in a single
+    # vectorised call — far faster than a Python loop of 14k csr_matrix()
+    # constructions when the consumer asks for many channels at once.
+    offsets = np.concatenate(([0], np.cumsum(len_data)))
+
+    # Fast path: ask for ALL channels in order. Read the full mat once;
+    # h5py + lzf turns this into a single decompression pass with no
+    # Python-level overhead per channel.
+    full_scan = (
+        ch_indices.size == n_ch_total
+        and ch_indices[0] == 0
+        and ch_indices[-1] == n_ch_total - 1
+        and np.all(np.diff(ch_indices) == 1)
+    )
+    if full_scan:
+        mat = ds[:]
+        indptrs_all = indptrs_ds[:]
+        # Shift each channel's indptr into the concatenated coordinate
+        # system: row r of channel i maps to absolute row i*n_rows + r,
+        # and its data range starts at offsets[i] + indptrs_all[i, r].
+        # Drop the leading 0 of every channel because it's redundant once
+        # we've concatenated; prepend a single 0 for the global indptr.
+        shifts = offsets[:-1][:, None]                # (n_ch, 1)
+        big_indptr = np.concatenate(
+            ([0], (indptrs_all[:, 1:] + shifts).ravel())
+        )
+    else:
+        # Selective path: gather only the slices we need.
+        ch_lens = len_data[ch_indices].astype(np.int64)
+        ch_offs = offsets[ch_indices].astype(np.int64)
+        total_nnz = int(ch_lens.sum())
+        mat = np.empty((2, total_nnz), dtype=np.float64)
+        cur = 0
+        # h5py supports cheap contiguous slices; one read per channel beats
+        # a single `ds[:]` when most channels are skipped (max_mass cap).
+        for i in range(ch_indices.size):
+            n = int(ch_lens[i])
+            if n == 0:
+                continue
+            off = int(ch_offs[i])
+            mat[:, cur:cur + n] = ds[:, off:off + n]
+            cur += n
+        # Indptrs: read just the requested rows.
+        indptrs_sel = indptrs_ds[ch_indices, :]
+        # Per-channel cumulative shift in the new packed buffer.
+        shifts_sel = np.concatenate(([0], np.cumsum(ch_lens[:-1])))[:, None]
+        big_indptr = np.concatenate(
+            ([0], (indptrs_sel[:, 1:] + shifts_sel).ravel())
+        )
+
+    data = mat[0]
+    col = mat[1].astype(np.int64)
+    n_rows_total = ch_indices.size * n_rows
+    big_csr = csr_matrix((data, col, big_indptr), shape=(n_rows_total, n_cols))
+    dense = big_csr.toarray().reshape(ch_indices.size, n_rows, n_cols)
+    if is_vector:
+        return dense[:, 0, :]
+    return dense
 
 
 # Boundary translation: the legacy ``particle_data.ppo`` is keyed by Neucosma
@@ -152,7 +260,7 @@ def fluka_decay_db():
             "nuclear_daughters": g["nuclear_daughters"][:],
             "branching_ratios":  g["branching_ratios"][:],
             "light_daughters":   g["light_daughters"][:],
-            "light_yields":      g["light_yields"][:],
+            "light_yields":      _read_csr_yields(g, "light_yields"),
             "xbins":             g["xbins"][:],
             "n_decays_per_mother":
                 int(g.attrs.get("n_decays_per_mother", 1)),
@@ -173,7 +281,7 @@ def pythia_hadron_db():
             "decay_mothers":   g["decay_mothers"][:],
             "rest_masses":     g["rest_masses"][:],
             "light_daughters": g["light_daughters"][:],
-            "light_yields":    g["light_yields"][:],
+            "light_yields":    _read_csr_yields(g, "light_yields"),
             "xbins":           g["xbins"][:],
             "n_decays_per_mother":
                 int(g.attrs.get("n_decays_per_mother", 1)),
@@ -604,13 +712,19 @@ class PrinceDB(object):
 
         return db_entry
 
-    def fluka_photo_nuclear_db(self, model_tag, e_range=None):
+    def fluka_photo_nuclear_db(self, model_tag, e_range=None, max_mass=None):
         """Read photo_nuclear/<tag>/ from the FLUKA db (a separate file from
         ``db_fname``). Lazy: opens the file on each call.
 
         Args:
             model_tag (str): subgroup tag, e.g. ``"FLUKA_2025"``.
             e_range (tuple or None): ``(e_min, e_max)`` GeV bounds.
+            max_mass (int or None): if given, only mother rows with
+                ``A_mother <= max_mass`` are read from disk. Skips both the
+                small index arrays and the large ``elementary_yields`` /
+                ``fragment_yields`` channel rows for heavier mothers, so
+                lighter caps load proportionally faster from a v2-sparse
+                db. ``None`` means no filter (read everything).
 
         Returns:
             dict with keys: ``energy_grid``, ``xbins``, ``inel_mothers``,
@@ -637,16 +751,61 @@ class PrinceDB(object):
             db_entry["energy_grid"] = egrid_full[sl]
             db_entry["xbins"] = grp["xbins"][:]
 
-            for entry in ("inel_mothers", "mothers_daughters", "elementary_daughters"):
-                info(10, "Reading entry {0} from FLUKA db.".format(entry))
-                db_entry[entry] = grp[entry][:]
+            inel_mothers_all = grp["inel_mothers"][:]
+            md_all = grp["mothers_daughters"][:]
+            ed_all = grp["elementary_daughters"][:]
 
-            # σ_inel: (n_m, n_E) — slice last axis
-            db_entry["inelastic_cross_sctions"] = grp["inelastic_cross_sctions"][:, sl]
-            # heavy yields: (n_ch, n_E) — slice last axis
-            db_entry["fragment_yields"] = grp["fragment_yields"][:, sl]
-            # elementary yields: (n_em, n_E, n_x) — slice middle axis
-            db_entry["elementary_yields"] = grp["elementary_yields"][:, sl, :]
+            if max_mass is None:
+                m_keep = np.ones(len(inel_mothers_all), dtype=bool)
+                bc_keep = np.ones(len(md_all), dtype=bool)
+                em_keep = np.ones(len(ed_all), dtype=bool)
+            else:
+                # Filter on mother A only. Daughter A is bounded by mother A
+                # at write time (`_filter_boost_keys`), so a mother-A cap is
+                # sufficient for the boost bucket, and elementary daughters
+                # are species-id'd not mass-cut.
+                m_a = np.array([get_AZN(int(p))[0] for p in inel_mothers_all])
+                bc_a = np.array([get_AZN(int(p))[0] for p in md_all[:, 0]]) \
+                    if md_all.size else np.empty(0, dtype=np.int64)
+                em_a = np.array([get_AZN(int(p))[0] for p in ed_all[:, 0]]) \
+                    if ed_all.size else np.empty(0, dtype=np.int64)
+                m_keep = m_a <= max_mass
+                bc_keep = bc_a <= max_mass
+                em_keep = em_a <= max_mass
+
+            db_entry["inel_mothers"] = inel_mothers_all[m_keep]
+            db_entry["mothers_daughters"] = md_all[bc_keep]
+            db_entry["elementary_daughters"] = ed_all[em_keep]
+
+            m_idx = np.flatnonzero(m_keep)
+            bc_idx = np.flatnonzero(bc_keep)
+            em_idx = np.flatnonzero(em_keep)
+
+            n_E_sl = len(egrid_full[sl])
+            # σ_inel: (n_m, n_E). Skip the fancy index when no mass cut so we
+            # don't pull the full block off disk just to drop nothing.
+            if max_mass is None:
+                db_entry["inelastic_cross_sctions"] = (
+                    grp["inelastic_cross_sctions"][:, sl]
+                )
+            elif m_idx.size:
+                db_entry["inelastic_cross_sctions"] = (
+                    grp["inelastic_cross_sctions"][m_idx, :][:, sl]
+                )
+            else:
+                db_entry["inelastic_cross_sctions"] = np.zeros(
+                    (0, n_E_sl), dtype=np.float64,
+                )
+            # heavy yields: (n_ch, n_E) — stays dense (no x axis to gain on).
+            if max_mass is None:
+                db_entry["fragment_yields"] = grp["fragment_yields"][:, sl]
+            elif bc_idx.size:
+                db_entry["fragment_yields"] = grp["fragment_yields"][bc_idx, :][:, sl]
+            else:
+                db_entry["fragment_yields"] = np.zeros((0, n_E_sl), dtype=np.float64)
+            # elementary yields: (n_em, n_E, n_x) — sparse-packed in v2 db.
+            ey_full = _read_csr_yields(grp, "elementary_yields", channels=em_idx)
+            db_entry["elementary_yields"] = ey_full[:, sl, :]
 
         return db_entry
 

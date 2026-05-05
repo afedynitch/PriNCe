@@ -101,7 +101,9 @@ class FlukaPhotoNuclear(CrossSectionBase):
 
         info(2, "Loading FLUKA photo-nuclear cross sections.")
         tables = db_handler.fluka_photo_nuclear_db(
-            model_tag, e_range=config.cross_section_e_range
+            model_tag,
+            e_range=config.cross_section_e_range,
+            max_mass=config.max_mass,
         )
 
         self._egrid_tab = tables["energy_grid"]    # GeV
