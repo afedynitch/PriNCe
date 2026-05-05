@@ -160,6 +160,17 @@ use_cupy_dense_lookahead = False
 # or update cadences (W ≥ ~30) where BSR's per-op win could pay off.
 mkl_bsr_blocksize = None
 
+# Float dtype used by the Stage 2 cupy backend. The project default is
+# fp32: consumer-grade NVIDIA hardware (RTX 3090 / Ampere) has its FP64
+# throughput throttled to ~1/64 of FP32, and the Ampere FP32 Tensor
+# Cores are unavailable in fp64. Set to ``"float64"`` only for parity
+# regression tests or when characterizing fp32 accumulated error —
+# ETD2's stiff multi-decade-dynamic-range propagation can accumulate
+# ~30 % L2 error vs scipy in fp32 over ~1000 steps even when the per-
+# step matvec is fp32-correct.
+cupy_dtype = "float32"
+
+
 # When True AND ``linear_algebra_backend == "MKL"``, route the rate-
 # cache-rebuild dense matvec through MKL CBLAS DGEMV so it shares MKL's
 # threadpool with the Sparse BLAS path. **Default is False** because on

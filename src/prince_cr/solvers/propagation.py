@@ -306,6 +306,12 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # MKL handle wrapping `_etd2_D_off`. One-shot for the whole solve.
         self._etd2_D_off_mkl = None
         self._backend = config.linear_algebra_backend.lower()
+        # Stage 2 cupy backend uses the same GPU-side dense matvec
+        # path as Stage 1.5 (handled in interaction_rates), but
+        # consumes the result on-device rather than D2H-copying. The
+        # `_lookahead_*` machinery is re-used — see
+        # ``_schedule_next_lookahead_anchor``.
+        self._is_cupy_backend = self._backend == "cupy"
         # Stage 1.5 hybrid lookahead state. Populated at solve() start
         # when ``config.use_cupy_dense_lookahead`` is True; reset after.
         self._lookahead_anchors = None
@@ -324,12 +330,25 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # scale_fac=1.0 → raw rate matrix (no dldz factor); we apply dldz later.
         M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
         if not self.enable_photohad_losses:
-            # Zero matrix with full sparsity preserved.
-            M = M.copy() if hasattr(M, "copy") else M
-            M.data = np.zeros_like(M.data)
+            # Zero matrix with full sparsity preserved. Works for either
+            # scipy or cupy CSR — both support ``.copy()`` and slice
+            # assignment on ``.data``.
+            M = M.copy()
+            M.data[:] = 0
 
         first_window = self._etd2_M_raw_off is None
-        if first_window:
+        if self._is_cupy_backend:
+            # Stage 2 path: ``M`` is a cupyx.scipy.sparse.csr_matrix
+            # already on-device (see :meth:`PhotoNuclearInteractionRate.
+            # _update_rates_cupy`). The xp-aware ``split_operator``
+            # returns cupy arrays. Re-splitting each cache window is a
+            # few ms on the GPU at production grid; we skip the host
+            # index-map gather for now (deferred until profile shows it
+            # matters).
+            d_M, M_off = split_operator(M)
+            self._etd2_M_raw_diag = d_M
+            self._etd2_M_raw_off = M_off
+        elif first_window:
             d_M, M_off = split_operator(M)
             self._etd2_M_raw_diag = d_M
             self._etd2_M_raw_off = M_off
@@ -399,6 +418,26 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 self._etd2_D_off_mkl = self._build_mkl_handle(
                     D_off, optimize=True, blocksize=None
                 )
+
+        if self._is_cupy_backend:
+            # Stage 2: upload D split to GPU once. Stored under the same
+            # attribute names as the host path — ``_make_apply_F_cupy``
+            # reads them as cupy arrays. Dtype follows ``config.cupy_dtype``
+            # (default fp32; see config.py).
+            import cupy as cp
+            import cupyx.scipy.sparse as csp
+
+            dt = np.dtype(getattr(config, "cupy_dtype", "float32"))
+            self._etd2_D_diag = cp.asarray(d_D, dtype=dt)
+            D_off_cast = D_off.astype(dt)
+            self._etd2_D_off = csp.csr_matrix(
+                (
+                    cp.asarray(D_off_cast.data, dtype=dt),
+                    cp.asarray(D_off_cast.indices, dtype=cp.int32),
+                    cp.asarray(D_off_cast.indptr, dtype=cp.int32),
+                ),
+                shape=D_off_cast.shape,
+            )
 
     @staticmethod
     def _build_M_off_index_map(M, M_off):
@@ -577,15 +616,18 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         else:
             kappa = None
 
-        # Diagonal d = dldz · (M_raw_diag + κ ⊙ D_diag)
-        d = dldz * self._etd2_M_raw_diag.copy()
-        if kappa is not None:
-            d += dldz * (kappa * self._etd2_D_diag)
-
         if self.enable_injection_jacobian and self.list_of_sources:
             b = self.injection(1.0, z)
         else:
             b = None
+
+        if self._is_cupy_backend:
+            return self._operator_at_cupy(z, dldz, kappa, b)
+
+        # Diagonal d = dldz · (M_raw_diag + κ ⊙ D_diag)
+        d = dldz * self._etd2_M_raw_diag.copy()
+        if kappa is not None:
+            d += dldz * (kappa * self._etd2_D_diag)
 
         # Pre-allocate one scratch buffer for κ⊙x — reused inside apply_F.
         kx_buf = np.empty(self.dim_states) if kappa is not None else None
@@ -596,6 +638,66 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             apply_F = self._make_apply_F_scipy(kappa, dldz, b, kx_buf)
 
         return d, apply_F
+
+    def _operator_at_cupy(self, z, dldz, kappa_host, b_host):
+        """Stage 2 cupy variant: build ``(d, apply_F)`` on the GPU.
+
+        ``kappa_host`` and ``b_host`` (when present) come from numpy
+        loss/injection paths. We upload them once per step in the active
+        cupy dtype (``config.cupy_dtype``, default fp32). At dim_states
+        ≈ 6 k that's a ~24 KB H2D copy — well below PCIe latency
+        dominance. The returned ``apply_F`` operates exclusively on
+        cupy buffers in the same dtype as the state vector.
+        """
+        import cupy as cp
+
+        dt = np.dtype(getattr(config, "cupy_dtype", "float32"))
+        dldz_scalar = dt.type(dldz)
+        kappa_cp = (
+            cp.asarray(kappa_host, dtype=dt) if kappa_host is not None else None
+        )
+        b_cp = cp.asarray(b_host, dtype=dt) if b_host is not None else None
+
+        d = dldz_scalar * self._etd2_M_raw_diag.copy()
+        if kappa_cp is not None:
+            d += dldz_scalar * (kappa_cp * self._etd2_D_diag)
+
+        kx_buf_cp = (
+            cp.empty(self.dim_states, dtype=dt) if kappa_cp is not None else None
+        )
+        apply_F = self._make_apply_F_cupy(kappa_cp, dldz_scalar, b_cp, kx_buf_cp)
+        return d, apply_F
+
+    def _make_apply_F_cupy(self, kappa_cp, dldz_f, b_cp, kx_buf_cp):
+        """Build a cupy-backed ``apply_F(x, out)``.
+
+        Per call:
+
+          out = M_off · x                       (cuSPARSE SpMV via @)
+          if kappa: kx = κ ⊙ x; out += D_off · kx
+          out *= dldz; if b: out += b
+
+        Inputs ``x`` and ``out`` are cupy fp32 arrays from
+        ``etd2._step_buffers`` (allocated against ``state.dtype``).
+        cupy's sparse ``@`` operator allocates a fresh result each call;
+        the default mempool reuses the underlying GPU memory across
+        consecutive calls so allocation overhead is negligible.
+        """
+        import cupy as cp
+
+        M_off_cp = self._etd2_M_raw_off
+        D_off_cp = self._etd2_D_off if kappa_cp is not None else None
+
+        def apply_F(x, out):
+            cp.copyto(out, M_off_cp @ x)
+            if kappa_cp is not None:
+                cp.multiply(kappa_cp, x, out=kx_buf_cp)
+                out += D_off_cp @ kx_buf_cp
+            out *= dldz_f
+            if b_cp is not None:
+                out += b_cp
+
+        return apply_F
 
     def _make_apply_F_scipy(self, kappa, dldz, b, kx_buf):
         M_off = self._etd2_M_raw_off
@@ -687,6 +789,18 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 except Exception:
                     pass
                 setattr(self, attr, None)
+        # On the cupy backend the M/D split lives on the GPU. Drop the
+        # cupy references so Python ref-counts them back to the
+        # mempool. Explicit None release keeps long-running scripts
+        # (mass scans) from pinning successive matrices on-device.
+        if self._is_cupy_backend:
+            for attr in (
+                "_etd2_M_raw_off",
+                "_etd2_M_raw_diag",
+                "_etd2_D_off",
+                "_etd2_D_diag",
+            ):
+                setattr(self, attr, None)
 
     def __del__(self):
         try:
@@ -716,7 +830,6 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         if abs(z_grid[-1] - self.final_z) > 1e-12:
             z_grid = np.concatenate([z_grid, [self.final_z]])
 
-        state = np.zeros(self.dim_states)
         # Force first-step rebuild of the cached photo-hadronic matrix.
         # Drop the M_off cache too: a fresh ``_refresh_z_caches`` will
         # rebuild it (and the MKL handle + index maps) from the current
@@ -729,15 +842,34 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         if self._etd2_M_raw_off_mkl is not None:
             self._etd2_M_raw_off_mkl.close()
             self._etd2_M_raw_off_mkl = None
+        # On Stage 2 cupy backend, also drop the cupy D split so
+        # ``_ensure_D_split`` rebuilds it for this solve. (The host
+        # path keeps D — it's truly constant for the lifetime of the
+        # PriNCeRun, but the GPU mirror may have come from a prior
+        # backend selection.)
+        if self._is_cupy_backend:
+            self._etd2_D_diag = None
+            self._etd2_D_off = None
         self._ensure_D_split()
+
+        if self._is_cupy_backend:
+            import cupy as cp
+
+            dt = np.dtype(getattr(config, "cupy_dtype", "float32"))
+            state = cp.zeros(self.dim_states, dtype=dt)
+        else:
+            state = np.zeros(self.dim_states)
 
         # Stage 1.5 lookahead bookkeeping. Compute the cache-window
         # anchor schedule from the deterministic z_grid + threshold,
         # drop any stale GPU rebuild from a previous solve, and
         # prime the first anchor before entering the integrate loop —
         # the first ``_refresh_z_caches`` call will consume it.
+        # Stage 2 cupy backend has its own GPU dense-matvec path and
+        # does not use the Stage 1.5 lookahead machinery.
         if (
-            getattr(config, "use_cupy_dense_lookahead", False)
+            not self._is_cupy_backend
+            and getattr(config, "use_cupy_dense_lookahead", False)
             and config.has_cupy
         ):
             self._lookahead_anchors = self._compute_lookahead_anchors(z_grid)
@@ -762,7 +894,15 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             self._next_anchor_idx = 0
 
         self.post_step_hook(self.final_z)
-        self.state = state
+        if self._is_cupy_backend:
+            # D2H + upcast back to fp64 host so downstream consumers
+            # (UHECRPropagationResult, plotting, et al.) see the
+            # canonical dtype.
+            import cupy as cp
+
+            self.state = cp.asnumpy(state).astype(np.float64)
+        else:
+            self.state = state
         end_time = time()
         info(2, "ETD2: integration completed in {0:.2f} s".format(end_time - start_time))
 
