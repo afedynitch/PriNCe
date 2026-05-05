@@ -29,9 +29,12 @@ config.x_cut_proton = 1e-2
 config.tau_dec_threshold = np.inf
 config.max_mass = 14
 
-# FLUKA db lives in a sibling repo during v0 development. Production users
-# either copy the file into data_dir or override this path themselves.
-config.fluka_db_path = "/ceph/sharedfs/work/SATORI/anatoli/devel/UH-UHECR-Fluka-Prince/runs/2026-05-04_pfu-v1-smoke"
+# FLUKA smoke db ships v2-sparse format under the bookkeeping repo's run
+# directory. Override fluka_db_path / fluka_db_fname to retarget elsewhere.
+_FLUKA_SMOKE_DB_DIR = os.path.expanduser(
+    "~/work/devel/UH-UHECR-Fluka-Prince/runs/2026-05-04_pfu-v1-smoke"
+)
+config.fluka_db_path = _FLUKA_SMOKE_DB_DIR
 config.fluka_db_fname = "prince_db_v1_smoke.h5"
 
 # ---------------------------------------------------------------------------
@@ -108,7 +111,7 @@ def cached_prince_run():
         _cfg.x_cut = 1e-4
         _cfg.x_cut_proton = 1e-2
         _cfg.tau_dec_threshold = np.inf
-        _cfg.fluka_db_path = "/ceph/sharedfs/work/SATORI/anatoli/devel/UH-UHECR-Fluka-Prince/runs/2026-05-04_pfu-v1-smoke"
+        _cfg.fluka_db_path = _FLUKA_SMOKE_DB_DIR
         _cfg.fluka_db_fname = "prince_db_v1_smoke.h5"
         pf_full = photonfields.CombinedPhotonField(
             [photonfields.CMBPhotonSpectrum, photonfields.CIBGilmore2D]

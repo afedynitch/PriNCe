@@ -11,6 +11,7 @@ Default output path: ../PriNCe-examples/prince_run_talys.ppo (relative to repo r
 
 from __future__ import annotations
 
+import os
 import pickle
 import sys
 import time
@@ -33,9 +34,10 @@ def main(out_path: Path) -> None:
     )
 
     print("Building cross sections (FLUKA photo-nuclear)...")
-    # FLUKA db is built by sibling repo prince-fluka-utils.
-    cfg.fluka_db_path = "/Users/anatoli/devel_mac/prince-fluka-utils"
-    cfg.fluka_db_fname = "prince_db_v0.h5"
+    cfg.fluka_db_path = os.path.expanduser(
+        "~/work/devel/UH-UHECR-Fluka-Prince/runs/2026-05-04_pfu-v1-prod"
+    )
+    cfg.fluka_db_fname = "prince_db_v1.h5"
     cs = cross_sections.FlukaPhotoNuclear()
 
     t0 = time.time()

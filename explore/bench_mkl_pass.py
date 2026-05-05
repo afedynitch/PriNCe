@@ -1,9 +1,9 @@
 """Stage 1 MKL-pass smoke + benchmark.
 
-Skirts conftest.py's hard-coded `/ceph/sharedfs/...` FLUKA db path (broken
-on this host) by setting ``config.fluka_db_path`` from a local default
-that resolves on SATORI's `/home/anatoli/work/devel/...` view. Runs the
-same ETD2 solve under each backend in a single Python process.
+Sets ``config.fluka_db_path`` from a local default under
+``$HOME/work/devel/UH-UHECR-Fluka-Prince/runs/`` so the bench is independent
+of the conftest fixture. Runs the same ETD2 solve under each backend in a
+single Python process.
 
 Usage:
     python explore/bench_mkl_pass.py [--max-mass=14] [--threads=8,16,32]
