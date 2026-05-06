@@ -329,6 +329,34 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # when ``config.use_cupy_dense_lookahead`` is True; reset after.
         self._lookahead_anchors = None
         self._next_anchor_idx = 0
+        # Stage 3 cupy persistent device buffers. Allocated once per
+        # solve (in :meth:`_ensure_apply_F_cupy`) and held for the
+        # whole integration so the per-step body is alloc-free —
+        # required for kernel fusion to pay off at the per-step scale
+        # and for stable buffer addresses inside captured CUDA Graphs.
+        # Per-step values (kappa, b, dldz, d) are refreshed in place;
+        # cache-window-bound values (M_diag, D_diag) are referenced by
+        # the apply_F closure and rebound on cache window refresh.
+        self._etd2_d_buf_cp = None
+        self._etd2_kappa_buf_cp = None
+        self._etd2_b_buf_cp = None
+        self._etd2_kx_buf_cp = None
+        self._etd2_dldz_buf_cp = None
+        # Mutable closure-state for the cupy apply_F. Rebound on each
+        # ``_refresh_z_caches`` because ``split_operator`` returns fresh
+        # cupy CSR arrays at every cache window (the host path keeps
+        # the same handles via in-place data updates; the GPU path
+        # currently re-splits — see :meth:`_refresh_z_caches`).
+        self._etd2_apply_F_state_cp = None
+        # Stage 3 CUDA Graph machinery. Allocated lazily when
+        # ``config.use_cuda_graphs`` is True. Re-captured on each cache
+        # window refresh because the SpMV kernel calls inside
+        # ``apply_F`` close over the current ``M_off`` / ``D_off``
+        # cupy CSRs whose pointers go stale across windows.
+        self._etd2_graph_exec = None
+        self._etd2_graph_stream = None
+        self._etd2_graph_state_buf = None
+        self._etd2_graph_needs_capture = True
 
     def _refresh_z_caches(self, z):
         """Refresh all rate-cache-window-bound pieces at z.
@@ -361,6 +389,11 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             d_M, M_off = split_operator(M)
             self._etd2_M_raw_diag = d_M
             self._etd2_M_raw_off = M_off
+            # Stage 3: the apply_F closure dereferences M_off / D_off
+            # through a mutable container so we can swap pointers here
+            # without rebuilding it. Triggers re-capture of the CUDA
+            # graph (if active) on the next ``_operator_at_cupy``.
+            self._rebind_apply_F_cupy()
         elif first_window:
             d_M, M_off = split_operator(M)
             self._etd2_M_raw_diag = d_M
@@ -644,10 +677,16 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         ):
             self._refresh_z_caches(z)
 
-        # Cupy variant has its own apply_F build path below — rebuilds
-        # per step today (cheap on-GPU, kappa/b uploads are PCIe-bound).
-        if not self._is_cupy_backend and self._etd2_apply_F is None:
-            self._ensure_apply_F()
+        if self._etd2_apply_F is None:
+            # Stage 3 cupy path needs host kappa scratch up too —
+            # ``_ensure_apply_F_cupy`` allocates it alongside the
+            # persistent device buffers. Both branches require
+            # ``_refresh_z_caches`` to have run first (M_off must exist),
+            # which is guaranteed by the cache-window check above.
+            if self._is_cupy_backend:
+                self._ensure_apply_F_cupy()
+            else:
+                self._ensure_apply_F()
 
         dldz = self.dldz(z)
         if self.enable_partial_diff_jacobian:
@@ -713,62 +752,174 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             self._etd2_apply_F = self._make_apply_F_scipy()
 
     def _operator_at_cupy(self, z, dldz, kappa_host, b_host):
-        """Stage 2 cupy variant: build ``(d, apply_F)`` on the GPU.
+        """Stage 3 cupy variant: refresh persistent device buffers.
 
-        ``kappa_host`` and ``b_host`` (when present) come from numpy
-        loss/injection paths. We upload them once per step in the active
-        cupy dtype (``config.cupy_dtype``, default fp32). At dim_states
-        ≈ 6 k that's a ~24 KB H2D copy — well below PCIe latency
-        dominance. The returned ``apply_F`` operates exclusively on
-        cupy buffers in the same dtype as the state vector.
+        Writes per-step values into pre-allocated device buffers, then
+        evaluates ``d = dldz · (M_diag + κ ⊙ D_diag)`` via the fused
+        ``compute_d`` ElementwiseKernel. No allocations on the hot path
+        beyond a tiny intermediate cupy array for the host-to-device
+        upload (mempool-reused). Returns the persistent ``d`` and
+        ``apply_F`` references — the closure was built once at first
+        call and rebound to current ``M_off`` / ``D_off`` on each cache
+        window refresh by :meth:`_rebind_apply_F_cupy`.
+        """
+        import cupy as cp
+        from .etd2 import cupy_kernels
+
+        if self._etd2_apply_F is None:
+            self._ensure_apply_F_cupy()
+
+        dt = self._etd2_dldz_buf_cp.dtype
+        # Update per-step scalar via a 1-element device buffer. Stays
+        # at the same address across the solve so a captured graph's
+        # kernels (which take ``raw T dldz_buf`` and read ``[0]``)
+        # always see the fresh value at replay time.
+        self._etd2_dldz_buf_cp[0] = dt.type(dldz)
+
+        if kappa_host is not None:
+            cp.copyto(
+                self._etd2_kappa_buf_cp,
+                cp.asarray(kappa_host, dtype=dt),
+            )
+        # b is optional; when None we keep the b_buf zeroed (filled at
+        # alloc time) and emit the no-b kernel variant from apply_F.
+        if b_host is not None:
+            cp.copyto(
+                self._etd2_b_buf_cp,
+                cp.asarray(b_host, dtype=dt),
+            )
+
+        # Compute d on the device via the fused kernel. Writes into the
+        # persistent ``_etd2_d_buf_cp`` so the address ``etd2_step``
+        # eventually loads from is stable across the whole solve.
+        K = cupy_kernels()
+        if kappa_host is not None:
+            K.compute_d(
+                self._etd2_M_raw_diag,
+                self._etd2_kappa_buf_cp,
+                self._etd2_D_diag,
+                self._etd2_dldz_buf_cp,
+                self._etd2_d_buf_cp,
+            )
+        else:
+            K.compute_d_no_kappa(
+                self._etd2_M_raw_diag,
+                self._etd2_dldz_buf_cp,
+                self._etd2_d_buf_cp,
+            )
+
+        return self._etd2_d_buf_cp, self._etd2_apply_F
+
+    def _ensure_apply_F_cupy(self):
+        """Allocate persistent cupy buffers and build the apply_F closure.
+
+        Called from :meth:`_operator_at_cupy` on first invocation per
+        solve. ``M_off`` / ``D_off`` are bound through the mutable
+        ``self._etd2_apply_F_state_cp`` dict so :meth:`_rebind_apply_F_cupy`
+        can swap them on cache-window refresh without rebuilding the
+        closure object (which keeps a stable callable identity for
+        :func:`etd2.integrate` and the CUDA Graph capture path).
         """
         import cupy as cp
 
         dt = np.dtype(getattr(config, "cupy_dtype", "float32"))
-        dldz_scalar = dt.type(dldz)
-        kappa_cp = (
-            cp.asarray(kappa_host, dtype=dt) if kappa_host is not None else None
-        )
-        b_cp = cp.asarray(b_host, dtype=dt) if b_host is not None else None
+        n = self.dim_states
 
-        d = dldz_scalar * self._etd2_M_raw_diag.copy()
-        if kappa_cp is not None:
-            d += dldz_scalar * (kappa_cp * self._etd2_D_diag)
+        # Host scratch for kappa accumulation (used by ``_operator_at``
+        # to compute κ_adia + κ_pair before upload). Same dtype as the
+        # loss-vector grid so the sum stays in fp64 host arithmetic
+        # regardless of the active GPU dtype.
+        if self._etd2_kappa_buf is None:
+            self._etd2_kappa_buf = np.zeros_like(
+                self.adia_loss_rates_grid.energy_vector
+            )
 
-        kx_buf_cp = (
-            cp.empty(self.dim_states, dtype=dt) if kappa_cp is not None else None
-        )
-        apply_F = self._make_apply_F_cupy(kappa_cp, dldz_scalar, b_cp, kx_buf_cp)
-        return d, apply_F
+        # Persistent per-step device buffers. Held for the whole solve;
+        # released in :meth:`close`.
+        self._etd2_d_buf_cp = cp.empty(n, dtype=dt)
+        self._etd2_kappa_buf_cp = cp.zeros(n, dtype=dt)
+        self._etd2_b_buf_cp = cp.zeros(n, dtype=dt)
+        self._etd2_kx_buf_cp = cp.empty(n, dtype=dt)
+        self._etd2_dldz_buf_cp = cp.empty(1, dtype=dt)
 
-    def _make_apply_F_cupy(self, kappa_cp, dldz_f, b_cp, kx_buf_cp):
-        """Build a cupy-backed ``apply_F(x, out)``.
+        has_kappa = bool(self.enable_partial_diff_jacobian)
+        has_b = bool(self.enable_injection_jacobian) and bool(self.list_of_sources)
+
+        # ``_etd2_M_raw_off`` / ``_etd2_D_off`` are referenced by the
+        # closure through this dict so the cache-window-refresh path
+        # can swap them in place via :meth:`_rebind_apply_F_cupy`.
+        self._etd2_apply_F_state_cp = {
+            "M_off": self._etd2_M_raw_off,
+            "D_off": self._etd2_D_off,
+            "has_kappa": has_kappa,
+            "has_b": has_b,
+        }
+
+        self._etd2_apply_F = self._make_apply_F_cupy()
+
+    def _rebind_apply_F_cupy(self):
+        """Swap ``M_off`` / ``D_off`` references on a cache window refresh.
+
+        Called from :meth:`_refresh_z_caches` cupy branch after
+        ``split_operator`` returns fresh cupy CSR arrays. Also drops the
+        captured CUDA Graph executable — its cuSPARSE descriptors hold
+        device pointers from the previous window's M_off/D_off and would
+        be dangling after we update the dict and Python frees the old
+        cupy CSR objects.
+        """
+        if self._etd2_apply_F_state_cp is None:
+            return
+        # Drop the old graph BEFORE swapping the dict entries — once
+        # the dict no longer references the previous window's M_off,
+        # cupy's mempool may reclaim its data buffer, and any captured
+        # spmv calls that pointed at it would fault on replay.
+        self._etd2_graph_exec = None
+        self._etd2_apply_F_state_cp["M_off"] = self._etd2_M_raw_off
+        self._etd2_apply_F_state_cp["D_off"] = self._etd2_D_off
+        self._etd2_graph_needs_capture = True
+
+    def _make_apply_F_cupy(self):
+        """Build the persistent cupy ``apply_F(x, out)`` closure.
 
         Per call:
 
-          out = M_off · x                       (cuSPARSE SpMV via @)
-          if kappa: kx = κ ⊙ x; out += D_off · kx
-          out *= dldz; if b: out += b
+          1. ``cusparse spmv`` writes ``M_off · x`` into ``out`` (alpha=1, beta=0).
+          2. if κ active: ``kx = κ ⊙ x``; ``cusparse spmv`` adds
+             ``D_off · kx`` into ``out`` (alpha=1, beta=1).
+          3. fused ``scale_b``: ``out = out · dldz + b``  (or just
+             ``out · dldz`` when sources are off).
 
-        Inputs ``x`` and ``out`` are cupy fp32 arrays from
-        ``etd2._step_buffers`` (allocated against ``state.dtype``).
-        cupy's sparse ``@`` operator allocates a fresh result each call;
-        the default mempool reuses the underlying GPU memory across
-        consecutive calls so allocation overhead is negligible.
+        All scalars (``dldz``) come from the 1-element ``_etd2_dldz_buf_cp``
+        device buffer the kernel reads via ``raw T``. ``M_off`` / ``D_off``
+        are dereferenced through ``_etd2_apply_F_state_cp`` so the
+        cache-window refresh path can swap them without rebuilding the
+        closure.
+
+        Compared with the Stage 2 ``cp.copyto(out, M_off @ x)`` /
+        ``out += D_off @ kx`` / ``out *= dldz`` / ``out += b`` chain,
+        this saves ~3 launches per ``apply_F`` call (2 calls/step) plus
+        the implicit allocations in cupy's sparse ``@``.
         """
         import cupy as cp
+        from .etd2 import cupy_kernels, csr_spmv
 
-        M_off_cp = self._etd2_M_raw_off
-        D_off_cp = self._etd2_D_off if kappa_cp is not None else None
+        K = cupy_kernels()
+        kx_buf = self._etd2_kx_buf_cp
+        kappa_buf = self._etd2_kappa_buf_cp
+        b_buf = self._etd2_b_buf_cp
+        dldz_buf = self._etd2_dldz_buf_cp
+        state = self._etd2_apply_F_state_cp
 
         def apply_F(x, out):
-            cp.copyto(out, M_off_cp @ x)
-            if kappa_cp is not None:
-                cp.multiply(kappa_cp, x, out=kx_buf_cp)
-                out += D_off_cp @ kx_buf_cp
-            out *= dldz_f
-            if b_cp is not None:
-                out += b_cp
+            M_off = state["M_off"]
+            csr_spmv(M_off, x, out, accumulate=False)
+            if state["has_kappa"]:
+                cp.multiply(kappa_buf, x, out=kx_buf)
+                csr_spmv(state["D_off"], kx_buf, out, accumulate=True)
+            if state["has_b"]:
+                K.scale_b(out, b_buf, dldz_buf, out)
+            else:
+                K.scale_no_b(out, dldz_buf, out)
 
         return apply_F
 
@@ -800,6 +951,187 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 np.add(out, b, out=out)
 
         return apply_F
+
+    def _step_body_cupy_graph(self, state, bufs, K, has_kappa):
+        """Run one ETD2 step's device-only kernel sequence.
+
+        All inputs come from persistent device buffers; no Python
+        scalars are baked into kernel launch params (per-step values
+        live in ``raw T`` 1-element device buffers read with ``[0]``),
+        so this body is safe to record into a CUDA Graph and replay
+        across many steps within a cache window.
+
+        Sequence (11 cupy ops at full feature load): compute_d →
+        phi_compute → spmv_M → multiply κ⊙state → spmv_D → scale_b →
+        post_apply1 → spmv_M → multiply κ⊙a → spmv_D → scale_b →
+        post_apply2.
+        """
+        d_buf = self._etd2_d_buf_cp
+        if has_kappa:
+            K.compute_d(
+                self._etd2_M_raw_diag,
+                self._etd2_kappa_buf_cp,
+                self._etd2_D_diag,
+                self._etd2_dldz_buf_cp,
+                d_buf,
+            )
+        else:
+            K.compute_d_no_kappa(
+                self._etd2_M_raw_diag,
+                self._etd2_dldz_buf_cp,
+                d_buf,
+            )
+        K.phi_compute(d_buf, bufs["h_buf"], bufs["eD"], bufs["phi1"], bufs["phi2"])
+        self._etd2_apply_F(state, bufs["F_phi"])
+        K.post_apply1(
+            bufs["eD"], state, bufs["phi1"], bufs["F_phi"], bufs["h_buf"], bufs["a"]
+        )
+        self._etd2_apply_F(bufs["a"], bufs["F_a"])
+        K.post_apply2(
+            bufs["a"],
+            bufs["F_a"],
+            bufs["F_phi"],
+            bufs["phi2"],
+            bufs["h_buf"],
+            state,
+        )
+
+    def _solve_loop_graphs(self, state, z_grid):
+        """Stage 3 graph-capture integration loop.
+
+        Replaces :func:`etd2.integrate` for the cupy-with-graphs path.
+        Per cache window: warmup step (eager), capture step (records
+        kernels into a ``cupy.cuda.Graph``), then replay for the
+        remainder of the window. Re-capture triggers on the next
+        ``_refresh_z_caches`` (signalled via
+        :attr:`_etd2_graph_needs_capture`).
+
+        All per-step host work (κ accumulation, b construction,
+        dldz scalar) happens outside the captured region; the graph
+        only contains the per-step kernel sequence built by
+        :meth:`_step_body_cupy_graph`.
+        """
+        import cupy as cp
+        from .etd2 import _step_buffers, cupy_kernels
+
+        K = cupy_kernels()
+        bufs = _step_buffers(state.shape[0], xp=cp, dtype=state.dtype)
+
+        # Capture stream — non-default; default stream forbids capture.
+        stream = cp.cuda.Stream(non_blocking=True)
+        self._etd2_graph_stream = stream
+
+        nsteps = len(z_grid) - 1
+        # Per-cache-window state machine: 0=needs warmup, 1=needs capture,
+        # 2=replay. Resets to 0 whenever ``_etd2_graph_needs_capture``
+        # flips back to True (cache-window refresh).
+        win_step_count = 0
+        last_h = None
+
+        has_kappa = bool(self.enable_partial_diff_jacobian)
+        has_b = bool(self.enable_injection_jacobian) and bool(self.list_of_sources)
+
+        for k in range(nsteps):
+            z0 = z_grid[k]
+            z1 = z_grid[k + 1]
+            h = z1 - z0
+
+            # Cache-window refresh check (mirrors :meth:`_operator_at`).
+            if (
+                self.current_z_rates is None
+                or abs(z0 - self.current_z_rates) > self.recomp_z_threshold
+            ):
+                self._refresh_z_caches(z0)
+                # _rebind_apply_F_cupy drops _etd2_graph_exec and sets
+                # _etd2_graph_needs_capture = True. Reset window state.
+                win_step_count = 0
+
+            # Lazy-init persistent buffers on first call after the first
+            # _refresh_z_caches. Mirrors the cupy branch in :meth:`_operator_at`.
+            if self._etd2_apply_F is None:
+                self._ensure_apply_F_cupy()
+
+            # Per-step host work: κ, b, dldz — exactly the same arithmetic
+            # the eager :meth:`_operator_at_cupy` does, lifted here so we
+            # can keep the captured region pure-device.
+            dldz = self.dldz(z0)
+            if has_kappa:
+                kappa = self._etd2_kappa_buf
+                kappa.fill(0.0)
+                if self.enable_adiabatic_losses:
+                    kappa += self.adia_loss_rates_grid.loss_vector(z0)
+                if self._etd2_kappa_pair_cached is not None:
+                    kappa += self._etd2_kappa_pair_cached
+            else:
+                kappa = None
+            if has_b:
+                b = self.injection(1.0, z0)
+            else:
+                b = None
+
+            dt = self._etd2_dldz_buf_cp.dtype
+
+            # All device work happens on the capture stream so that the
+            # per-step uploads (dldz / κ / b / h) are correctly ordered
+            # before the kernel launches that read them — without a
+            # stream context the uploads would land on the per-thread
+            # default stream and race against the non-default capture
+            # stream's kernels.
+            with stream:
+                self._etd2_dldz_buf_cp[0] = dt.type(dldz)
+                if kappa is not None:
+                    cp.copyto(
+                        self._etd2_kappa_buf_cp,
+                        cp.asarray(kappa, dtype=dt),
+                    )
+                if b is not None:
+                    cp.copyto(
+                        self._etd2_b_buf_cp,
+                        cp.asarray(b, dtype=dt),
+                    )
+                if last_h != h:
+                    bufs["h_buf"][0] = dt.type(h)
+                    last_h = h
+                    # h changing within a cache window is the truncated
+                    # final step. Force re-capture: although h_buf is
+                    # read via ``raw T`` at replay time and would
+                    # technically pick up the new value, the captured
+                    # graph might have been planned around the previous
+                    # step count.
+                    if win_step_count == 2:
+                        self._etd2_graph_exec = None
+                        self._etd2_graph_needs_capture = True
+                        win_step_count = 0
+
+                # Per-window state machine.
+                if self._etd2_graph_needs_capture and win_step_count == 0:
+                    # Warmup pass — runs the body eagerly on the capture
+                    # stream so cuSPARSE's per-stream handle and cupy's
+                    # ElementwiseKernel JIT compile *outside* the captured
+                    # region. Advances state like a normal step.
+                    self._step_body_cupy_graph(state, bufs, K, has_kappa)
+                    win_step_count = 1
+                elif self._etd2_graph_needs_capture and win_step_count == 1:
+                    # Capture pass. ``begin_capture`` puts the stream
+                    # in record-only mode — the kernel launches are
+                    # captured into the graph but do NOT execute. We
+                    # launch the graph once after end_capture so this
+                    # step advances state like a real step (otherwise
+                    # we'd silently lose one step per cache window).
+                    stream.begin_capture()
+                    self._step_body_cupy_graph(state, bufs, K, has_kappa)
+                    graph = stream.end_capture()
+                    graph.upload(stream)
+                    graph.launch(stream)
+                    self._etd2_graph_exec = graph
+                    self._etd2_graph_needs_capture = False
+                    win_step_count = 2
+                else:
+                    # Replay — single graph.launch per step.
+                    self._etd2_graph_exec.launch(stream)
+
+        stream.synchronize()
+        return state
 
     def _make_apply_F_mkl(self):
         """Build the persistent MKL-backed ``apply_F(x, out)`` closure.
@@ -894,8 +1226,19 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 "_etd2_M_raw_diag",
                 "_etd2_D_off",
                 "_etd2_D_diag",
+                # Stage 3 persistent device buffers + graph machinery.
+                "_etd2_d_buf_cp",
+                "_etd2_kappa_buf_cp",
+                "_etd2_b_buf_cp",
+                "_etd2_kx_buf_cp",
+                "_etd2_dldz_buf_cp",
+                "_etd2_apply_F_state_cp",
+                "_etd2_graph_exec",
+                "_etd2_graph_stream",
+                "_etd2_graph_state_buf",
             ):
                 setattr(self, attr, None)
+            self._etd2_graph_needs_capture = True
 
     def __del__(self):
         try:
@@ -950,6 +1293,22 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         if self._is_cupy_backend:
             self._etd2_D_diag = None
             self._etd2_D_off = None
+            # Stage 3 persistent cupy buffers + apply_F state. Dropped
+            # so this solve starts fresh — they get reallocated by
+            # :meth:`_ensure_apply_F_cupy` on the first
+            # :meth:`_operator_at_cupy` call.
+            self._etd2_d_buf_cp = None
+            self._etd2_kappa_buf_cp = None
+            self._etd2_b_buf_cp = None
+            self._etd2_kx_buf_cp = None
+            self._etd2_dldz_buf_cp = None
+            self._etd2_apply_F_state_cp = None
+            # Drop any captured CUDA Graph; the previous solve's
+            # buffer addresses are no longer valid.
+            self._etd2_graph_exec = None
+            self._etd2_graph_stream = None
+            self._etd2_graph_state_buf = None
+            self._etd2_graph_needs_capture = True
         self._ensure_D_split()
 
         if self._is_cupy_backend:
@@ -985,7 +1344,14 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self.pre_step_hook(self.initial_z)
 
         info(2, f"ETD2: integrating with {len(z_grid) - 1} steps of dz≈{dz_step:.2e}")
-        integrate(state, z_grid, operator_at=self._operator_at)
+        if (
+            self._is_cupy_backend
+            and getattr(config, "use_cuda_graphs", False)
+            and config.has_cupy
+        ):
+            self._solve_loop_graphs(state, z_grid)
+        else:
+            integrate(state, z_grid, operator_at=self._operator_at)
 
         # Done with the solve — clear lookahead state.
         if self._lookahead_anchors is not None:

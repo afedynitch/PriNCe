@@ -170,6 +170,17 @@ mkl_bsr_blocksize = None
 # step matvec is fp32-correct.
 cupy_dtype = "float32"
 
+# Stage 3: capture the per-step ETD2 kernel sequence into a CUDA Graph
+# and replay it across each cache window (~10 steps), re-capturing on
+# every ``_refresh_z_caches`` (the cuSPARSE descriptors close over
+# ``M_off`` / ``D_off`` device pointers that change at each window).
+# Default False — independent of ``cupy_dtype``. Enable only when
+# ``has_cupy`` is True and the cupy backend is selected; the launcher
+# falls back to the eager fused-kernel cupy path otherwise. See
+# wiki/results/prof-etd2-launch-bound.md § "CUDA Graph capture/replay"
+# for the launch-overhead measurements that motivate this path.
+use_cuda_graphs = False
+
 
 # When True AND ``linear_algebra_backend == "MKL"``, route the rate-
 # cache-rebuild dense matvec through MKL CBLAS DGEMV so it shares MKL's
