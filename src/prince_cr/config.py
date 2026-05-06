@@ -131,7 +131,7 @@ update_rates_z_threshold = 0.01
 
 # #Number of MKL threads (for sparse matrix multiplication the performance
 # #advantage from using more than a few threads is limited by memory bandwidth)
-MKL_threads = 32
+MKL_threads = 16
 
 # Sparse matrix-vector product from "CUPY"|"MKL"|"scipy"
 linear_algebra_backend = "MKL"
