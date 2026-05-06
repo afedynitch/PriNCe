@@ -63,6 +63,10 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         self.incl_idcs = []
         # List of available (mothers,daughter) reactions in incl. diff. cross sections
         self.incl_diff_idcs = []
+        # O(1) membership companion to incl_diff_idcs. Kept in sync by
+        # `_update_indices`; queried by the hot ``is_differential`` path
+        # in the decay-chain reducer (606k calls at max_mass=245).
+        self._incl_diff_idcs_set = set()
         # Common grid in x (the redistribution variable)
         self.xbins = None
 
@@ -77,6 +81,13 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         self.known_bc_channels = []
         # List of all differential inclusive channels (after optimization)
         self.known_diff_channels = []
+        # O(1) companions to the lists above — `interaction_rates`
+        # iterates `dcr × dcr` species pairs and queries channel
+        # membership for each, which is hundreds of thousands of
+        # `tuple in list` checks at heavy max_mass. Synced inside
+        # `_optimize_and_generate_index`.
+        self.known_bc_channels_set = set()
+        self.known_diff_channels_set = set()
         # Dictionary of (mother, daughter) reactions for each mother
         self.reactions = {}
 
@@ -160,7 +171,7 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         """
         if (
             _is_redistributed(daughter)
-            or (mother, daughter) in self.incl_diff_idcs
+            or (mother, daughter) in self._incl_diff_idcs_set
         ):
             info(60, "Daughter requires redistribution.", mother, daughter)
             return True
@@ -174,6 +185,10 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         self.nonel_idcs = sorted(self._nonel_tab.keys())
         self.incl_idcs = sorted(self._incl_tab.keys())
         self.incl_diff_idcs = sorted(self._incl_diff_tab.keys())
+        # Keep the O(1) membership companion in sync. `is_differential`
+        # is called O(1e6) times during chain reduction at heavy
+        # max_mass, so a list scan dominates init.
+        self._incl_diff_idcs_set = set(self.incl_diff_idcs)
 
     def generate_incl_channels(self, mo_indices):
         """Generates indices for all allowed channels given mo_indices
@@ -259,6 +274,11 @@ class CrossSectionBase(object, metaclass=ABCMeta):
                 self.known_bc_channels.append((mo, mo))
             if (mo, mo) not in self.reactions[mo]:
                 self.reactions[mo].append((mo, mo))
+
+        # Membership companions used by `interaction_rates` to bypass
+        # O(N) `tuple in list` lookups in the dcr × dcr species product.
+        self.known_bc_channels_set = set(self.known_bc_channels)
+        self.known_diff_channels_set = set(self.known_diff_channels)
 
         # Make sure the indices are up to date
         self._update_indices()

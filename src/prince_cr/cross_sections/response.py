@@ -1,6 +1,12 @@
 import numpy as np
 
-from prince_cr.util import get_2Dinterp_object, get_interp_object, info, get_AZN
+from prince_cr.util import (
+    BilinearGrid2D,
+    get_2Dinterp_object,
+    get_interp_object,
+    info,
+    get_AZN,
+)
 
 from .base import _is_redistributed
 
@@ -20,12 +26,24 @@ class ResponseFunction(object):
         self.nonel_idcs = cross_section.nonel_idcs
         self.incl_idcs = cross_section.incl_idcs
         self.incl_diff_idcs = cross_section.incl_diff_idcs
+        # O(1) membership companion (see `CrossSectionBase`).
+        self._incl_diff_idcs_set = set(self.incl_diff_idcs)
 
         # Dictionary of reponse function interpolators
         self.nonel_intp = {}
         self.incl_intp = {}
         self.incl_diff_intp = {}
         self.incl_diff_intp_integral = {}
+
+        # Batched view of `incl_diff_intp_integral` (Rec #3): all
+        # 2D-integral channels share the same `(xcenters, ygr)` grid by
+        # construction, so we stack them along a trailing axis to enable
+        # one-shot bilinear evaluation in `interaction_rates._init_matrices`.
+        # `incl_diff_integral_keys` is the channel ordering used in the
+        # stack's last axis; consumers compose
+        # ``incl_diff_integral_stack_intp(...)[..., i_for_channel]``.
+        self.incl_diff_integral_keys = []
+        self.incl_diff_integral_stack_intp = None
 
         self._precompute_interpolators()
 
@@ -37,7 +55,7 @@ class ResponseFunction(object):
         """
         return (
             _is_redistributed(daughter)
-            or (mother, daughter) in self.incl_diff_idcs
+            or (mother, daughter) in self._incl_diff_idcs_set
         )
 
     def get_full(self, mother, daughter, ygrid, xgrid=None):
@@ -165,17 +183,61 @@ class ResponseFunction(object):
 
         info(5, "Inclusive (redistributed) response functions h(y)")
         self.incl_diff_intp = {}
+        # Collect per-channel integral arrays so we can stack them after
+        # the loop. All channels share the same `(xcenters, ygr)` grid
+        # because `xcenters` is fixed and the FLUKA tabulation gives
+        # every channel the same energy grid; cross-checked at m=56.
+        from scipy.integrate import cumulative_trapezoid
+
+        stacked_integrals = []
+        stacked_keys = []
+        shared_ygr = None
         for mother, daughter in self.incl_diff_idcs:
             ygr, rfunc = self.get_channel(mother, daughter)
+            # Use the lighter `BilinearGrid2D` (RegularGridInterpolator)
+            # instead of `RectBivariateSplineNoExtrap` for the
+            # incl_diff path: bilinear-on-regular-grid is bit-exact in
+            # the domain and skips FITPACK's knot fit. The 2D-spline
+            # one is preserved for `incl_diff_intp` since `get_full`
+            # treats it differently and external callers may assume
+            # the spline surface there.
             self.incl_diff_intp[(mother, daughter)] = get_2Dinterp_object(
                 self.xcenters, ygr, rfunc, self.cross_section.xbins
             )
 
-            from scipy.integrate import cumulative_trapezoid
-
             integral = cumulative_trapezoid(rfunc, ygr, axis=1, initial=0)
             integral = cumulative_trapezoid(integral, self.xcenters, axis=0, initial=0)
 
-            self.incl_diff_intp_integral[(mother, daughter)] = get_2Dinterp_object(
+            self.incl_diff_intp_integral[(mother, daughter)] = BilinearGrid2D(
                 self.xcenters, ygr, integral, self.cross_section.xbins
+            )
+
+            # Accumulate the integral on the shared grid for batched eval.
+            # The first channel sets `shared_ygr`; subsequent channels
+            # must match. (This is true for FLUKA — all channels share
+            # the same egrid — but assert defensively.)
+            if shared_ygr is None:
+                shared_ygr = ygr
+            elif (
+                ygr.shape != shared_ygr.shape
+                or not np.array_equal(ygr, shared_ygr)
+            ):
+                # Bail out of the batched path: keep the per-channel
+                # interpolators and leave the stack intp as None so the
+                # consumer falls back to the per-channel `.ev` loop.
+                self.incl_diff_integral_keys = []
+                self.incl_diff_integral_stack_intp = None
+                stacked_integrals = None
+                continue
+            if stacked_integrals is not None:
+                stacked_integrals.append(integral)
+                stacked_keys.append((mother, daughter))
+
+        if stacked_integrals and shared_ygr is not None:
+            # Shape: (n_channels, n_x, n_y). RGI takes values shape
+            # (n_x, n_y, n_channels) for trailing-axis batching.
+            stack = np.stack(stacked_integrals, axis=-1)
+            self.incl_diff_integral_keys = stacked_keys
+            self.incl_diff_integral_stack_intp = BilinearGrid2D(
+                self.xcenters, shared_ygr, stack, self.cross_section.xbins
             )

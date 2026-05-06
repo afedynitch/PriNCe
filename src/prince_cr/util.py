@@ -4,7 +4,11 @@ in different modules of this project."""
 import inspect
 
 import numpy as np
-from scipy.interpolate import InterpolatedUnivariateSpline, RectBivariateSpline
+from scipy.interpolate import (
+    InterpolatedUnivariateSpline,
+    RectBivariateSpline,
+    RegularGridInterpolator,
+)
 import prince_cr.config as config
 
 
@@ -97,6 +101,63 @@ class RectBivariateSplineNoExtrap(RectBivariateSpline):
             # result[np.isnan(result)] = 0.
             # return result
             return np.where(np.isnan(result), 0.0, result)
+
+
+class BilinearGrid2D(object):
+    """Bilinear interpolator with zero-extrapolation, with the same
+    ``.ev(x, y)`` / ``__call__`` surface as ``RectBivariateSplineNoExtrap``.
+
+    Backed by :class:`scipy.interpolate.RegularGridInterpolator`
+    (``method='linear'``, ``bounds_error=False``, ``fill_value=0``),
+    which matches the wrapper's "NaN-replace with 0 outside the domain"
+    behaviour because RGI's bilinear path on an in-domain query is
+    bit-exact with FITPACK's ``kx=ky=1, s=0`` spline (verified at
+    1e-16 abs).
+
+    Constructed and evaluated faster than ``RectBivariateSplineNoExtrap``
+    for the regular-grid case used by ``incl_diff_intp_integral``: no
+    FITPACK knot-fitting overhead, and ``.ev`` is a vectorised pure-
+    numpy bilinear lookup. Used by ``ResponseFunction`` (Rec #3 of
+    ``wiki/results/prof-init-heavy-mass.md``).
+    """
+
+    def __init__(self, xgrid, ygrid, zgrid, xbins=None):
+        self.xgrid = np.asarray(xgrid)
+        self.ygrid = np.asarray(ygrid)
+        self.zgrid = np.asarray(zgrid)
+        self.xbins = xbins
+        self.xmin, self.xmax = float(self.xgrid[0]), float(self.xgrid[-1])
+        self.ymin, self.ymax = float(self.ygrid[0]), float(self.ygrid[-1])
+        self._rgi = RegularGridInterpolator(
+            (self.xgrid, self.ygrid),
+            self.zgrid,
+            method="linear",
+            bounds_error=False,
+            fill_value=0.0,
+        )
+
+    def ev(self, x, y):
+        x = np.asarray(x)
+        y = np.asarray(y)
+        pts = np.column_stack([x.ravel(), y.ravel()])
+        out = self._rgi(pts)
+        # When the underlying values array has trailing axes (channel-
+        # stacked), preserve them in the output shape.
+        trailing = out.shape[1:] if out.ndim > 1 else ()
+        return out.reshape(x.shape + trailing)
+
+    def __call__(self, x, y, **kwargs):
+        # Mirrors ``RectBivariateSplineNoExtrap.__call__``: the default
+        # path meshgrids the inputs (returning a 2D result).
+        if "grid" not in kwargs or kwargs.get("grid") is True:
+            x = np.asarray(x)
+            y = np.asarray(y)
+            X, Y = np.meshgrid(x, y, indexing="xy")
+            pts = np.column_stack([X.ravel(), Y.ravel()])
+            out = self._rgi(pts)
+            trailing = out.shape[1:] if out.ndim > 1 else ()
+            return out.reshape(X.shape + trailing).T
+        return self.ev(x, y)
 
 
 class RectBivariateSplineLogData(RectBivariateSplineNoExtrap):
@@ -263,20 +324,73 @@ def bin_widths(bin_edges):
 
 
 class AdditiveDictionary(dict):
-    """This dictionary subclass adds values if keys are
-    are already present instead of overwriting. For value tuples
-    only the second argument is added and the first kept to its
-    original value."""
+    """Dictionary subclass: subsequent assignments to the same key are
+    summed into the existing entry instead of overwriting it.
+
+    Used by the cross-section decay-chain reducer
+    (``cross_sections/base.py:_DecayChainReducer``), which stores per
+    ``(mother, daughter)`` cross-section contributions across many
+    chain branches and expects the final value to be the *sum* of all
+    contributions, not the last one written.
+
+    Performance: the first assignment to a key stores a writable copy
+    of the ndarray; all subsequent assignments accumulate in place via
+    ``np.add(existing, value, out=existing)`` — no per-call ndarray
+    allocation. This replaces the prior ``self[key] = self[key] +
+    value`` formulation, which materialised a fresh array on every
+    set and was a hot spot in init at heavy ``max_mass`` (see
+    ``wiki/results/prof-init-heavy-mass.md`` Rec #2).
+
+    Tuple payloads ``(meta, ndarray)``: the ``meta`` from the first
+    assignment is preserved; the ndarray slot accumulates in place
+    across subsequent sets. Matches the prior public semantics.
+
+    The :meth:`flush` method is a no-op kept for forward compatibility
+    with code paths that batch assignments and explicitly flush after
+    the loop; the dict is always in a fully-reduced state.
+    """
 
     def __setitem__(self, key, value):
-        if key not in self:
-            super(AdditiveDictionary, self).__setitem__(key, value)
+        existing = super(AdditiveDictionary, self).get(key)
+        if existing is None:
+            # First assignment under this key. Store a writable copy so
+            # in-place accumulation across subsequent sets does not
+            # mutate the caller's input array.
+            if isinstance(value, tuple):
+                meta, arr = value
+                if isinstance(arr, np.ndarray):
+                    super(AdditiveDictionary, self).__setitem__(
+                        key, (meta, arr.copy())
+                    )
+                else:
+                    super(AdditiveDictionary, self).__setitem__(key, value)
+            elif isinstance(value, np.ndarray):
+                super(AdditiveDictionary, self).__setitem__(key, value.copy())
+            else:
+                super(AdditiveDictionary, self).__setitem__(key, value)
         elif isinstance(value, tuple):
-            super(AdditiveDictionary, self).__setitem__(
-                key, (self[key][0], value[1] + self[key][1])
-            )
+            # Tuple slot: meta is preserved from the first assignment.
+            # Accumulate the array payload in place when both are
+            # ndarrays; fall back to a fresh tuple for scalar payloads.
+            old_meta, old_arr = existing
+            new_arr = value[1]
+            if isinstance(old_arr, np.ndarray) and isinstance(new_arr, np.ndarray):
+                np.add(old_arr, new_arr, out=old_arr)
+            else:
+                super(AdditiveDictionary, self).__setitem__(
+                    key, (old_meta, old_arr + new_arr)
+                )
+        elif isinstance(existing, np.ndarray) and isinstance(value, np.ndarray):
+            np.add(existing, value, out=existing)
         else:
-            super(AdditiveDictionary, self).__setitem__(key, self[key] + value)
+            # Non-ndarray fallback (preserves the old generic-add path).
+            super(AdditiveDictionary, self).__setitem__(key, existing + value)
+
+    def flush(self):
+        """No-op: the dict is always fully reduced. Provided as a
+        forward-compatible hook for callers that batch assignments and
+        flush explicitly after the loop."""
+        return None
 
 
 class PrinceProgressBar(object):
