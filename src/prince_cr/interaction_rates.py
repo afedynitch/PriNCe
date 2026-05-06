@@ -223,15 +223,53 @@ class PhotoNuclearInteractionRate(object):
 
         # ----- pre-sample 2D antiderivatives once -----
         # diff: dict[(mo,da)] → ΔΔR̂ of shape (dcr+dph-1, 2*dcr-1)
+        # Rec #3: batch the per-channel `intp2d.ev(...)` — at m=245
+        # this loop fired 2600 spline evals on the same fixed grid.
+        # `ResponseFunction` precomputes a stacked
+        # `BilinearGrid2D((nx, ny, n_ch))` for shared-grid channels;
+        # one batched call replaces the per-channel loop. Falls back
+        # to the per-channel path if the shared-grid invariant
+        # somehow doesn't hold for this DB.
         diff_ddR = {}
         if resp.incl_diff_intp_integral:
             Y2d, X2d = np.meshgrid(y_grid, x_grid, indexing="ij")
             Yflat, Xflat = Y2d.ravel(), X2d.ravel()
             shape2d = Y2d.shape
-            for key, intp2d in resp.incl_diff_intp_integral.items():
-                R = intp2d.ev(Xflat, Yflat).reshape(shape2d)
-                ddR = R[1:, 1:] - R[1:, :-1] - R[:-1, 1:] + R[:-1, :-1]
-                diff_ddR[key] = ddR
+            stack_intp = getattr(resp, "incl_diff_integral_stack_intp", None)
+            stack_keys = getattr(resp, "incl_diff_integral_keys", None)
+            if stack_intp is not None and stack_keys:
+                # Batched path: one bilinear lookup, shape (n_pts, n_ch)
+                # then reshape to (*shape2d, n_ch). The slot-3 axis is
+                # the channel index from `stack_keys`.
+                R_stack = stack_intp.ev(Xflat, Yflat).reshape(*shape2d, len(stack_keys))
+                ddR_stack = (
+                    R_stack[1:, 1:, :]
+                    - R_stack[1:, :-1, :]
+                    - R_stack[:-1, 1:, :]
+                    + R_stack[:-1, :-1, :]
+                )
+                for i, key in enumerate(stack_keys):
+                    diff_ddR[key] = ddR_stack[..., i]
+                # Any channels left uncovered by the stack (shouldn't
+                # happen in practice — every channel shares the FLUKA
+                # ygrid — but the fallback keeps us correct). Use the
+                # per-channel `.ev` for those keys only.
+                if len(stack_keys) != len(resp.incl_diff_intp_integral):
+                    covered = set(stack_keys)
+                    for key, intp2d in resp.incl_diff_intp_integral.items():
+                        if key in covered:
+                            continue
+                        R = intp2d.ev(Xflat, Yflat).reshape(shape2d)
+                        diff_ddR[key] = (
+                            R[1:, 1:] - R[1:, :-1] - R[:-1, 1:] + R[:-1, :-1]
+                        )
+            else:
+                # No stacked tensor (shared-grid invariant violated, or
+                # an older ResponseFunction without the stack attr).
+                for key, intp2d in resp.incl_diff_intp_integral.items():
+                    R = intp2d.ev(Xflat, Yflat).reshape(shape2d)
+                    ddR = R[1:, 1:] - R[1:, :-1] - R[:-1, 1:] + R[:-1, :-1]
+                    diff_ddR[key] = ddR
 
         # ----- iterate channels and fill _batch_matrix -----
         x_cut = config.x_cut

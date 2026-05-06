@@ -4,7 +4,11 @@ in different modules of this project."""
 import inspect
 
 import numpy as np
-from scipy.interpolate import InterpolatedUnivariateSpline, RectBivariateSpline
+from scipy.interpolate import (
+    InterpolatedUnivariateSpline,
+    RectBivariateSpline,
+    RegularGridInterpolator,
+)
 import prince_cr.config as config
 
 
@@ -97,6 +101,63 @@ class RectBivariateSplineNoExtrap(RectBivariateSpline):
             # result[np.isnan(result)] = 0.
             # return result
             return np.where(np.isnan(result), 0.0, result)
+
+
+class BilinearGrid2D(object):
+    """Bilinear interpolator with zero-extrapolation, with the same
+    ``.ev(x, y)`` / ``__call__`` surface as ``RectBivariateSplineNoExtrap``.
+
+    Backed by :class:`scipy.interpolate.RegularGridInterpolator`
+    (``method='linear'``, ``bounds_error=False``, ``fill_value=0``),
+    which matches the wrapper's "NaN-replace with 0 outside the domain"
+    behaviour because RGI's bilinear path on an in-domain query is
+    bit-exact with FITPACK's ``kx=ky=1, s=0`` spline (verified at
+    1e-16 abs).
+
+    Constructed and evaluated faster than ``RectBivariateSplineNoExtrap``
+    for the regular-grid case used by ``incl_diff_intp_integral``: no
+    FITPACK knot-fitting overhead, and ``.ev`` is a vectorised pure-
+    numpy bilinear lookup. Used by ``ResponseFunction`` (Rec #3 of
+    ``wiki/results/prof-init-heavy-mass.md``).
+    """
+
+    def __init__(self, xgrid, ygrid, zgrid, xbins=None):
+        self.xgrid = np.asarray(xgrid)
+        self.ygrid = np.asarray(ygrid)
+        self.zgrid = np.asarray(zgrid)
+        self.xbins = xbins
+        self.xmin, self.xmax = float(self.xgrid[0]), float(self.xgrid[-1])
+        self.ymin, self.ymax = float(self.ygrid[0]), float(self.ygrid[-1])
+        self._rgi = RegularGridInterpolator(
+            (self.xgrid, self.ygrid),
+            self.zgrid,
+            method="linear",
+            bounds_error=False,
+            fill_value=0.0,
+        )
+
+    def ev(self, x, y):
+        x = np.asarray(x)
+        y = np.asarray(y)
+        pts = np.column_stack([x.ravel(), y.ravel()])
+        out = self._rgi(pts)
+        # When the underlying values array has trailing axes (channel-
+        # stacked), preserve them in the output shape.
+        trailing = out.shape[1:] if out.ndim > 1 else ()
+        return out.reshape(x.shape + trailing)
+
+    def __call__(self, x, y, **kwargs):
+        # Mirrors ``RectBivariateSplineNoExtrap.__call__``: the default
+        # path meshgrids the inputs (returning a 2D result).
+        if "grid" not in kwargs or kwargs.get("grid") is True:
+            x = np.asarray(x)
+            y = np.asarray(y)
+            X, Y = np.meshgrid(x, y, indexing="xy")
+            pts = np.column_stack([X.ravel(), Y.ravel()])
+            out = self._rgi(pts)
+            trailing = out.shape[1:] if out.ndim > 1 else ()
+            return out.reshape(X.shape + trailing).T
+        return self.ev(x, y)
 
 
 class RectBivariateSplineLogData(RectBivariateSplineNoExtrap):
