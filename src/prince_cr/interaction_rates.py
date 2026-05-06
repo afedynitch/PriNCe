@@ -658,8 +658,24 @@ class PhotoNuclearInteractionRate(object):
             # Sparsity-pattern contract (see CLAUDE.md): only `data` is mutated;
             # `indices`/`indptr` were fixed by `_init_coupling_mat`. SpMV backends
             # (scipy/MKL/cupy) rely on the pattern being intact.
+            #
+            # In-place refresh into the existing ``coupling_mat.data`` buffer.
+            # ``self.coupling_mat.data = scale_fac * self._batch_vec`` allocates
+            # a fresh ndarray every cache window — at production grid that's
+            # ~1.7 M float64 = ~13 MB allocated + freed ~100×/solve, which
+            # showed up as ~23 ms/window in the line profile (the scipy
+            # backend's per-window cost is ~150 ms of which 23 ms was this
+            # rebind alone). Writing into the pinned buffer also keeps any
+            # MKL Sparse BLAS handle that pinned ``coupling_mat.data`` valid
+            # across windows (relevant if the MKL handle ever wraps the
+            # downstream ``M`` directly rather than its ``M_off`` copy).
             assert self.coupling_mat.data.size == self._batch_vec.size
-            self.coupling_mat.data = scale_fac * self._batch_vec
+            if scale_fac == 1.0:
+                np.copyto(self.coupling_mat.data, self._batch_vec)
+            else:
+                np.multiply(
+                    self._batch_vec, scale_fac, out=self.coupling_mat.data
+                )
 
     def get_hadr_jacobian(self, z, scale_fac=1.0, force_update=False, pfield=None):
         """Returns the nonel rate vector and coupling matrix."""
