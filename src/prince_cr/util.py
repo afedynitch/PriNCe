@@ -263,20 +263,73 @@ def bin_widths(bin_edges):
 
 
 class AdditiveDictionary(dict):
-    """This dictionary subclass adds values if keys are
-    are already present instead of overwriting. For value tuples
-    only the second argument is added and the first kept to its
-    original value."""
+    """Dictionary subclass: subsequent assignments to the same key are
+    summed into the existing entry instead of overwriting it.
+
+    Used by the cross-section decay-chain reducer
+    (``cross_sections/base.py:_DecayChainReducer``), which stores per
+    ``(mother, daughter)`` cross-section contributions across many
+    chain branches and expects the final value to be the *sum* of all
+    contributions, not the last one written.
+
+    Performance: the first assignment to a key stores a writable copy
+    of the ndarray; all subsequent assignments accumulate in place via
+    ``np.add(existing, value, out=existing)`` — no per-call ndarray
+    allocation. This replaces the prior ``self[key] = self[key] +
+    value`` formulation, which materialised a fresh array on every
+    set and was a hot spot in init at heavy ``max_mass`` (see
+    ``wiki/results/prof-init-heavy-mass.md`` Rec #2).
+
+    Tuple payloads ``(meta, ndarray)``: the ``meta`` from the first
+    assignment is preserved; the ndarray slot accumulates in place
+    across subsequent sets. Matches the prior public semantics.
+
+    The :meth:`flush` method is a no-op kept for forward compatibility
+    with code paths that batch assignments and explicitly flush after
+    the loop; the dict is always in a fully-reduced state.
+    """
 
     def __setitem__(self, key, value):
-        if key not in self:
-            super(AdditiveDictionary, self).__setitem__(key, value)
+        existing = super(AdditiveDictionary, self).get(key)
+        if existing is None:
+            # First assignment under this key. Store a writable copy so
+            # in-place accumulation across subsequent sets does not
+            # mutate the caller's input array.
+            if isinstance(value, tuple):
+                meta, arr = value
+                if isinstance(arr, np.ndarray):
+                    super(AdditiveDictionary, self).__setitem__(
+                        key, (meta, arr.copy())
+                    )
+                else:
+                    super(AdditiveDictionary, self).__setitem__(key, value)
+            elif isinstance(value, np.ndarray):
+                super(AdditiveDictionary, self).__setitem__(key, value.copy())
+            else:
+                super(AdditiveDictionary, self).__setitem__(key, value)
         elif isinstance(value, tuple):
-            super(AdditiveDictionary, self).__setitem__(
-                key, (self[key][0], value[1] + self[key][1])
-            )
+            # Tuple slot: meta is preserved from the first assignment.
+            # Accumulate the array payload in place when both are
+            # ndarrays; fall back to a fresh tuple for scalar payloads.
+            old_meta, old_arr = existing
+            new_arr = value[1]
+            if isinstance(old_arr, np.ndarray) and isinstance(new_arr, np.ndarray):
+                np.add(old_arr, new_arr, out=old_arr)
+            else:
+                super(AdditiveDictionary, self).__setitem__(
+                    key, (old_meta, old_arr + new_arr)
+                )
+        elif isinstance(existing, np.ndarray) and isinstance(value, np.ndarray):
+            np.add(existing, value, out=existing)
         else:
-            super(AdditiveDictionary, self).__setitem__(key, self[key] + value)
+            # Non-ndarray fallback (preserves the old generic-add path).
+            super(AdditiveDictionary, self).__setitem__(key, existing + value)
+
+    def flush(self):
+        """No-op: the dict is always fully reduced. Provided as a
+        forward-compatible hook for callers that batch assignments and
+        flush explicitly after the loop."""
+        return None
 
 
 class PrinceProgressBar(object):

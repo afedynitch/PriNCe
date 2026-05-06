@@ -95,6 +95,12 @@ class PhotoNuclearInteractionRate(object):
         dcr = self.e_cosmicray.d
         dph = self.e_photon.d
 
+        # O(1) membership lookups; the list-form versions remain in
+        # place for any external readers but the inner loop does not
+        # touch them. See `wiki/results/prof-init-heavy-mass.md` Rec #2.
+        bc_set = self.cross_sections.known_bc_channels_set
+        diff_set = self.cross_sections.known_diff_channels_set
+
         batch_dim = 0
         for specid in self.spec_man.known_species:
             if not is_nucleus(specid):
@@ -103,9 +109,9 @@ class PhotoNuclearInteractionRate(object):
             batch_dim += dcr
             for rtup in self.cross_sections.reactions[specid]:
                 # Off main diagonal couplings (reinjection)
-                if rtup in self.cross_sections.known_bc_channels:
+                if rtup in bc_set:
                     batch_dim += dcr
-                elif rtup in self.cross_sections.known_diff_channels:
+                elif rtup in diff_set:
                     # Only half of the elements can be non-zero (energy conservation)
                     batch_dim += int(dcr**2 / 2) + 1
 
@@ -245,13 +251,18 @@ class PhotoNuclearInteractionRate(object):
         known_species_rev = spec_man.known_species[::-1]
         import itertools
 
+        # See `_estimate_batch_matrix` for the rationale behind the
+        # set companions; same hot-loop justification.
+        bc_set = self.cross_sections.known_bc_channels_set
+        diff_set = self.cross_sections.known_diff_channels_set
+
         for moid, daid in itertools.product(known_species_rev, known_species_rev):
             if not is_nucleus(moid):
                 continue
 
             has_nonel = moid == daid
-            in_bc = (moid, daid) in self.cross_sections.known_bc_channels
-            in_diff = (moid, daid) in self.cross_sections.known_diff_channels
+            in_bc = (moid, daid) in bc_set
+            in_diff = (moid, daid) in diff_set
 
             if in_bc or (has_nonel and not in_diff):
                 # ---- bc channel branch ----

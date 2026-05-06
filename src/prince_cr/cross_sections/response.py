@@ -20,6 +20,8 @@ class ResponseFunction(object):
         self.nonel_idcs = cross_section.nonel_idcs
         self.incl_idcs = cross_section.incl_idcs
         self.incl_diff_idcs = cross_section.incl_diff_idcs
+        # O(1) membership companion (see `CrossSectionBase`).
+        self._incl_diff_idcs_set = set(self.incl_diff_idcs)
 
         # Dictionary of reponse function interpolators
         self.nonel_intp = {}
@@ -37,7 +39,7 @@ class ResponseFunction(object):
         """
         return (
             _is_redistributed(daughter)
-            or (mother, daughter) in self.incl_diff_idcs
+            or (mother, daughter) in self._incl_diff_idcs_set
         )
 
     def get_full(self, mother, daughter, ygrid, xgrid=None):
