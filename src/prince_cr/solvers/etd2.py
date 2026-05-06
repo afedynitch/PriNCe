@@ -29,6 +29,8 @@ systems"); Hochbruck & Ostermann 2010 §2.2 for inhomogeneous source.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import scipy.sparse as sp
 
@@ -42,6 +44,191 @@ _PHI1_SMALL = 1e-6
 _PHI2_SMALL = 1e-3
 _INV_6 = 1.0 / 6.0
 _INV_24 = 1.0 / 24.0
+
+
+# Fused cupy ElementwiseKernels (Stage 3). Lazily compiled per dtype on
+# first call. The non-graph cupy path uses these directly; the graph path
+# captures their launches and reads scalar params (``h``, ``dldz``) from
+# 1-element ``raw T`` device buffers so the captured graph picks up new
+# values across replays without re-capture.
+_CUPY_KERNELS = None
+
+
+def _build_cupy_kernels(cp):
+    phi_compute = cp.ElementwiseKernel(
+        "T d, raw T hbuf",
+        "T eD, T phi1, T phi2",
+        f"""
+        T h = hbuf[0];
+        T hd = h * d;
+        T e = exp(hd);
+        eD = e;
+        T abs_hd = (hd >= T(0)) ? hd : -hd;
+        if (abs_hd > T({_PHI1_SMALL!r})) {{
+            phi1 = (e - T(1)) / hd;
+        }} else {{
+            phi1 = T(1) + hd * (T(0.5) + hd * T({_INV_6!r}));
+        }}
+        if (abs_hd > T({_PHI2_SMALL!r})) {{
+            phi2 = (e - T(1) - hd) / (hd * hd);
+        }} else {{
+            phi2 = T(0.5) + hd * (T({_INV_6!r}) + hd * T({_INV_24!r}));
+        }}
+        """,
+        "prince_etd2_phi_compute",
+    )
+    post_apply1 = cp.ElementwiseKernel(
+        "T eD, T state, T phi1, T F_phi, raw T hbuf",
+        "T a",
+        "a = eD * state + hbuf[0] * phi1 * F_phi;",
+        "prince_etd2_post_apply1",
+    )
+    post_apply2 = cp.ElementwiseKernel(
+        "T a, T F_a, T F_phi, T phi2, raw T hbuf",
+        "T state",
+        "state = a + hbuf[0] * phi2 * (F_a - F_phi);",
+        "prince_etd2_post_apply2",
+    )
+    # Fused ``out = out * dldz + b`` (apply_F tail, source-on case) and
+    # ``out = out * dldz`` (source-off case). Output writes back into the
+    # same buffer as the input so the kernel is in-place from the caller's
+    # perspective.
+    scale_b = cp.ElementwiseKernel(
+        "T x, T b, raw T dldz_buf",
+        "T y",
+        "y = x * dldz_buf[0] + b;",
+        "prince_etd2_scale_b",
+    )
+    scale_no_b = cp.ElementwiseKernel(
+        "T x, raw T dldz_buf",
+        "T y",
+        "y = x * dldz_buf[0];",
+        "prince_etd2_scale_no_b",
+    )
+    # Fused ``d = dldz · (M_diag + κ ⊙ D_diag)`` for the diagonal of
+    # ``L(z)``. Used by the cupy graph path so the entire per-step body
+    # (including the diagonal rebuild) lives inside the captured graph.
+    compute_d = cp.ElementwiseKernel(
+        "T M_diag, T kappa, T D_diag, raw T dldz_buf",
+        "T d_out",
+        "d_out = dldz_buf[0] * (M_diag + kappa * D_diag);",
+        "prince_etd2_compute_d",
+    )
+    compute_d_no_kappa = cp.ElementwiseKernel(
+        "T M_diag, raw T dldz_buf",
+        "T d_out",
+        "d_out = dldz_buf[0] * M_diag;",
+        "prince_etd2_compute_d_no_kappa",
+    )
+    return SimpleNamespace(
+        phi_compute=phi_compute,
+        post_apply1=post_apply1,
+        post_apply2=post_apply2,
+        scale_b=scale_b,
+        scale_no_b=scale_no_b,
+        compute_d=compute_d,
+        compute_d_no_kappa=compute_d_no_kappa,
+    )
+
+
+def cupy_kernels():
+    """Return the (lazily compiled) Stage 3 cupy ElementwiseKernel set.
+
+    Module-level singleton — first call imports cupy and builds the
+    kernels; subsequent calls return the cached namespace. ElementwiseKernel
+    objects compile their CUDA source on first launch per dtype, not on
+    construction, so this call is cheap.
+    """
+    global _CUPY_KERNELS
+    if _CUPY_KERNELS is None:
+        import cupy as cp
+
+        _CUPY_KERNELS = _build_cupy_kernels(cp)
+    return _CUPY_KERNELS
+
+
+# Custom warp-per-row CSR SpMV. Required for the CUDA Graph path because
+# cupy 14 explicitly blocks cuSPARSE calls during stream capture
+# ("NotImplementedError: calling cuSPARSE API during stream capture is
+# currently unsupported", `_setStream` in cusparse.pyx). The kernel is
+# also used for the eager fused path so both code paths exercise the
+# same SpMV implementation — see :class:`UHECRPropagationSolverETD2`.
+_CSR_SPMV_CACHE = {}
+
+
+def _csr_spmv_kernel(dtype, accumulate):
+    """Compile (cached) a warp-per-row CSR SpMV ``RawKernel``.
+
+    ``accumulate=False`` writes ``y = A·x``; ``accumulate=True`` writes
+    ``y = y + A·x`` (no scalar multipliers — α is fused into the
+    downstream ``scale_b`` / ``post_apply`` ElementwiseKernels). One
+    warp per row; threads in the warp stride across the row's nnz and
+    do a butterfly reduction. At the photo-hadronic ``M_off`` density
+    (~150 nnz/row) the warp loop is fed; at the FD ``D_off`` density
+    (~4 nnz/row) most lanes idle but the kernel is still cheap.
+    """
+    import cupy as cp
+
+    key = (np.dtype(dtype).name, bool(accumulate))
+    cached = _CSR_SPMV_CACHE.get(key)
+    if cached is not None:
+        return cached
+    T = "float" if np.dtype(dtype) == np.float32 else "double"
+    op = "y[row] += sum;" if accumulate else "y[row] = sum;"
+    name = f"prince_csr_spmv_{T}_{'add' if accumulate else 'set'}"
+    code = f"""
+    extern "C" __global__ void {name}(
+        const int n,
+        const int* __restrict__ indptr,
+        const int* __restrict__ indices,
+        const {T}* __restrict__ data,
+        const {T}* __restrict__ x,
+        {T}* __restrict__ y
+    ) {{
+        const int warps_per_block = blockDim.x / 32;
+        const int row = blockIdx.x * warps_per_block + (threadIdx.x / 32);
+        const int lane = threadIdx.x & 31;
+        if (row >= n) return;
+        const int row_start = indptr[row];
+        const int row_end = indptr[row + 1];
+        {T} sum = ({T})0;
+        for (int j = row_start + lane; j < row_end; j += 32) {{
+            sum += data[j] * x[indices[j]];
+        }}
+        // Warp shuffle reduction.
+        for (int offset = 16; offset > 0; offset >>= 1) {{
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }}
+        if (lane == 0) {op}
+    }}
+    """
+    k = cp.RawKernel(code, name)
+    _CSR_SPMV_CACHE[key] = k
+    return k
+
+
+_CSR_SPMV_THREADS = 128  # 4 warps/block — light occupancy works for our row count
+
+
+def csr_spmv(M, x, y, accumulate=False):
+    """Run the custom CSR SpMV on the active stream.
+
+    ``M`` is a ``cupyx.scipy.sparse.csr_matrix`` (or anything exposing
+    ``indptr`` / ``indices`` / ``data`` cupy arrays); ``x`` and ``y``
+    are dense cupy ndarrays of compatible dtype and length ``M.shape[0]``.
+    Capture-friendly: no host syncs, no allocations, no cuSPARSE calls.
+    """
+    n = M.shape[0]
+    if n == 0:
+        return
+    k = _csr_spmv_kernel(M.dtype, accumulate)
+    warps = n
+    blocks = (warps * 32 + _CSR_SPMV_THREADS - 1) // _CSR_SPMV_THREADS
+    k(
+        (blocks,),
+        (_CSR_SPMV_THREADS,),
+        (n, M.indptr, M.indices, M.data, x, y),
+    )
 
 
 def split_operator(L):
@@ -109,7 +296,7 @@ def _step_buffers(dim, xp=np, dtype=None):
     """
     if dtype is None:
         dtype = xp.float32 if xp is not np else xp.float64
-    return {
+    bufs = {
         "hD": xp.empty(dim, dtype=dtype),
         "eD": xp.empty(dim, dtype=dtype),
         "phi1": xp.empty(dim, dtype=dtype),
@@ -129,6 +316,15 @@ def _step_buffers(dim, xp=np, dtype=None):
         "F_a": xp.empty(dim, dtype=dtype),
         "a": xp.empty(dim, dtype=dtype),
     }
+    if xp is not np:
+        # Stage 3 fused kernels read ``h`` from a 1-element ``raw T``
+        # device buffer so a captured CUDA Graph can pick up updated
+        # ``h`` between replays without re-capture (uniform z-grid means
+        # the value never actually changes within a solve, but we keep
+        # the buffer for the truncated-final-step edge case and for
+        # symmetry with the per-step ``dldz_buf``).
+        bufs["h_buf"] = xp.empty(1, dtype=dtype)
+    return bufs
 
 
 def _compute_diag_factors(h, d, bufs, xp):
@@ -206,7 +402,16 @@ def etd2_step(state, h, d, apply_F, bufs, xp):
         F(x) = L_off · x + b
         a   = exp(h*D) * state + h * phi1(h*D) * F(state)
         state <- a + h * phi2(h*D) * (F(a) - F(state))
+
+    Dispatches to the fused-kernel cupy variant when ``xp`` isn't numpy.
     """
+    if xp is np:
+        return _etd2_step_numpy(state, h, d, apply_F, bufs)
+    return _etd2_step_cupy(state, h, d, apply_F, bufs)
+
+
+def _etd2_step_numpy(state, h, d, apply_F, bufs):
+    """Host-side ETD2 step. The original ufunc-chain implementation."""
     eD = bufs["eD"]
     phi1 = bufs["phi1"]
     phi2 = bufs["phi2"]
@@ -215,23 +420,59 @@ def etd2_step(state, h, d, apply_F, bufs, xp):
     F_a = bufs["F_a"]
     a = bufs["a"]
 
-    _compute_diag_factors(h, d, bufs, xp)
+    _compute_diag_factors(h, d, bufs, np)
 
     apply_F(state, F_phi)
 
     # a = eD * state + h * phi1 * F_phi
-    xp.multiply(eD, state, out=a)
-    xp.multiply(phi1, F_phi, out=scratch)
+    np.multiply(eD, state, out=a)
+    np.multiply(phi1, F_phi, out=scratch)
     scratch *= h
-    xp.add(a, scratch, out=a)
+    np.add(a, scratch, out=a)
 
     apply_F(a, F_a)
 
     # state <- a + h * phi2 * (F_a - F_phi)
-    xp.subtract(F_a, F_phi, out=scratch)
+    np.subtract(F_a, F_phi, out=scratch)
     scratch *= h
-    xp.multiply(scratch, phi2, out=scratch)
-    xp.add(a, scratch, out=state)
+    np.multiply(scratch, phi2, out=scratch)
+    np.add(a, scratch, out=state)
+    return state
+
+
+def _etd2_step_cupy(state, h, d, apply_F, bufs):
+    """Stage 3 fused-kernel cupy step.
+
+    Replaces the per-step ufunc chain (~17 launches in
+    ``_compute_diag_factors`` + 4 launches each in the two post-apply
+    blocks) with three ElementwiseKernels — ``phi_compute``,
+    ``post_apply1``, ``post_apply2`` — for a measured ~30 launches/step
+    saved at production grid (see wiki/results/prof-etd2-launch-bound.md).
+
+    ``apply_F`` itself remains the caller's responsibility (cupy variant
+    in :class:`UHECRPropagationSolverETD2._make_apply_F_cupy`); its
+    ``out *= dldz; out += b`` tail is fused into a single ElementwiseKernel
+    on the propagation side using :func:`cupy_kernels`.
+    """
+    K = cupy_kernels()
+    eD = bufs["eD"]
+    phi1 = bufs["phi1"]
+    phi2 = bufs["phi2"]
+    F_phi = bufs["F_phi"]
+    F_a = bufs["F_a"]
+    a = bufs["a"]
+    h_buf = bufs["h_buf"]
+
+    # Refresh the 1-element ``h`` buffer the kernels read. Cheap (~µs)
+    # and the value is constant for almost every step in a uniform
+    # z-grid; kept per-step for the truncated-final-step edge case.
+    h_buf[0] = h
+
+    K.phi_compute(d, h_buf, eD, phi1, phi2)
+    apply_F(state, F_phi)
+    K.post_apply1(eD, state, phi1, F_phi, h_buf, a)
+    apply_F(a, F_a)
+    K.post_apply2(a, F_a, F_phi, phi2, h_buf, state)
     return state
 
 
