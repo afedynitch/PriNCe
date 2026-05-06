@@ -119,6 +119,12 @@ def _step_buffers(dim, xp=np, dtype=None):
         "abs_hD": xp.empty(dim, dtype=dtype),
         "mask1": xp.empty(dim, dtype=xp.bool_),
         "mask2": xp.empty(dim, dtype=xp.bool_),
+        # Inverted mask scratch — reused for the two ``copyto(where=)``
+        # patches per ``_compute_diag_factors`` call. Without these
+        # buffers ``xp.logical_not(mask)`` allocates a fresh bool array
+        # each call (4×/step → ~6 µs each at dim_states ≈ 6 k).
+        "not_mask1": xp.empty(dim, dtype=xp.bool_),
+        "not_mask2": xp.empty(dim, dtype=xp.bool_),
         "F_phi": xp.empty(dim, dtype=dtype),
         "F_a": xp.empty(dim, dtype=dtype),
         "a": xp.empty(dim, dtype=dtype),
@@ -147,6 +153,8 @@ def _compute_diag_factors(h, d, bufs, xp):
     abs_hD = bufs["abs_hD"]
     mask1 = bufs["mask1"]
     mask2 = bufs["mask2"]
+    not_mask1 = bufs["not_mask1"]
+    not_mask2 = bufs["not_mask2"]
 
     xp.multiply(d, h, out=hD)
     xp.exp(hD, out=eD)
@@ -158,8 +166,9 @@ def _compute_diag_factors(h, d, bufs, xp):
     # 1.0 fallback so we never divide by zero, even where the result
     # will be discarded).
     xp.greater(abs_hD, _PHI1_SMALL, out=mask1)
+    xp.invert(mask1, out=not_mask1)
     xp.copyto(scratch, hD)
-    xp.copyto(scratch, 1.0, where=xp.logical_not(mask1))
+    xp.copyto(scratch, 1.0, where=not_mask1)
     # phi1 = (eD - 1) / scratch (analytic value where mask1 is True)
     xp.subtract(eD, 1.0, out=phi1)
     xp.divide(phi1, scratch, out=phi1)
@@ -168,13 +177,14 @@ def _compute_diag_factors(h, d, bufs, xp):
     xp.add(scratch2, 0.5, out=scratch2)
     xp.multiply(scratch2, hD, out=scratch2)
     xp.add(scratch2, 1.0, out=scratch2)
-    xp.copyto(phi1, scratch2, where=xp.logical_not(mask1))
+    xp.copyto(phi1, scratch2, where=not_mask1)
 
     # phi2: analytic (eD - 1 - hD) / hD² where |hD| > _PHI2_SMALL,
     #       Taylor 1/2 + hD/6 + hD²/24 elsewhere.
     xp.greater(abs_hD, _PHI2_SMALL, out=mask2)
+    xp.invert(mask2, out=not_mask2)
     xp.multiply(hD, hD, out=scratch)
-    xp.copyto(scratch, 1.0, where=xp.logical_not(mask2))
+    xp.copyto(scratch, 1.0, where=not_mask2)
     xp.subtract(eD, 1.0, out=phi2)
     xp.subtract(phi2, hD, out=phi2)
     xp.divide(phi2, scratch, out=phi2)
@@ -182,7 +192,7 @@ def _compute_diag_factors(h, d, bufs, xp):
     xp.add(scratch2, _INV_6, out=scratch2)
     xp.multiply(scratch2, hD, out=scratch2)
     xp.add(scratch2, 0.5, out=scratch2)
-    xp.copyto(phi2, scratch2, where=xp.logical_not(mask2))
+    xp.copyto(phi2, scratch2, where=not_mask2)
 
 
 def etd2_step(state, h, d, apply_F, bufs, xp):
