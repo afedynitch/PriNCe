@@ -154,15 +154,6 @@ MKL_threads = 16
 # Sparse matrix-vector product from "CUPY"|"MKL"|"scipy"
 linear_algebra_backend = "CUPY"
 
-# Hybrid CPU/GPU lookahead: upload ``_batch_matrix`` to GPU once and route
-# the dense cache-rebuild matvec through cupy on a non-blocking stream so
-# the GPU dgemv for cache anchor k+1 overlaps with the CPU's ETD2 steps in
-# cache window k. Per-step SpMVs and state buffers stay on host. Default
-# False; superseded for most workloads by the full-GPU ``"cupy"`` backend
-# (which keeps everything on-device). Kept for hosts where MKL Sparse BLAS
-# beats cuSPARSE on the per-step SpMV but the dense matvec is the bottleneck.
-use_cupy_dense_lookahead = False
-
 # MKL Sparse BLAS block size for the photo-hadronic ``M_off`` matrix.
 # ``None`` keeps it CSR; an integer ≥ 2 stores it as BSR with that
 # block size (auto-padding the matrix). Per-op BSR(bs=2) is ~5 % faster
@@ -251,7 +242,6 @@ class BackendConfig:
 
     linear_algebra_backend: str = ""
     use_cuda_graphs: bool = False
-    use_cupy_dense_lookahead: bool = False
     use_mkl_dense_matvec: bool = False
     cupy_dtype: str = "float64"
     cupy_xs_dtype: Optional[str] = "float32"
@@ -270,7 +260,6 @@ class BackendConfig:
         return cls(
             linear_algebra_backend=linear_algebra_backend,
             use_cuda_graphs=use_cuda_graphs,
-            use_cupy_dense_lookahead=use_cupy_dense_lookahead,
             use_mkl_dense_matvec=use_mkl_dense_matvec,
             cupy_dtype=cupy_dtype,
             cupy_xs_dtype=cupy_xs_dtype,

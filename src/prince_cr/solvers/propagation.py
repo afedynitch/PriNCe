@@ -16,6 +16,21 @@ from .partial_diff import DifferentialOperator
 _DEFAULT = object()
 
 
+def _resolve_prince_run(args, kwargs):
+    """Pull ``prince_run`` from positional/keyword args of the solver constructor.
+
+    Both façade ``__new__`` dispatchers need this to pick a backend subclass
+    before ``__init__`` runs.
+    """
+    if "prince_run" in kwargs:
+        return kwargs["prince_run"]
+    if len(args) >= 3:
+        return args[2]
+    raise TypeError(
+        "ETD2 solver constructor requires `prince_run` (positional or keyword)."
+    )
+
+
 class UHECRPropagationResult(object):
     """Reduced version of solver class, that only holds the result vector and defined add and multiply"""
 
@@ -269,11 +284,21 @@ class UHECRPropagationSolver(object):
         else:
             return f * self.list_of_sources[0].injection_rate(z)
 
+
 class UHECRPropagationSolverETD2(UHECRPropagationSolver):
     """Exponential time-differencing RK2 (Cox-Matthews) integrator.
 
-    Treats the diagonal of ``L(z) = J(z) + dl/dz · D · diag(κ(z))`` exactly
-    via ``exp(h · diag(L))`` and the off-diagonal block with two SpMVs per
+    This is the algorithm parent. Construct it directly and ``__new__``
+    dispatches to the appropriate backend subclass:
+
+    * ``ETD2SolverCPU`` for ``linear_algebra_backend in {"scipy", "mkl"}``
+    * ``ETD2SolverCUPY`` for ``linear_algebra_backend == "cupy"`` (eager
+      fused kernels by default; CUDA Graph capture/replay when
+      ``backend.use_cuda_graphs`` is True).
+
+    The ETD2 method treats the diagonal of
+    ``L(z) = J(z) + dl/dz · D · diag(κ(z))`` exactly via
+    ``exp(h · diag(L))`` and the off-diagonal block with two SpMVs per
     stage (4 SpMVs / step). Source term ``b(z) = injection(z)`` enters via
     the same φ₁/φ₂ machinery, frozen at step start to preserve 2nd order.
 
@@ -285,210 +310,77 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
     recomputed every step.
     """
 
+    def __new__(cls, *args, **kwargs):
+        if cls is UHECRPropagationSolverETD2:
+            prince_run = _resolve_prince_run(args, kwargs)
+            backend = prince_run.backend.linear_algebra_backend.lower()
+            target = ETD2SolverCUPY if backend == "cupy" else ETD2SolverCPU
+            return object.__new__(target)
+        return object.__new__(cls)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Pieces refreshed at ``recomp_z_threshold`` resolution (z tracked by
         # ``self.current_z_rates`` from the base class).
         self._etd2_M_raw_diag = None
         self._etd2_M_raw_off = None
-        # MKL handle wrapping `_etd2_M_raw_off`. Built once at the first
-        # cache window and reused across subsequent windows via in-place
-        # value updates — the photo-hadronic sparsity pattern is fixed at
-        # init (see CLAUDE.md "Matrix Updates"), so MKL's optimised layout
-        # remains valid as the data values change.
-        self._etd2_M_raw_off_mkl = None
-        # Index map: for each entry in M_off.data, the position in
-        # M_raw.data it came from. Populated once at the first cache
-        # window so subsequent windows can do
-        # ``M_off.data[:] = M_raw.data[off_to_M_idx]`` without re-running
-        # split_operator + mkl_sparse_optimize.
-        self._etd2_M_off_to_M_idx = None
-        self._etd2_M_diag_to_M_idx = None
         # κ_pair(z) is expensive (CIB interpolated at dim_cr × xi_steps points).
         # κ_adia(z) is closed-form and trivially cheap, recomputed per step.
         self._etd2_kappa_pair_cached = None
-        # Constant pieces, populated on first solve().
+        # Constant (or one-shot per solve) FD operator split.
         self._etd2_D_diag = None
         self._etd2_D_off = None
-        # MKL handle wrapping `_etd2_D_off`. One-shot for the whole solve.
-        self._etd2_D_off_mkl = None
-        # Persistent per-step host scratch buffers. Sized to ``dim_states``
-        # at solve() start. Reused across all steps to keep the
-        # ``_operator_at`` body alloc-free on the hot path.
-        self._etd2_d_buf = None
+        # Host scratch for κ accumulation. Used by both backends — the cupy
+        # path uploads from this buffer to a device counterpart.
         self._etd2_kappa_buf = None
-        self._etd2_kx_buf = None
-        # Mutable per-step parameter holder, captured by the persistent
-        # apply_F closure. ``dldz`` is a python float scalar; ``b`` is
-        # either None or a per-step injection vector that we copy into
-        # ``self._etd2_b_buf`` so the closure can read a fixed buffer.
+        # Persistent ``apply_F`` closure. Identity is stable for a solve.
         self._etd2_apply_F = None
-        self._etd2_apply_F_params = {"dldz": 1.0, "kappa": None, "b": None}
-        self._etd2_b_buf = None
+
         self._backend = self.backend.linear_algebra_backend.lower()
-        # The full-GPU cupy backend reuses the dense-matvec lookahead
-        # plumbing from the CPU/GPU hybrid backend (handled in
-        # ``interaction_rates``) but consumes the result on-device.
         self._is_cupy_backend = self._backend == "cupy"
-        # CPU/GPU hybrid lookahead state. Populated at solve() start
-        # when ``config.use_cupy_dense_lookahead`` is True; reset after.
-        self._lookahead_anchors = None
-        self._next_anchor_idx = 0
-        # cupy persistent device buffers. Allocated once per solve (in
-        # :meth:`_ensure_apply_F_cupy`) and held for the whole integration
-        # so the per-step body is alloc-free — required for kernel fusion
-        # to pay off at the per-step scale and for stable buffer addresses
-        # inside captured CUDA Graphs. Per-step values (kappa, b, dldz, d)
-        # are refreshed in place; cache-window-bound values (M_diag,
-        # D_diag) are referenced by the apply_F closure and rebound on
-        # cache window refresh.
-        self._etd2_d_buf_cp = None
-        self._etd2_kappa_buf_cp = None
-        self._etd2_b_buf_cp = None
-        self._etd2_kx_buf_cp = None
-        self._etd2_dldz_buf_cp = None
-        # Mutable closure-state for the cupy apply_F. Rebound on each
-        # ``_refresh_z_caches`` because ``split_operator`` returns fresh
-        # cupy CSR arrays at every cache window (the host path keeps
-        # the same handles via in-place data updates; the GPU path
-        # currently re-splits — see :meth:`_refresh_z_caches`).
-        self._etd2_apply_F_state_cp = None
-        # CUDA Graph machinery. Allocated lazily when
-        # ``config.use_cuda_graphs`` is True. Re-captured on each cache
-        # window refresh because the SpMV kernel calls inside
-        # ``apply_F`` close over the current ``M_off`` / ``D_off``
-        # cupy CSRs whose pointers go stale across windows.
-        self._etd2_graph_exec = None
-        self._etd2_graph_stream = None
-        self._etd2_graph_state_buf = None
-        self._etd2_graph_needs_capture = True
 
+    # ------------------------------------------------------------------
+    # Abstract API — implemented by backend subclasses.
+    # ------------------------------------------------------------------
     def _refresh_z_caches(self, z):
-        """Refresh all rate-cache-window-bound pieces at z.
+        raise NotImplementedError
 
-        Bundles the photo-hadronic matrix and the pair-production loss
-        vector — both expensive and both naturally tied to the same z
-        resolution. Cheap pieces (adiabatic κ, dl/dz, source b(z)) stay
-        per-step.
-        """
-        from .etd2 import split_operator
+    def _operator_at(self, z):
+        raise NotImplementedError
 
-        # scale_fac=1.0 → raw rate matrix (no dldz factor); we apply dldz later.
-        M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
-        if not self.enable_photohad_losses:
-            # Zero matrix with full sparsity preserved. Works for either
-            # scipy or cupy CSR — both support ``.copy()`` and slice
-            # assignment on ``.data``.
-            M = M.copy()
-            M.data[:] = 0
-
-        first_window = self._etd2_M_raw_off is None
-        if self._is_cupy_backend:
-            # Full-GPU path: ``M`` is a cupyx.scipy.sparse.csr_matrix
-            # already on-device (see :meth:`PhotoNuclearInteractionRate.
-            # _update_rates_cupy`). The xp-aware ``split_operator``
-            # returns cupy arrays. Re-splitting each cache window is a
-            # few ms on the GPU at production grid; we skip the host
-            # index-map gather for now (deferred until profile shows it
-            # matters).
-            d_M, M_off = split_operator(M)
-            self._etd2_M_raw_diag = d_M
-            self._etd2_M_raw_off = M_off
-            # The apply_F closure dereferences M_off / D_off through a
-            # mutable container so we can swap pointers here without
-            # rebuilding it. Triggers re-capture of the CUDA graph (if
-            # active) on the next ``_operator_at_cupy``.
-            self._rebind_apply_F_cupy()
-        elif first_window:
-            d_M, M_off = split_operator(M)
-            self._etd2_M_raw_diag = d_M
-            self._etd2_M_raw_off = M_off
-            self._etd2_M_off_to_M_idx, self._etd2_M_diag_to_M_idx = (
-                self._build_M_off_index_map(M, M_off)
-            )
-            if self._backend == "mkl" and config.has_mkl:
-                # optimize=False so update_data() can refresh values
-                # across cache windows without re-running mkl_sparse_optimize.
-                self._etd2_M_raw_off_mkl = self._build_mkl_handle(M_off, optimize=False)
-        else:
-            # Same sparsity pattern: refresh the values in place. The MKL
-            # handle's optimised layout is invariant under value updates.
-            M_off = self._etd2_M_raw_off
-            if not getattr(M, "has_sorted_indices", False):
-                # The index map was built against sorted M.indices, so
-                # subsequent windows must keep that invariant.
-                M.sort_indices()
-            if M_off.data.size:
-                M_off.data[:] = M.data[self._etd2_M_off_to_M_idx]
-            diag_idx = self._etd2_M_diag_to_M_idx
-            d_M = np.zeros(M.shape[0], dtype=np.float64)
-            present = diag_idx >= 0
-            d_M[present] = M.data[diag_idx[present]]
-            self._etd2_M_raw_diag = d_M
-            if self._etd2_M_raw_off_mkl is not None:
-                # Push the same data into MKL's pinned buffer (no-op if
-                # the wrapper happens to share M_off.data — keeps
-                # semantics explicit either way).
-                self._etd2_M_raw_off_mkl.update_data(M_off.data)
-
-        if self.enable_pairprod_losses:
-            self._etd2_kappa_pair_cached = self.pair_loss_rates_grid.loss_vector(z)
-        else:
-            self._etd2_kappa_pair_cached = None
-
-        self.current_z_rates = z
-
-        # CPU/GPU hybrid: dispatch the next anchor's GPU dense matvec in
-        # the background while this cache window's ETD2 steps run on CPU.
-        # The consume happens inside the next ``_refresh_z_caches`` call
-        # via ``had_int_rates._try_consume_for(z)``.
-        self._schedule_next_lookahead_anchor()
+    def _ensure_apply_F(self):
+        raise NotImplementedError
 
     def _ensure_D_split(self):
-        """Compute and cache the FD operator's diagonal/off-diagonal split."""
-        if self._etd2_D_diag is not None:
-            return
-        from .etd2 import split_operator
+        raise NotImplementedError
 
-        D = self.diff_operator
-        if not hasattr(D, "indices"):
-            D = D.tocsr()
-        d_D, D_off = split_operator(D)
-        self._etd2_D_diag = d_D
-        self._etd2_D_off = D_off
+    def _init_state(self):
+        raise NotImplementedError
 
-        if self._backend == "mkl" and config.has_mkl:
-            # D is constant for the whole solve, so the MKL handle is
-            # one-shot. optimize=True picks the inspector-executor fast
-            # path; the data values never change so the internal cache
-            # is fine.
-            if self._etd2_D_off_mkl is None:
-                # Force CSR for D_off: it's small, constant for the whole
-                # solve, and the BSR sweet spot wasn't measured for this
-                # sparsity. CSR opt=True is already fast for it.
-                self._etd2_D_off_mkl = self._build_mkl_handle(
-                    D_off, optimize=True, blocksize=None
-                )
+    def _reset_for_solve(self):
+        """Backend-specific cleanup at the start of each ``solve()`` call."""
+        pass
 
-        if self._is_cupy_backend:
-            # Full-GPU: upload D split to GPU once. Stored under the
-            # same attribute names as the host path — ``_make_apply_F_cupy``
-            # reads them as cupy arrays. Dtype follows ``config.cupy_dtype``.
-            import cupy as cp
-            import cupyx.scipy.sparse as csp
+    def _run_integration(self, state, z_grid, step_hook=None):
+        raise NotImplementedError
 
-            dt = np.dtype(self.backend.cupy_dtype)
-            self._etd2_D_diag = cp.asarray(d_D, dtype=dt)
-            D_off_cast = D_off.astype(dt)
-            self._etd2_D_off = csp.csr_matrix(
-                (
-                    cp.asarray(D_off_cast.data, dtype=dt),
-                    cp.asarray(D_off_cast.indices, dtype=cp.int32),
-                    cp.asarray(D_off_cast.indptr, dtype=cp.int32),
-                ),
-                shape=D_off_cast.shape,
-            )
+    def _finalize_state(self, state):
+        """Backend-specific post-solve transform (e.g. cupy → host array)."""
+        return state
 
+    def close(self):
+        """Release backend resources. Idempotent. Safe to skip."""
+        pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Shared utility: index-map for CPU in-place M_off refresh.
+    # ------------------------------------------------------------------
     @staticmethod
     def _build_M_off_index_map(M, M_off):
         """Pre-compute index maps from M.data into M_off.data and diag.
@@ -506,10 +398,10 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         ``mkl_sparse_d_create_csr + mkl_sparse_set_mv_hint +
         mkl_sparse_optimize`` rebuild.
 
-        Vectorized via ``numpy.searchsorted`` over flat (row, col) keys
-        — at production grid (M.nnz ≈ 1.2 M, M_off.nnz ≈ 895 k) the
-        original per-row two-pointer Python loop showed up as ~0.9 s
-        of one-shot setup time in cProfile of a 4.6 s solve. The
+        Vectorized via ``numpy.searchsorted`` over flat (row, col) keys —
+        at production grid (M.nnz ≈ 1.2 M, M_off.nnz ≈ 895 k) the
+        original per-row two-pointer Python loop showed up as ~0.9 s of
+        one-shot setup time in cProfile of a 4.6 s solve. The
         searchsorted version runs in ~5 ms while preserving the same
         contract.
 
@@ -550,13 +442,13 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # scatter is unambiguous.
         diag_to_M[diag_rows] = np.flatnonzero(diag_mask).astype(np.int64)
 
-        # Off-diagonal: build M_off keys the same way and locate each
-        # one in M_keys via searchsorted. ``M_off`` is by construction a
+        # Off-diagonal: build M_off keys the same way and locate each one
+        # in M_keys via searchsorted. ``M_off`` is by construction a
         # subset of M's off-diagonal entries (split_operator zeroed the
         # diagonal then eliminate_zeros may drop more), so every M_off
         # key is present in M_keys. searchsorted on a sorted array
-        # returns the insertion index, which equals the matching
-        # M.data index when the key is present.
+        # returns the insertion index, which equals the matching M.data
+        # index when the key is present.
         if M_off.nnz:
             Moff_rows = np.repeat(
                 np.arange(n, dtype=np.int64), np.diff(M_off.indptr)
@@ -578,51 +470,140 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         return off_to_M, diag_to_M
 
     # ------------------------------------------------------------------
-    # Hybrid-backend deterministic-grid lookahead for GPU dense matvec
+    # Outer driver. Backend subclass plugs in via _init_state /
+    # _reset_for_solve / _run_integration / _finalize_state hooks.
     # ------------------------------------------------------------------
-    def _compute_lookahead_anchors(self, z_grid):
-        """Predict the redshifts at which ``_refresh_z_caches`` will fire.
+    def solve(
+        self,
+        dz=1e-3,
+        verbose=False,
+        summary=False,
+        progressbar=False,
+    ):
+        from time import time
 
-        ETD2 walks ``z_grid[:-1]`` with ``operator_at(z_k)``; the cache
-        invalidates whenever ``|z - last_anchor| > recomp_z_threshold``.
-        That contract is deterministic — anchor[0] is z_grid[0]; each
-        subsequent anchor is the first grid point with abs(Δ) above
-        threshold from the previous anchor. The list returned here
-        feeds the GPU-dgemv lookahead.
-        """
-        anchors = []
-        last = None
-        thr = self.recomp_z_threshold
-        for z in z_grid[:-1]:
-            if last is None or abs(z - last) > thr:
-                anchors.append(float(z))
-                last = z
-        return anchors
+        start_time = time()
+        info(2, "ETD2: setting up integration")
 
-    def _lookahead_active(self):
-        return (
-            self.backend.use_cupy_dense_lookahead
-            and config.has_cupy
-            and self._lookahead_anchors is not None
+        # Sign convention: integrate from initial_z (high) to final_z (low),
+        # so step h = -dz < 0. Build a uniform grid of size dz, with the
+        # final step truncated to land exactly on final_z.
+        dz_step = -float(abs(dz))
+        n_full = int(np.floor((self.final_z - self.initial_z) / dz_step))
+        z_grid = self.initial_z + np.arange(n_full + 1) * dz_step
+        if abs(z_grid[-1] - self.final_z) > 1e-12:
+            z_grid = np.concatenate([z_grid, [self.final_z]])
+
+        # Force first-step rebuild of the cached photo-hadronic matrix
+        # and the apply_F closure pinned to the previous solve's M_off.
+        self.current_z_rates = None
+        self._etd2_M_raw_off = None
+        self._etd2_apply_F = None
+        self._reset_for_solve()
+        self._ensure_D_split()
+
+        state = self._init_state()
+        self.pre_step_hook(self.initial_z)
+
+        nsteps = len(z_grid) - 1
+        info(2, f"ETD2: integrating with {nsteps} steps of dz≈{dz_step:.2e}")
+        with PrinceProgressBar(bar_type=progressbar, nsteps=nsteps) as pbar:
+            step_hook = pbar.update if pbar.pbar is not None else None
+            self._run_integration(state, z_grid, step_hook=step_hook)
+
+        self.post_step_hook(self.final_z)
+        self.state = self._finalize_state(state)
+        end_time = time()
+        info(2, "ETD2: integration completed in {0:.2f} s".format(end_time - start_time))
+
+        if summary or verbose:
+            print("ETD2 summary:")
+            print(f"  steps: {len(z_grid) - 1}")
+            print(f"  initial z: {self.initial_z} → final z: {self.final_z}")
+            print(f"  wall time: {end_time - start_time:.3f} s")
+
+
+class ETD2SolverCPU(UHECRPropagationSolverETD2):
+    """ETD2 backend for the scipy / MKL Sparse BLAS path.
+
+    Per-step body uses scipy's CSR ``@`` (single-threaded BLAS-2) for the
+    SpMV unless ``backend.linear_algebra_backend == "mkl"``, in which
+    case the M_off / D_off are wrapped in :class:`MklSparseMatrix`
+    handles for the ``mkl_sparse_d_mv`` fast path. The photo-hadronic
+    M_off has its values refreshed in place across cache windows via a
+    pre-computed index map (see :meth:`_build_M_off_index_map`); the
+    constant FD operator D_off is built once with ``optimize=True`` and
+    held for the whole solve.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # MKL handle wrapping `_etd2_M_raw_off`. Built once at the first
+        # cache window and reused across subsequent windows via in-place
+        # value updates — the photo-hadronic sparsity pattern is fixed at
+        # init (see CLAUDE.md "Matrix Updates"), so MKL's optimised layout
+        # remains valid as the data values change.
+        self._etd2_M_raw_off_mkl = None
+        # Index map: for each entry in M_off.data, the position in
+        # M_raw.data it came from. Populated once at the first cache
+        # window so subsequent windows can do
+        # ``M_off.data[:] = M_raw.data[off_to_M_idx]`` without re-running
+        # split_operator + mkl_sparse_optimize.
+        self._etd2_M_off_to_M_idx = None
+        self._etd2_M_diag_to_M_idx = None
+        # MKL handle wrapping `_etd2_D_off`. One-shot for the whole solve.
+        self._etd2_D_off_mkl = None
+        # Persistent per-step host scratch. Sized to ``dim_states`` at
+        # solve() start. Reused across all steps.
+        self._etd2_d_buf = None
+        self._etd2_kx_buf = None
+        # Mutable per-step parameter holder, captured by the persistent
+        # apply_F closure. ``dldz`` is a python float scalar; ``b`` is
+        # either None or a per-step injection vector.
+        self._etd2_apply_F_params = {"dldz": 1.0, "kappa": None, "b": None}
+
+    # ------------------------------------------------------------------
+    # Outer-driver hooks
+    # ------------------------------------------------------------------
+    def _init_state(self):
+        return np.zeros(self.dim_states)
+
+    def _reset_for_solve(self):
+        # Drop the M_off cache + index maps; a fresh ``_refresh_z_caches``
+        # rebuilds them from the current rate matrix on the first window.
+        self._etd2_M_off_to_M_idx = None
+        self._etd2_M_diag_to_M_idx = None
+        if self._etd2_M_raw_off_mkl is not None:
+            self._etd2_M_raw_off_mkl.close()
+            self._etd2_M_raw_off_mkl = None
+
+    def _run_integration(self, state, z_grid, step_hook=None):
+        from .etd2 import integrate
+        integrate(
+            state, z_grid,
+            operator_at=self._operator_at,
+            step_hook=step_hook,
         )
 
-    def _schedule_next_lookahead_anchor(self):
-        """Dispatch the upcoming anchor's GPU rebuild, if lookahead is on."""
-        if not self._lookahead_active():
-            return
-        idx = self._next_anchor_idx
-        if idx >= len(self._lookahead_anchors):
-            return
-        z_next = self._lookahead_anchors[idx]
-        self.had_int_rates.schedule_rebuild(z_next)
-        self._next_anchor_idx = idx + 1
+    def close(self):
+        for attr in ("_etd2_M_raw_off_mkl", "_etd2_D_off_mkl"):
+            h = getattr(self, attr, None)
+            if h is not None:
+                try:
+                    h.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
+    # ------------------------------------------------------------------
+    # MKL handle factory
+    # ------------------------------------------------------------------
     def _build_mkl_handle(self, off, optimize=True, blocksize=_DEFAULT):
         """Wrap a scipy CSR/COO/etc. off-diagonal into an MklSparseMatrix.
 
-        Returns ``None`` if the matrix has zero nnz — the kernel skips the
-        SpMV in that case rather than feeding MKL an empty handle (some
-        MKL versions are squirrelly about zero-nnz CSRs).
+        Returns ``None`` if the matrix has zero nnz — the kernel skips
+        the SpMV in that case rather than feeding MKL an empty handle
+        (some MKL versions are squirrelly about zero-nnz CSRs).
 
         ``optimize=True`` chooses the inspector-executor fast path —
         ~2× faster per gemv but caches data values internally, so
@@ -648,6 +629,92 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             blocksize = self.backend.mkl_bsr_blocksize
         return mkl_sparse.MklSparseMatrix(off, blocksize=blocksize, optimize=optimize)
 
+    # ------------------------------------------------------------------
+    # Cache-window refresh + per-step operator
+    # ------------------------------------------------------------------
+    def _refresh_z_caches(self, z):
+        """Refresh all rate-cache-window-bound pieces at z.
+
+        Bundles the photo-hadronic matrix and the pair-production loss
+        vector — both expensive and both naturally tied to the same z
+        resolution. Cheap pieces (adiabatic κ, dl/dz, source b(z)) stay
+        per-step.
+        """
+        from .etd2 import split_operator
+
+        # scale_fac=1.0 → raw rate matrix (no dldz factor); we apply dldz later.
+        M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+        if not self.enable_photohad_losses:
+            # Zero matrix with full sparsity preserved.
+            M = M.copy()
+            M.data[:] = 0
+
+        first_window = self._etd2_M_raw_off is None
+        if first_window:
+            d_M, M_off = split_operator(M)
+            self._etd2_M_raw_diag = d_M
+            self._etd2_M_raw_off = M_off
+            self._etd2_M_off_to_M_idx, self._etd2_M_diag_to_M_idx = (
+                self._build_M_off_index_map(M, M_off)
+            )
+            if self._backend == "mkl" and config.has_mkl:
+                # optimize=False so update_data() can refresh values
+                # across cache windows without re-running mkl_sparse_optimize.
+                self._etd2_M_raw_off_mkl = self._build_mkl_handle(M_off, optimize=False)
+        else:
+            # Same sparsity pattern: refresh the values in place. The MKL
+            # handle's optimised layout is invariant under value updates.
+            M_off = self._etd2_M_raw_off
+            if not getattr(M, "has_sorted_indices", False):
+                # The index map was built against sorted M.indices, so
+                # subsequent windows must keep that invariant.
+                M.sort_indices()
+            if M_off.data.size:
+                M_off.data[:] = M.data[self._etd2_M_off_to_M_idx]
+            diag_idx = self._etd2_M_diag_to_M_idx
+            d_M = np.zeros(M.shape[0], dtype=np.float64)
+            present = diag_idx >= 0
+            d_M[present] = M.data[diag_idx[present]]
+            self._etd2_M_raw_diag = d_M
+            if self._etd2_M_raw_off_mkl is not None:
+                # Push the same data into MKL's pinned buffer (no-op if
+                # the wrapper happens to share M_off.data — keeps
+                # semantics explicit either way).
+                self._etd2_M_raw_off_mkl.update_data(M_off.data)
+
+        if self.enable_pairprod_losses:
+            self._etd2_kappa_pair_cached = self.pair_loss_rates_grid.loss_vector(z)
+        else:
+            self._etd2_kappa_pair_cached = None
+
+        self.current_z_rates = z
+
+    def _ensure_D_split(self):
+        """Compute and cache the FD operator's diagonal/off-diagonal split."""
+        if self._etd2_D_diag is not None:
+            return
+        from .etd2 import split_operator
+
+        D = self.diff_operator
+        if not hasattr(D, "indices"):
+            D = D.tocsr()
+        d_D, D_off = split_operator(D)
+        self._etd2_D_diag = d_D
+        self._etd2_D_off = D_off
+
+        if self._backend == "mkl" and config.has_mkl:
+            # D is constant for the whole solve, so the MKL handle is
+            # one-shot. optimize=True picks the inspector-executor fast
+            # path; the data values never change so the internal cache
+            # is fine.
+            if self._etd2_D_off_mkl is None:
+                # Force CSR for D_off: it's small, constant for the whole
+                # solve, and the BSR sweet spot wasn't measured for this
+                # sparsity. CSR opt=True is already fast for it.
+                self._etd2_D_off_mkl = self._build_mkl_handle(
+                    D_off, optimize=True, blocksize=None
+                )
+
     def _operator_at(self, z):
         """Return ``(d, apply_F)`` for the ETD2 step at redshift ``z``.
 
@@ -659,8 +726,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         κ(z) = κ_adia(z) (per-step, closed form) + κ_pair(z) (cached at
         ``recomp_z_threshold`` together with the photo-hadronic matrix).
 
-        Hot-path bookkeeping notes (CPU paths only — cupy variant lives
-        in :meth:`_operator_at_cupy`):
+        Hot-path bookkeeping notes:
 
         * ``d``, ``kappa`` and the ``apply_F`` closure are built once
           per ``solve()`` (in :meth:`_ensure_apply_F` / :meth:`solve`)
@@ -668,10 +734,9 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
           ~50 µs/step of saved alloc + closure-build overhead vs
           rebuilding both per call.
         * ``b`` is per-step (the injection rate depends on z) and is
-          pulled from ``injection(1.0, z)`` directly each step. We
-          keep a reference into the closure's mutable parameter dict
-          so the closure body can read the fresh value without being
-          rebuilt.
+          pulled from ``injection(1.0, z)`` directly each step. We keep
+          a reference into the closure's mutable parameter dict so the
+          closure body can read the fresh value without being rebuilt.
         """
         if (
             self.current_z_rates is None
@@ -680,20 +745,10 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             self._refresh_z_caches(z)
 
         if self._etd2_apply_F is None:
-            # cupy path needs host kappa scratch too —
-            # ``_ensure_apply_F_cupy`` allocates it alongside the
-            # persistent device buffers. Both branches require
-            # ``_refresh_z_caches`` to have run first (M_off must exist),
-            # which is guaranteed by the cache-window check above.
-            if self._is_cupy_backend:
-                self._ensure_apply_F_cupy()
-            else:
-                self._ensure_apply_F()
+            self._ensure_apply_F()
 
         dldz = self.dldz(z)
         if self.enable_partial_diff_jacobian:
-            # Persistent kappa buffer; lazily initialized in
-            # :meth:`_ensure_apply_F` against the host loss-vector dtype.
             kappa = self._etd2_kappa_buf
             kappa.fill(0.0)
             if self.enable_adiabatic_losses:
@@ -708,12 +763,9 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         else:
             b = None
 
-        if self._is_cupy_backend:
-            return self._operator_at_cupy(z, dldz, kappa, b)
-
         # Diagonal d = dldz · (M_raw_diag + κ ⊙ D_diag) — written into a
-        # persistent buffer; ``etd2_step`` does not retain ``d`` past
-        # the step body, so reusing the buffer is safe.
+        # persistent buffer; ``etd2_step`` does not retain ``d`` past the
+        # step body, so reusing the buffer is safe.
         d = self._etd2_d_buf
         np.multiply(self._etd2_M_raw_diag, dldz, out=d)
         if kappa is not None:
@@ -730,20 +782,20 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         return d, self._etd2_apply_F
 
     def _ensure_apply_F(self):
-        """Lazily build the persistent CPU apply_F closure.
+        """Lazily build the persistent apply_F closure.
 
-        Called from :meth:`solve` after :meth:`_ensure_D_split`. The
-        closure captures ``self._etd2_apply_F_params`` (mutable dict)
-        so per-step refreshes happen via dict assignment in
-        :meth:`_operator_at`, not by rebuilding the closure.
+        Called from :meth:`_operator_at` on first invocation per solve.
+        The closure captures ``self._etd2_apply_F_params`` (mutable
+        dict) so per-step refreshes happen via dict assignment, not by
+        rebuilding the closure.
         """
         if self._etd2_apply_F is not None:
             return
         # Persistent host scratch sized to dim_states.
         self._etd2_d_buf = np.empty(self.dim_states, dtype=np.float64)
         self._etd2_kx_buf = np.empty(self.dim_states, dtype=np.float64)
-        # ``kappa`` is sized to the loss-vector grid, which is the same
-        # ``dim_states`` length but takes its dtype from the loss grid.
+        # ``kappa`` is sized to the loss-vector grid (== dim_states) but
+        # takes its dtype from the loss grid.
         self._etd2_kappa_buf = np.zeros_like(
             self.adia_loss_rates_grid.energy_vector
         )
@@ -753,23 +805,303 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         else:
             self._etd2_apply_F = self._make_apply_F_scipy()
 
-    def _operator_at_cupy(self, z, dldz, kappa_host, b_host):
-        """cupy variant: refresh persistent device buffers.
+    def _make_apply_F_scipy(self):
+        """Build the persistent scipy-backed ``apply_F(x, out)`` closure.
+
+        ``M_off`` and ``D_off`` are pinned at closure-build time; both
+        are stable ndarrays for the whole solve (M_off has its data
+        refreshed in place by :meth:`_refresh_z_caches`; D_off is
+        constant). ``dldz`` / ``kappa`` / ``b`` come from the mutable
+        ``self._etd2_apply_F_params`` dict — :meth:`_operator_at`
+        refreshes the values per step.
+        """
+        M_off = self._etd2_M_raw_off
+        D_off = self._etd2_D_off
+        params = self._etd2_apply_F_params
+        kx_buf = self._etd2_kx_buf
+
+        def apply_F(x, out):
+            kappa = params["kappa"]
+            np.copyto(out, M_off.dot(x))
+            if kappa is not None:
+                np.multiply(kappa, x, out=kx_buf)
+                np.add(out, D_off.dot(kx_buf), out=out)
+            np.multiply(out, params["dldz"], out=out)
+            b = params["b"]
+            if b is not None:
+                np.add(out, b, out=out)
+
+        return apply_F
+
+    def _make_apply_F_mkl(self):
+        """Build the persistent MKL-backed ``apply_F(x, out)`` closure.
+
+        Per call:
+
+          out = M_off · x                                (mkl gemv α=1, β=0)
+          if kappa: kx_buf = κ ⊙ x; out += D_off · kx_buf (mkl gemv α=1, β=1)
+          out *= dldz; if b: out += b
+
+        ``etd2_step`` calls ``apply_F`` twice per ETD2 step against four
+        persistent buffers (state, F_phi, a, F_a) plus kx_buf. We
+        memoise the ctypes pointer for each ndarray by ``id`` so we
+        don't redo ``arr.ctypes.data_as`` on every step. The buffers
+        come from ``etd2._step_buffers`` and live for the whole solve,
+        so the cached pointers stay valid across the integration loop.
+        """
+        from ctypes import POINTER, c_double
+
+        mkl_M = self._etd2_M_raw_off_mkl
+        mkl_D = self._etd2_D_off_mkl
+
+        # Pre-box the only two (alpha, beta) constants we ever use,
+        # avoiding ~5 µs of ``c_double(...)`` per gemv in the hot loop.
+        alpha_box = c_double(1.0)
+        beta_zero = c_double(0.0)
+        beta_one = c_double(1.0)
+        mkl_M_op = mkl_M.gemv_preboxed
+        mkl_D_op = mkl_D.gemv_preboxed if mkl_D is not None else None
+
+        ptr_cache = {}
+
+        def get_p(arr):
+            key = id(arr)
+            p = ptr_cache.get(key)
+            if p is None:
+                p = arr.ctypes.data_as(POINTER(c_double))
+                ptr_cache[key] = p
+            return p
+
+        kx_buf = self._etd2_kx_buf
+        kx_p = get_p(kx_buf)
+        params = self._etd2_apply_F_params
+
+        def apply_F(x, out):
+            x_p = get_p(x)
+            out_p = get_p(out)
+            mkl_M_op(alpha_box, x_p, beta_zero, out_p)
+            kappa = params["kappa"]
+            if kappa is not None:
+                np.multiply(kappa, x, out=kx_buf)
+                mkl_D_op(alpha_box, kx_p, beta_one, out_p)
+            np.multiply(out, params["dldz"], out=out)
+            b = params["b"]
+            if b is not None:
+                np.add(out, b, out=out)
+
+        return apply_F
+
+
+class ETD2SolverCUPY(UHECRPropagationSolverETD2):
+    """ETD2 backend for the cupy / cuSPARSE path.
+
+    Per-step body uses fused cupy ``ElementwiseKernel``s
+    (:func:`prince_cr.solvers.etd2.cupy_kernels`) and a custom warp-per-
+    row CSR SpMV (:func:`prince_cr.solvers.etd2.csr_spmv`). When
+    ``backend.use_cuda_graphs`` is True the per-cache-window step body
+    is recorded into a ``cupy.cuda.Graph`` after a warmup + capture pass
+    and replayed for the rest of the window; re-capture triggers on
+    each ``_refresh_z_caches`` because the M_off / D_off cuSPARSE
+    descriptors close over device pointers that change at each window.
+
+    The eager (non-graph) path is the bit-exact reference for the graph
+    path at fp64 (max abs diff = 0). The eager path is also what the
+    multi-RHS subclass uses, since CUDA Graph capture is not currently
+    implemented for cuSPARSE SpMM under cupy 14.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # cupy persistent device buffers. Allocated once per solve (in
+        # :meth:`_ensure_apply_F`) and held for the whole integration so
+        # the per-step body is alloc-free — required for kernel fusion
+        # to pay off at the per-step scale and for stable buffer
+        # addresses inside captured CUDA Graphs. Per-step values
+        # (kappa, b, dldz, d) are refreshed in place; cache-window-bound
+        # values (M_diag, D_diag) are referenced by the apply_F closure
+        # and rebound on cache window refresh.
+        self._etd2_d_buf_cp = None
+        self._etd2_kappa_buf_cp = None
+        self._etd2_b_buf_cp = None
+        self._etd2_kx_buf_cp = None
+        self._etd2_dldz_buf_cp = None
+        # Mutable closure-state for the cupy apply_F. Rebound on each
+        # ``_refresh_z_caches`` because ``split_operator`` returns fresh
+        # cupy CSR arrays at every cache window.
+        self._etd2_apply_F_state_cp = None
+        # CUDA Graph machinery. Allocated lazily when
+        # ``backend.use_cuda_graphs`` is True. Re-captured on each cache
+        # window refresh because the cuSPARSE descriptors close over
+        # ``M_off`` / ``D_off`` device pointers that change at each
+        # window.
+        self._etd2_graph_exec = None
+        self._etd2_graph_stream = None
+        self._etd2_graph_state_buf = None
+        self._etd2_graph_needs_capture = True
+
+    # ------------------------------------------------------------------
+    # Outer-driver hooks
+    # ------------------------------------------------------------------
+    def _init_state(self):
+        import cupy as cp
+        dt = np.dtype(self.backend.cupy_dtype)
+        return cp.zeros(self.dim_states, dtype=dt)
+
+    def _finalize_state(self, state):
+        # D2H + upcast back to fp64 host so downstream consumers
+        # (UHECRPropagationResult, plotting, et al.) see the canonical
+        # dtype.
+        import cupy as cp
+        return cp.asnumpy(state).astype(np.float64)
+
+    def _reset_for_solve(self):
+        # The GPU D split is not constant across solves: a backend flip
+        # (cupy_dtype change, etc.) requires rebuilding it. ``_ensure_D_split``
+        # repopulates it from the (host) ``self.diff_operator``.
+        self._etd2_D_diag = None
+        self._etd2_D_off = None
+        self._etd2_d_buf_cp = None
+        self._etd2_kappa_buf_cp = None
+        self._etd2_b_buf_cp = None
+        self._etd2_kx_buf_cp = None
+        self._etd2_dldz_buf_cp = None
+        self._etd2_apply_F_state_cp = None
+        # Drop any captured CUDA Graph; the previous solve's buffer
+        # addresses are no longer valid.
+        self._etd2_graph_exec = None
+        self._etd2_graph_stream = None
+        self._etd2_graph_state_buf = None
+        self._etd2_graph_needs_capture = True
+
+    def _run_integration(self, state, z_grid, step_hook=None):
+        if self.backend.use_cuda_graphs and config.has_cupy:
+            self._solve_loop_graphs(state, z_grid, step_hook=step_hook)
+        else:
+            from .etd2 import integrate
+            integrate(
+                state, z_grid,
+                operator_at=self._operator_at,
+                step_hook=step_hook,
+            )
+
+    def close(self):
+        for attr in (
+            "_etd2_M_raw_off",
+            "_etd2_M_raw_diag",
+            "_etd2_D_off",
+            "_etd2_D_diag",
+            "_etd2_d_buf_cp",
+            "_etd2_kappa_buf_cp",
+            "_etd2_b_buf_cp",
+            "_etd2_kx_buf_cp",
+            "_etd2_dldz_buf_cp",
+            "_etd2_apply_F_state_cp",
+            "_etd2_graph_exec",
+            "_etd2_graph_stream",
+            "_etd2_graph_state_buf",
+        ):
+            setattr(self, attr, None)
+        self._etd2_graph_needs_capture = True
+
+    # ------------------------------------------------------------------
+    # Cache-window refresh + per-step operator
+    # ------------------------------------------------------------------
+    def _refresh_z_caches(self, z):
+        """GPU variant: split_operator returns cupy CSR arrays directly."""
+        from .etd2 import split_operator
+
+        M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+        if not self.enable_photohad_losses:
+            M = M.copy()
+            M.data[:] = 0
+
+        # Re-splitting each cache window is a few ms on the GPU at
+        # production grid; we skip a host-style index-map gather (the
+        # data already lives on-device, and ``M`` is rebuilt fresh by
+        # the cupy ``_update_rates_gpu`` path each window).
+        d_M, M_off = split_operator(M)
+        self._etd2_M_raw_diag = d_M
+        self._etd2_M_raw_off = M_off
+        # The apply_F closure dereferences M_off / D_off through a
+        # mutable container so we can swap pointers here without
+        # rebuilding it. Triggers re-capture of the CUDA graph on the
+        # next per-step call.
+        self._rebind_apply_F()
+
+        if self.enable_pairprod_losses:
+            self._etd2_kappa_pair_cached = self.pair_loss_rates_grid.loss_vector(z)
+        else:
+            self._etd2_kappa_pair_cached = None
+
+        self.current_z_rates = z
+
+    def _ensure_D_split(self):
+        """Compute the FD operator split and upload to GPU once per solve."""
+        if self._etd2_D_diag is not None:
+            return
+        from .etd2 import split_operator
+
+        D = self.diff_operator
+        if not hasattr(D, "indices"):
+            D = D.tocsr()
+        d_D, D_off = split_operator(D)
+
+        import cupy as cp
+        import cupyx.scipy.sparse as csp
+
+        dt = np.dtype(self.backend.cupy_dtype)
+        self._etd2_D_diag = cp.asarray(d_D, dtype=dt)
+        D_off_cast = D_off.astype(dt)
+        self._etd2_D_off = csp.csr_matrix(
+            (
+                cp.asarray(D_off_cast.data, dtype=dt),
+                cp.asarray(D_off_cast.indices, dtype=cp.int32),
+                cp.asarray(D_off_cast.indptr, dtype=cp.int32),
+            ),
+            shape=D_off_cast.shape,
+        )
+
+    def _operator_at(self, z):
+        """Return ``(d_buf_cp, apply_F)``. Uploads per-step values to device."""
+        if (
+            self.current_z_rates is None
+            or abs(z - self.current_z_rates) > self.recomp_z_threshold
+        ):
+            self._refresh_z_caches(z)
+
+        if self._etd2_apply_F is None:
+            self._ensure_apply_F()
+
+        dldz = self.dldz(z)
+        if self.enable_partial_diff_jacobian:
+            kappa = self._etd2_kappa_buf
+            kappa.fill(0.0)
+            if self.enable_adiabatic_losses:
+                kappa += self.adia_loss_rates_grid.loss_vector(z)
+            if self._etd2_kappa_pair_cached is not None:
+                kappa += self._etd2_kappa_pair_cached
+        else:
+            kappa = None
+
+        if self.enable_injection_jacobian and self.list_of_sources:
+            b = self.injection(1.0, z)
+        else:
+            b = None
+
+        return self._operator_at_device(dldz, kappa, b)
+
+    def _operator_at_device(self, dldz, kappa_host, b_host):
+        """Refresh persistent device buffers and compute (n,) ``d`` on-device.
 
         Writes per-step values into pre-allocated device buffers, then
         evaluates ``d = dldz · (M_diag + κ ⊙ D_diag)`` via the fused
         ``compute_d`` ElementwiseKernel. No allocations on the hot path
         beyond a tiny intermediate cupy array for the host-to-device
         upload (mempool-reused). Returns the persistent ``d`` and
-        ``apply_F`` references — the closure was built once at first
-        call and rebound to current ``M_off`` / ``D_off`` on each cache
-        window refresh by :meth:`_rebind_apply_F_cupy`.
+        ``apply_F`` references.
         """
         import cupy as cp
         from .etd2 import cupy_kernels
-
-        if self._etd2_apply_F is None:
-            self._ensure_apply_F_cupy()
 
         dt = self._etd2_dldz_buf_cp.dtype
         # Update per-step scalar via a 1-element device buffer. Stays
@@ -791,9 +1123,6 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 cp.asarray(b_host, dtype=dt),
             )
 
-        # Compute d on the device via the fused kernel. Writes into the
-        # persistent ``_etd2_d_buf_cp`` so the address ``etd2_step``
-        # eventually loads from is stable across the whole solve.
         K = cupy_kernels()
         if kappa_host is not None:
             K.compute_d(
@@ -812,24 +1141,24 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
 
         return self._etd2_d_buf_cp, self._etd2_apply_F
 
-    def _ensure_apply_F_cupy(self):
+    def _ensure_apply_F(self):
         """Allocate persistent cupy buffers and build the apply_F closure.
 
-        Called from :meth:`_operator_at_cupy` on first invocation per
-        solve. ``M_off`` / ``D_off`` are bound through the mutable
-        ``self._etd2_apply_F_state_cp`` dict so :meth:`_rebind_apply_F_cupy`
+        ``M_off`` / ``D_off`` are bound through the mutable
+        ``self._etd2_apply_F_state_cp`` dict so :meth:`_rebind_apply_F`
         can swap them on cache-window refresh without rebuilding the
         closure object (which keeps a stable callable identity for
         :func:`etd2.integrate` and the CUDA Graph capture path).
         """
+        if self._etd2_apply_F is not None:
+            return
         import cupy as cp
 
         dt = np.dtype(self.backend.cupy_dtype)
         n = self.dim_states
 
-        # Host scratch for kappa accumulation (used by ``_operator_at``
-        # to compute κ_adia + κ_pair before upload). Same dtype as the
-        # loss-vector grid so the sum stays in fp64 host arithmetic
+        # Host scratch for kappa accumulation. Same dtype as the loss-
+        # vector grid so the sum stays in fp64 host arithmetic
         # regardless of the active GPU dtype.
         if self._etd2_kappa_buf is None:
             self._etd2_kappa_buf = np.zeros_like(
@@ -847,9 +1176,6 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         has_kappa = bool(self.enable_partial_diff_jacobian)
         has_b = bool(self.enable_injection_jacobian) and bool(self.list_of_sources)
 
-        # ``_etd2_M_raw_off`` / ``_etd2_D_off`` are referenced by the
-        # closure through this dict so the cache-window-refresh path
-        # can swap them in place via :meth:`_rebind_apply_F_cupy`.
         self._etd2_apply_F_state_cp = {
             "M_off": self._etd2_M_raw_off,
             "D_off": self._etd2_D_off,
@@ -857,17 +1183,15 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             "has_b": has_b,
         }
 
-        self._etd2_apply_F = self._make_apply_F_cupy()
+        self._etd2_apply_F = self._make_apply_F()
 
-    def _rebind_apply_F_cupy(self):
+    def _rebind_apply_F(self):
         """Swap ``M_off`` / ``D_off`` references on a cache window refresh.
 
-        Called from :meth:`_refresh_z_caches` cupy branch after
-        ``split_operator`` returns fresh cupy CSR arrays. Also drops the
-        captured CUDA Graph executable — its cuSPARSE descriptors hold
-        device pointers from the previous window's M_off/D_off and would
-        be dangling after we update the dict and Python frees the old
-        cupy CSR objects.
+        Also drops the captured CUDA Graph executable — its cuSPARSE
+        descriptors hold device pointers from the previous window's
+        M_off/D_off and would be dangling after we update the dict and
+        Python frees the old cupy CSR objects.
         """
         if self._etd2_apply_F_state_cp is None:
             return
@@ -880,7 +1204,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self._etd2_apply_F_state_cp["D_off"] = self._etd2_D_off
         self._etd2_graph_needs_capture = True
 
-    def _make_apply_F_cupy(self):
+    def _make_apply_F(self):
         """Build the persistent cupy ``apply_F(x, out)`` closure.
 
         Per call:
@@ -896,11 +1220,6 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         are dereferenced through ``_etd2_apply_F_state_cp`` so the
         cache-window refresh path can swap them without rebuilding the
         closure.
-
-        Compared with the eager ``cp.copyto(out, M_off @ x)`` /
-        ``out += D_off @ kx`` / ``out *= dldz`` / ``out += b`` chain,
-        this saves ~3 launches per ``apply_F`` call (2 calls/step) plus
-        the implicit allocations in cupy's sparse ``@``.
         """
         import cupy as cp
         from .etd2 import cupy_kernels, csr_spmv
@@ -925,36 +1244,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
 
         return apply_F
 
-    def _make_apply_F_scipy(self):
-        """Build the persistent scipy-backed ``apply_F(x, out)`` closure.
-
-        The closure reads ``dldz`` / ``kappa`` / ``b`` from
-        ``self._etd2_apply_F_params`` (a mutable dict refreshed by
-        :meth:`_operator_at` per step). ``kx_buf`` is the persistent
-        scratch allocated in :meth:`_ensure_apply_F`. ``M_off`` and
-        ``D_off`` are pinned at closure-build time; both are stable
-        ndarrays for the whole solve (M_off has its data refreshed in
-        place by :meth:`_refresh_z_caches`; D_off is constant).
-        """
-        M_off = self._etd2_M_raw_off
-        D_off = self._etd2_D_off
-        params = self._etd2_apply_F_params
-        kx_buf = self._etd2_kx_buf
-
-        def apply_F(x, out):
-            kappa = params["kappa"]
-            np.copyto(out, M_off.dot(x))
-            if kappa is not None:
-                np.multiply(kappa, x, out=kx_buf)
-                np.add(out, D_off.dot(kx_buf), out=out)
-            np.multiply(out, params["dldz"], out=out)
-            b = params["b"]
-            if b is not None:
-                np.add(out, b, out=out)
-
-        return apply_F
-
-    def _step_body_cupy_graph(self, state, bufs, K, has_kappa):
+    def _step_body_graph(self, state, bufs, K, has_kappa):
         """Run one ETD2 step's device-only kernel sequence.
 
         All inputs come from persistent device buffers; no Python
@@ -1011,7 +1301,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         All per-step host work (κ accumulation, b construction,
         dldz scalar) happens outside the captured region; the graph
         only contains the per-step kernel sequence built by
-        :meth:`_step_body_cupy_graph`.
+        :meth:`_step_body_graph`.
 
         Parameters
         ----------
@@ -1051,17 +1341,17 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 or abs(z0 - self.current_z_rates) > self.recomp_z_threshold
             ):
                 self._refresh_z_caches(z0)
-                # _rebind_apply_F_cupy drops _etd2_graph_exec and sets
+                # _rebind_apply_F drops _etd2_graph_exec and sets
                 # _etd2_graph_needs_capture = True. Reset window state.
                 win_step_count = 0
 
             # Lazy-init persistent buffers on first call after the first
-            # _refresh_z_caches. Mirrors the cupy branch in :meth:`_operator_at`.
+            # _refresh_z_caches.
             if self._etd2_apply_F is None:
-                self._ensure_apply_F_cupy()
+                self._ensure_apply_F()
 
             # Per-step host work: κ, b, dldz — exactly the same arithmetic
-            # the eager :meth:`_operator_at_cupy` does, lifted here so we
+            # the eager :meth:`_operator_at_device` does, lifted here so we
             # can keep the captured region pure-device.
             dldz = self.dldz(z0)
             if has_kappa:
@@ -1118,7 +1408,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                     # stream so cuSPARSE's per-stream handle and cupy's
                     # ElementwiseKernel JIT compile *outside* the captured
                     # region. Advances state like a normal step.
-                    self._step_body_cupy_graph(state, bufs, K, has_kappa)
+                    self._step_body_graph(state, bufs, K, has_kappa)
                     win_step_count = 1
                 elif self._etd2_graph_needs_capture and win_step_count == 1:
                     # Capture pass. ``begin_capture`` puts the stream
@@ -1128,7 +1418,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                     # step advances state like a real step (otherwise
                     # we'd silently lose one step per cache window).
                     stream.begin_capture()
-                    self._step_body_cupy_graph(state, bufs, K, has_kappa)
+                    self._step_body_graph(state, bufs, K, has_kappa)
                     graph = stream.end_capture()
                     graph.upload(stream)
                     graph.launch(stream)
@@ -1145,258 +1435,10 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         stream.synchronize()
         return state
 
-    def _make_apply_F_mkl(self):
-        """Build the persistent MKL-backed ``apply_F(x, out)`` closure.
 
-        Per call:
-
-          out = M_off · x                                (mkl gemv α=1, β=0)
-          if kappa: kx_buf = κ ⊙ x; out += D_off · kx_buf (mkl gemv α=1, β=1)
-          out *= dldz; if b: out += b
-
-        ``etd2_step`` calls ``apply_F`` twice per ETD2 step against four
-        persistent buffers (state, F_phi, a, F_a) plus kx_buf. We memoise
-        the ctypes pointer for each ndarray by ``id`` so we don't redo
-        ``arr.ctypes.data_as`` on every step. The buffers come from
-        ``etd2._step_buffers`` and live for the whole solve, so the
-        cached pointers stay valid across the integration loop. Per-
-        step ``dldz``/``kappa``/``b`` come from the mutable
-        ``self._etd2_apply_F_params`` dict — :meth:`_operator_at`
-        refreshes the values; the closure is built exactly once per
-        solve.
-        """
-        from ctypes import POINTER, c_double
-
-        mkl_M = self._etd2_M_raw_off_mkl
-        mkl_D = self._etd2_D_off_mkl
-
-        # Pre-box the only two (alpha, beta) constants we ever use,
-        # avoiding ~5 µs of ``c_double(...)`` per gemv in the hot loop.
-        # Sanity-check the M_off SpMV via the gemv_ctargs path on the
-        # first call only — if MKL is going to fail it'll do so loudly
-        # there. Subsequent calls go through gemv_preboxed.
-        alpha_box = c_double(1.0)
-        beta_zero = c_double(0.0)
-        beta_one = c_double(1.0)
-        mkl_M_op = mkl_M.gemv_preboxed
-        mkl_D_op = mkl_D.gemv_preboxed if mkl_D is not None else None
-
-        ptr_cache = {}
-
-        def get_p(arr):
-            key = id(arr)
-            p = ptr_cache.get(key)
-            if p is None:
-                p = arr.ctypes.data_as(POINTER(c_double))
-                ptr_cache[key] = p
-            return p
-
-        kx_buf = self._etd2_kx_buf
-        kx_p = get_p(kx_buf)
-        params = self._etd2_apply_F_params
-
-        def apply_F(x, out):
-            x_p = get_p(x)
-            out_p = get_p(out)
-            mkl_M_op(alpha_box, x_p, beta_zero, out_p)
-            kappa = params["kappa"]
-            if kappa is not None:
-                np.multiply(kappa, x, out=kx_buf)
-                mkl_D_op(alpha_box, kx_p, beta_one, out_p)
-            np.multiply(out, params["dldz"], out=out)
-            b = params["b"]
-            if b is not None:
-                np.add(out, b, out=out)
-
-        return apply_F
-
-    def close(self):
-        """Release backend resources (currently: MKL sparse handles).
-
-        Idempotent. Safe to call repeatedly and safe to skip — Python
-        reference-counting eventually frees the handles via
-        ``MklSparseMatrix.__del__``, but the underlying MKL-internal
-        optimised-layout memory only drops on explicit
-        ``mkl_sparse_destroy``. Calling ``close()`` between long-running
-        runs avoids accumulating that memory.
-        """
-        for attr in ("_etd2_M_raw_off_mkl", "_etd2_D_off_mkl"):
-            h = getattr(self, attr, None)
-            if h is not None:
-                try:
-                    h.close()
-                except Exception:
-                    pass
-                setattr(self, attr, None)
-        # On the cupy backend the M/D split lives on the GPU. Drop the
-        # cupy references so Python ref-counts them back to the
-        # mempool. Explicit None release keeps long-running scripts
-        # (mass scans) from pinning successive matrices on-device.
-        if self._is_cupy_backend:
-            for attr in (
-                "_etd2_M_raw_off",
-                "_etd2_M_raw_diag",
-                "_etd2_D_off",
-                "_etd2_D_diag",
-                # cupy persistent device buffers + graph machinery.
-                "_etd2_d_buf_cp",
-                "_etd2_kappa_buf_cp",
-                "_etd2_b_buf_cp",
-                "_etd2_kx_buf_cp",
-                "_etd2_dldz_buf_cp",
-                "_etd2_apply_F_state_cp",
-                "_etd2_graph_exec",
-                "_etd2_graph_stream",
-                "_etd2_graph_state_buf",
-            ):
-                setattr(self, attr, None)
-            self._etd2_graph_needs_capture = True
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def solve(
-        self,
-        dz=1e-3,
-        verbose=False,
-        summary=False,
-        progressbar=False,
-    ):
-        from time import time
-        from .etd2 import integrate
-
-        start_time = time()
-        info(2, "ETD2: setting up integration")
-
-        # Sign convention: integrate from initial_z (high) to final_z (low),
-        # so step h = -dz < 0. Build a uniform grid of size dz, with the
-        # final step truncated to land exactly on final_z.
-        dz_step = -float(abs(dz))
-        n_full = int(np.floor((self.final_z - self.initial_z) / dz_step))
-        z_grid = self.initial_z + np.arange(n_full + 1) * dz_step
-        if abs(z_grid[-1] - self.final_z) > 1e-12:
-            z_grid = np.concatenate([z_grid, [self.final_z]])
-
-        # Force first-step rebuild of the cached photo-hadronic matrix.
-        # Drop the M_off cache too: a fresh ``_refresh_z_caches`` will
-        # rebuild it (and the MKL handle + index maps) from the current
-        # rate matrix, then keep the same handle alive across all this
-        # solve's cache windows via in-place data updates.
-        self.current_z_rates = None
-        self._etd2_M_raw_off = None
-        self._etd2_M_off_to_M_idx = None
-        self._etd2_M_diag_to_M_idx = None
-        if self._etd2_M_raw_off_mkl is not None:
-            self._etd2_M_raw_off_mkl.close()
-            self._etd2_M_raw_off_mkl = None
-        # Drop the persistent CPU apply_F closure so it gets rebuilt
-        # against this solve's M_off / D_off (the M_off ndarray identity
-        # changes when ``_refresh_z_caches`` runs split_operator on the
-        # first window — the CPU closure pins ``M_off`` by reference).
-        self._etd2_apply_F = None
-        # On the full-GPU cupy backend, also drop the cupy D split so
-        # ``_ensure_D_split`` rebuilds it for this solve. (The host
-        # path keeps D — it's truly constant for the lifetime of the
-        # PriNCeRun, but the GPU mirror may have come from a prior
-        # backend selection.)
-        if self._is_cupy_backend:
-            self._etd2_D_diag = None
-            self._etd2_D_off = None
-            # Persistent cupy buffers + apply_F state. Dropped so this
-            # solve starts fresh — they get reallocated by
-            # :meth:`_ensure_apply_F_cupy` on the first
-            # :meth:`_operator_at_cupy` call.
-            self._etd2_d_buf_cp = None
-            self._etd2_kappa_buf_cp = None
-            self._etd2_b_buf_cp = None
-            self._etd2_kx_buf_cp = None
-            self._etd2_dldz_buf_cp = None
-            self._etd2_apply_F_state_cp = None
-            # Drop any captured CUDA Graph; the previous solve's
-            # buffer addresses are no longer valid.
-            self._etd2_graph_exec = None
-            self._etd2_graph_stream = None
-            self._etd2_graph_state_buf = None
-            self._etd2_graph_needs_capture = True
-        self._ensure_D_split()
-
-        if self._is_cupy_backend:
-            import cupy as cp
-
-            dt = np.dtype(self.backend.cupy_dtype)
-            state = cp.zeros(self.dim_states, dtype=dt)
-        else:
-            state = np.zeros(self.dim_states)
-
-        # Hybrid-lookahead bookkeeping. Compute the cache-window anchor
-        # schedule from the deterministic z_grid + threshold, drop any
-        # stale GPU rebuild from a previous solve, and prime the first
-        # anchor before entering the integrate loop — the first
-        # ``_refresh_z_caches`` call will consume it. The full-GPU cupy
-        # backend has its own GPU dense-matvec path and does not use
-        # the lookahead machinery.
-        if (
-            not self._is_cupy_backend
-            and self.backend.use_cupy_dense_lookahead
-            and config.has_cupy
-        ):
-            self._lookahead_anchors = self._compute_lookahead_anchors(z_grid)
-            self._next_anchor_idx = 0
-            self.had_int_rates.drop_pending()
-            self._schedule_next_lookahead_anchor()
-            info(2, f"ETD2: scheduled {len(self._lookahead_anchors)} "
-                    "GPU dense-matvec anchors for hybrid-backend lookahead.")
-        else:
-            self._lookahead_anchors = None
-            self._next_anchor_idx = 0
-
-        self.pre_step_hook(self.initial_z)
-
-        nsteps = len(z_grid) - 1
-        info(2, f"ETD2: integrating with {nsteps} steps of dz≈{dz_step:.2e}")
-        with PrinceProgressBar(bar_type=progressbar, nsteps=nsteps) as pbar:
-            step_hook = pbar.update if pbar.pbar is not None else None
-            if (
-                self._is_cupy_backend
-                and self.backend.use_cuda_graphs
-                and config.has_cupy
-            ):
-                self._solve_loop_graphs(state, z_grid, step_hook=step_hook)
-            else:
-                integrate(
-                    state, z_grid,
-                    operator_at=self._operator_at,
-                    step_hook=step_hook,
-                )
-
-        # Done with the solve — clear lookahead state.
-        if self._lookahead_anchors is not None:
-            self.had_int_rates.drop_pending()
-            self._lookahead_anchors = None
-            self._next_anchor_idx = 0
-
-        self.post_step_hook(self.final_z)
-        if self._is_cupy_backend:
-            # D2H + upcast back to fp64 host so downstream consumers
-            # (UHECRPropagationResult, plotting, et al.) see the
-            # canonical dtype.
-            import cupy as cp
-
-            self.state = cp.asnumpy(state).astype(np.float64)
-        else:
-            self.state = state
-        end_time = time()
-        info(2, "ETD2: integration completed in {0:.2f} s".format(end_time - start_time))
-
-        if summary or verbose:
-            print("ETD2 summary:")
-            print(f"  steps: {len(z_grid) - 1}")
-            print(f"  initial z: {self.initial_z} → final z: {self.final_z}")
-            print(f"  wall time: {end_time - start_time:.3f} s")
-
+# =====================================================================
+# Multi-RHS ETD2: K independent solutions sharing the operator.
+# =====================================================================
 
 class _MultiRHSView:
     """Per-RHS view of a :class:`MultiRHSPropagationSolverETD2`.
@@ -1444,15 +1486,26 @@ class MultiRHSPropagationSolverETD2(UHECRPropagationSolverETD2):
     ~3.5× per-RHS at K=64; cupy/cuSPARSE gives ~36×. Cache-window work
     is K-independent.
 
-    v1 limitations:
+    This is the algorithm parent. Construct it directly and ``__new__``
+    dispatches to a backend subclass:
 
-    * MKL backend falls through to scipy SpMM (we don't yet wrap
-      ``mkl_sparse_d_mm``). Set ``linear_algebra_backend = "scipy"`` or
-      ``"cupy"`` for explicit selection.
-    * CUDA Graph capture is not implemented for the multi-RHS path
-      (cupy 14 blocks cuSPARSE during capture; the eager cuSPARSE SpMM
-      is already K-amortised so the graph win is small).
+    * ``_MultiRHSETD2SolverCPU`` — scipy SpMM (MKL Sparse SpMM not
+      wrapped; the MKL backend setting falls through to scipy).
+    * ``_MultiRHSETD2SolverCUPY`` — eager cuSPARSE SpMM. CUDA Graph
+      capture is not currently supported on the multi-RHS path
+      (cupy 14 blocks cuSPARSE during capture).
     """
+
+    def __new__(cls, *args, **kwargs):
+        if cls is MultiRHSPropagationSolverETD2:
+            prince_run = _resolve_prince_run(args, kwargs)
+            backend = prince_run.backend.linear_algebra_backend.lower()
+            target = (
+                _MultiRHSETD2SolverCUPY if backend == "cupy"
+                else _MultiRHSETD2SolverCPU
+            )
+            return object.__new__(target)
+        return object.__new__(cls)
 
     def __init__(self, *args, K, **kwargs):
         if K < 1:
@@ -1464,7 +1517,7 @@ class MultiRHSPropagationSolverETD2(UHECRPropagationSolverETD2):
         # before solve() (returns zeros, like the parent).
         self.state = np.zeros((self.dim_states, self._K))
         # Multi-RHS state-shape scratch buffers, allocated lazily by
-        # :meth:`_ensure_apply_F` / :meth:`_ensure_apply_F_cupy`.
+        # the concrete subclass's :meth:`_ensure_apply_F`.
         self._etd2_KX_buf = None
         self._etd2_KX_buf_cp = None
         self._etd2_B_buf_cp = None
@@ -1534,233 +1587,11 @@ class MultiRHSPropagationSolverETD2(UHECRPropagationSolverETD2):
         return out
 
     # ------------------------------------------------------------------
-    # apply_F closures (multi-RHS)
+    # Backend-agnostic multi-RHS integration loop. ``state`` shape is
+    # (n, K); ``apply_F`` is the multi-RHS closure built by the concrete
+    # subclass's :meth:`_ensure_apply_F`.
     # ------------------------------------------------------------------
-    def _ensure_apply_F(self):
-        if self._etd2_apply_F is not None:
-            return
-        # (n,) diag scratch (same as parent).
-        self._etd2_d_buf = np.empty(self.dim_states, dtype=np.float64)
-        self._etd2_kx_buf = np.empty(self.dim_states, dtype=np.float64)
-        self._etd2_kappa_buf = np.zeros_like(
-            self.adia_loss_rates_grid.energy_vector
-        )
-        # (n, K) state-shape scratch.
-        self._etd2_KX_buf = np.empty(
-            (self.dim_states, self._K), dtype=np.float64
-        )
-        # MKL SpMM is not wrapped; force scipy SpMM for v1.
-        self._etd2_apply_F = self._make_apply_F_scipy_multi()
-
-    def _make_apply_F_scipy_multi(self):
-        M_off = self._etd2_M_raw_off
-        D_off = self._etd2_D_off
-        params = self._etd2_apply_F_params
-        KX_buf = self._etd2_KX_buf
-
-        def apply_F(X, OUT):
-            # SpMM: scipy CSR ``@`` 2D dense returns (n, K) ndarray; no
-            # in-place option in scipy.sparse, so we copy into OUT.
-            np.copyto(OUT, M_off.dot(X))
-            kappa = params["kappa"]
-            if kappa is not None:
-                np.multiply(kappa[:, None], X, out=KX_buf)
-                np.add(OUT, D_off.dot(KX_buf), out=OUT)
-            np.multiply(OUT, params["dldz"], out=OUT)
-            B = params["b"]
-            if B is not None:
-                np.add(OUT, B, out=OUT)
-
-        return apply_F
-
-    def _make_apply_F_mkl(self):
-        # MKL Sparse BLAS gemv is single-RHS; mkl_sparse_d_mm not wrapped.
-        # Fall back to scipy SpMM.
-        return self._make_apply_F_scipy_multi()
-
-    def _ensure_apply_F_cupy(self):
-        import cupy as cp
-
-        dt = np.dtype(self.backend.cupy_dtype)
-        n = self.dim_states
-        K = self._K
-        if self._etd2_kappa_buf is None:
-            self._etd2_kappa_buf = np.zeros_like(
-                self.adia_loss_rates_grid.energy_vector
-            )
-        # (n,) device buffers.
-        self._etd2_d_buf_cp = cp.empty(n, dtype=dt)
-        self._etd2_kappa_buf_cp = cp.zeros(n, dtype=dt)
-        self._etd2_dldz_buf_cp = cp.empty(1, dtype=dt)
-        # (n, K) device buffers.
-        self._etd2_KX_buf_cp = cp.empty((n, K), dtype=dt)
-        self._etd2_B_buf_cp = cp.zeros((n, K), dtype=dt)
-        has_kappa = bool(self.enable_partial_diff_jacobian)
-        has_b = bool(self.enable_injection_jacobian) and any(
-            v.list_of_sources for v in self._views
-        )
-        self._etd2_apply_F_state_cp = {
-            "M_off": self._etd2_M_raw_off,
-            "D_off": self._etd2_D_off,
-            "has_kappa": has_kappa,
-            "has_b": has_b,
-        }
-        self._etd2_apply_F = self._make_apply_F_cupy_multi()
-
-    def _make_apply_F_cupy_multi(self):
-        import cupy as cp
-
-        kappa_buf = self._etd2_kappa_buf_cp
-        KX_buf = self._etd2_KX_buf_cp
-        B_buf = self._etd2_B_buf_cp
-        dldz_buf = self._etd2_dldz_buf_cp
-        state = self._etd2_apply_F_state_cp
-
-        def apply_F(X, OUT):
-            M_off = state["M_off"]
-            # eager cuSPARSE SpMM through cupyx.scipy.sparse ``@``.
-            cp.copyto(OUT, M_off @ X)
-            if state["has_kappa"]:
-                cp.multiply(kappa_buf[:, None], X, out=KX_buf)
-                cp.add(OUT, state["D_off"] @ KX_buf, out=OUT)
-            # Tail: out = out * dldz + B (broadcast scalar from
-            # 1-element device buffer).
-            cp.multiply(OUT, dldz_buf, out=OUT)
-            if state["has_b"]:
-                cp.add(OUT, B_buf, out=OUT)
-
-        return apply_F
-
-    def _operator_at_cupy(self, z, dldz, kappa_host, b_host):
-        """Multi-RHS variant: refresh device buffers, compute (n,) ``d``."""
-        import cupy as cp
-        from .etd2 import cupy_kernels
-
-        if self._etd2_apply_F is None:
-            self._ensure_apply_F_cupy()
-
-        dt = self._etd2_dldz_buf_cp.dtype
-        self._etd2_dldz_buf_cp[0] = dt.type(dldz)
-        if kappa_host is not None:
-            cp.copyto(
-                self._etd2_kappa_buf_cp,
-                cp.asarray(kappa_host, dtype=dt),
-            )
-        # B is (n, K) host; per-cycle upload mirrors the single-RHS
-        # path and stays within the cupy mempool's working set.
-        if b_host is not None:
-            cp.copyto(
-                self._etd2_B_buf_cp,
-                cp.asarray(b_host, dtype=dt),
-            )
-
-        K = cupy_kernels()
-        if kappa_host is not None:
-            K.compute_d(
-                self._etd2_M_raw_diag,
-                self._etd2_kappa_buf_cp,
-                self._etd2_D_diag,
-                self._etd2_dldz_buf_cp,
-                self._etd2_d_buf_cp,
-            )
-        else:
-            K.compute_d_no_kappa(
-                self._etd2_M_raw_diag,
-                self._etd2_dldz_buf_cp,
-                self._etd2_d_buf_cp,
-            )
-        return self._etd2_d_buf_cp, self._etd2_apply_F
-
-    def _solve_loop_graphs(self, *args, **kwargs):
-        raise NotImplementedError(
-            "CUDA Graph capture is not implemented for the multi-RHS "
-            "solver; the eager cuSPARSE SpMM is already K-amortised."
-        )
-
-    # ------------------------------------------------------------------
-    # solve() and integration loop
-    # ------------------------------------------------------------------
-    def solve(self, dz=1e-3, verbose=False, summary=False, progressbar=False):
-        from time import time
-
-        start_time = time()
-        info(2, f"ETD2 multi-RHS (K={self._K}): setting up integration")
-
-        dz_step = -float(abs(dz))
-        n_full = int(np.floor((self.final_z - self.initial_z) / dz_step))
-        z_grid = self.initial_z + np.arange(n_full + 1) * dz_step
-        if abs(z_grid[-1] - self.final_z) > 1e-12:
-            z_grid = np.concatenate([z_grid, [self.final_z]])
-
-        # Reset cache-window state so this solve rebuilds the rate
-        # matrix and the apply_F closure from scratch (mirrors parent).
-        self.current_z_rates = None
-        self._etd2_M_raw_off = None
-        self._etd2_M_off_to_M_idx = None
-        self._etd2_M_diag_to_M_idx = None
-        if self._etd2_M_raw_off_mkl is not None:
-            self._etd2_M_raw_off_mkl.close()
-            self._etd2_M_raw_off_mkl = None
-        self._etd2_apply_F = None
-        if self._is_cupy_backend:
-            self._etd2_D_diag = None
-            self._etd2_D_off = None
-            self._etd2_d_buf_cp = None
-            self._etd2_kappa_buf_cp = None
-            self._etd2_KX_buf_cp = None
-            self._etd2_B_buf_cp = None
-            self._etd2_dldz_buf_cp = None
-            self._etd2_apply_F_state_cp = None
-
-        self._ensure_D_split()
-
-        n = self.dim_states
-        K = self._K
-        if self._is_cupy_backend:
-            import cupy as cp
-
-            dt = np.dtype(self.backend.cupy_dtype)
-            STATE = cp.zeros((n, K), dtype=dt)
-        else:
-            STATE = np.zeros((n, K))
-
-        # Multi-RHS does not use the hybrid-backend lookahead machinery
-        # (which is single-RHS-only and tied to the dense matvec
-        # caching pattern); explicitly drop any prior bookkeeping.
-        self._lookahead_anchors = None
-        self._next_anchor_idx = 0
-
-        self.pre_step_hook(self.initial_z)
-        nsteps = len(z_grid) - 1
-        info(2, f"ETD2 multi-RHS: integrating with {nsteps} "
-                f"steps of dz≈{dz_step:.2e}")
-        with PrinceProgressBar(bar_type=progressbar, nsteps=nsteps) as pbar:
-            step_hook = pbar.update if pbar.pbar is not None else None
-            self._integrate_multi(STATE, z_grid, step_hook=step_hook)
-        self.post_step_hook(self.final_z)
-
-        if self._is_cupy_backend:
-            import cupy as cp
-
-            self.state = cp.asnumpy(STATE).astype(np.float64)
-        else:
-            self.state = STATE
-        end_time = time()
-        info(2, "ETD2 multi-RHS: integration completed in "
-                f"{end_time - start_time:.2f} s")
-
-        if summary or verbose:
-            print(f"ETD2 multi-RHS summary (K={self._K}):")
-            print(f"  steps: {len(z_grid) - 1}")
-            print(f"  initial z: {self.initial_z} → final z: {self.final_z}")
-            print(f"  wall time: {end_time - start_time:.3f} s")
-
     def _integrate_multi(self, state, z_grid, step_hook=None):
-        """Multi-RHS ETD2 loop. ``state`` has shape ``(n, K)``.
-
-        ``step_hook`` is called once per step (after the state advance);
-        used by the ``solve(progressbar=...)`` path.
-        """
         from .etd2 import _array_module, _step_buffers
 
         xp = _array_module(state)
@@ -1787,7 +1618,8 @@ class MultiRHSPropagationSolverETD2(UHECRPropagationSolverETD2):
                 step_hook()
         return state
 
-    def _etd2_step_multi(self, state, h, d, apply_F, bufs, xp):
+    @staticmethod
+    def _etd2_step_multi(state, h, d, apply_F, bufs, xp):
         """One multi-RHS ETD2 step, in place on (n, K) ``state``.
 
         Phi factors are (n,) functions of ``d`` and are broadcast over
@@ -1827,3 +1659,165 @@ class MultiRHSPropagationSolverETD2(UHECRPropagationSolverETD2):
         xp.multiply(phi2[:, None], SCR, out=SCR)
         xp.add(a, SCR, out=state)
         return state
+
+
+class _MultiRHSETD2SolverCPU(MultiRHSPropagationSolverETD2, ETD2SolverCPU):
+    """Multi-RHS CPU: scipy SpMM. ``M_off``-handle MKL ``mkl_sparse_d_mm``
+    is not wrapped, so the MKL backend setting falls through to scipy
+    SpMM here too.
+    """
+
+    def _init_state(self):
+        return np.zeros((self.dim_states, self._K))
+
+    def _run_integration(self, state, z_grid, step_hook=None):
+        self._integrate_multi(state, z_grid, step_hook=step_hook)
+
+    def _ensure_apply_F(self):
+        if self._etd2_apply_F is not None:
+            return
+        # (n,) diag scratch (same shape as single-RHS).
+        self._etd2_d_buf = np.empty(self.dim_states, dtype=np.float64)
+        self._etd2_kx_buf = np.empty(self.dim_states, dtype=np.float64)
+        self._etd2_kappa_buf = np.zeros_like(
+            self.adia_loss_rates_grid.energy_vector
+        )
+        # (n, K) state-shape scratch.
+        self._etd2_KX_buf = np.empty(
+            (self.dim_states, self._K), dtype=np.float64
+        )
+        # MKL Sparse SpMM not wrapped; force scipy SpMM regardless of backend.
+        self._etd2_apply_F = self._make_apply_F_scipy()
+
+    def _make_apply_F_scipy(self):
+        M_off = self._etd2_M_raw_off
+        D_off = self._etd2_D_off
+        params = self._etd2_apply_F_params
+        KX_buf = self._etd2_KX_buf
+
+        def apply_F(X, OUT):
+            # SpMM: scipy CSR ``@`` 2D dense returns (n, K) ndarray; no
+            # in-place option in scipy.sparse, so we copy into OUT.
+            np.copyto(OUT, M_off.dot(X))
+            kappa = params["kappa"]
+            if kappa is not None:
+                np.multiply(kappa[:, None], X, out=KX_buf)
+                np.add(OUT, D_off.dot(KX_buf), out=OUT)
+            np.multiply(OUT, params["dldz"], out=OUT)
+            B = params["b"]
+            if B is not None:
+                np.add(OUT, B, out=OUT)
+
+        return apply_F
+
+    def _make_apply_F_mkl(self):
+        # MKL Sparse SpMM not wrapped; fall back to scipy SpMM.
+        return self._make_apply_F_scipy()
+
+
+class _MultiRHSETD2SolverCUPY(MultiRHSPropagationSolverETD2, ETD2SolverCUPY):
+    """Multi-RHS cupy: eager cuSPARSE SpMM. CUDA Graphs not supported."""
+
+    def _init_state(self):
+        import cupy as cp
+        dt = np.dtype(self.backend.cupy_dtype)
+        return cp.zeros((self.dim_states, self._K), dtype=dt)
+
+    def _run_integration(self, state, z_grid, step_hook=None):
+        # Multi-RHS does not support CUDA Graph capture (cupy 14 blocks
+        # cuSPARSE during capture); the eager cuSPARSE SpMM is already
+        # K-amortised so the graph win would be small.
+        self._integrate_multi(state, z_grid, step_hook=step_hook)
+
+    def _ensure_apply_F(self):
+        if self._etd2_apply_F is not None:
+            return
+        import cupy as cp
+
+        dt = np.dtype(self.backend.cupy_dtype)
+        n = self.dim_states
+        K = self._K
+        if self._etd2_kappa_buf is None:
+            self._etd2_kappa_buf = np.zeros_like(
+                self.adia_loss_rates_grid.energy_vector
+            )
+        # (n,) device buffers.
+        self._etd2_d_buf_cp = cp.empty(n, dtype=dt)
+        self._etd2_kappa_buf_cp = cp.zeros(n, dtype=dt)
+        self._etd2_dldz_buf_cp = cp.empty(1, dtype=dt)
+        # (n, K) device buffers.
+        self._etd2_KX_buf_cp = cp.empty((n, K), dtype=dt)
+        self._etd2_B_buf_cp = cp.zeros((n, K), dtype=dt)
+
+        has_kappa = bool(self.enable_partial_diff_jacobian)
+        has_b = bool(self.enable_injection_jacobian) and any(
+            v.list_of_sources for v in self._views
+        )
+        self._etd2_apply_F_state_cp = {
+            "M_off": self._etd2_M_raw_off,
+            "D_off": self._etd2_D_off,
+            "has_kappa": has_kappa,
+            "has_b": has_b,
+        }
+        self._etd2_apply_F = self._make_apply_F()
+
+    def _make_apply_F(self):
+        import cupy as cp
+
+        kappa_buf = self._etd2_kappa_buf_cp
+        KX_buf = self._etd2_KX_buf_cp
+        B_buf = self._etd2_B_buf_cp
+        dldz_buf = self._etd2_dldz_buf_cp
+        state = self._etd2_apply_F_state_cp
+
+        def apply_F(X, OUT):
+            M_off = state["M_off"]
+            # eager cuSPARSE SpMM through cupyx.scipy.sparse ``@``.
+            cp.copyto(OUT, M_off @ X)
+            if state["has_kappa"]:
+                cp.multiply(kappa_buf[:, None], X, out=KX_buf)
+                cp.add(OUT, state["D_off"] @ KX_buf, out=OUT)
+            # Tail: out = out * dldz + B (broadcast scalar from
+            # 1-element device buffer).
+            cp.multiply(OUT, dldz_buf, out=OUT)
+            if state["has_b"]:
+                cp.add(OUT, B_buf, out=OUT)
+
+        return apply_F
+
+    def _operator_at_device(self, dldz, kappa_host, b_host):
+        """Multi-RHS variant: upload K-shaped B instead of (n,) b."""
+        import cupy as cp
+        from .etd2 import cupy_kernels
+
+        dt = self._etd2_dldz_buf_cp.dtype
+        self._etd2_dldz_buf_cp[0] = dt.type(dldz)
+        if kappa_host is not None:
+            cp.copyto(
+                self._etd2_kappa_buf_cp,
+                cp.asarray(kappa_host, dtype=dt),
+            )
+        # B is (n, K) host; upload mirrors the single-RHS path and
+        # stays within the cupy mempool's working set.
+        if b_host is not None:
+            cp.copyto(
+                self._etd2_B_buf_cp,
+                cp.asarray(b_host, dtype=dt),
+            )
+
+        K = cupy_kernels()
+        if kappa_host is not None:
+            K.compute_d(
+                self._etd2_M_raw_diag,
+                self._etd2_kappa_buf_cp,
+                self._etd2_D_diag,
+                self._etd2_dldz_buf_cp,
+                self._etd2_d_buf_cp,
+            )
+        else:
+            K.compute_d_no_kappa(
+                self._etd2_M_raw_diag,
+                self._etd2_dldz_buf_cp,
+                self._etd2_d_buf_cp,
+            )
+        return self._etd2_d_buf_cp, self._etd2_apply_F

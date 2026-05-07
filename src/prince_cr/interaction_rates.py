@@ -55,20 +55,9 @@ class PhotoNuclearInteractionRate(object):
         self.coupling_mat = None
         self.dense_coupling_mat = None
 
-        # GPU dense-matvec lookahead state (CPU/GPU hybrid backend).
-        # Lazily populated when :meth:`schedule_rebuild` is called for
-        # the first time.
+        # GPU mirror of the dense rate kernel; populated by
+        # :meth:`_ensure_coupling_mat_gpu` on the cupy backend.
         self._batch_matrix_gpu = None
-        self._dot_stream = None
-        self._pending_event = None
-        self._pending_anchor_z = None
-        self._pending_pfield_id = None  # id() of pfield override, or None
-        self._pending_result_gpu = None
-        # Float tolerance for matching scheduled z to incoming z. Set to
-        # 1e-12 because the solver's deterministic z-grid is built with
-        # cumulative ``initial_z + k * dz_step`` arithmetic, which is
-        # round-off-stable to ~1e-15 for our z range.
-        self._anchor_z_tol = 1e-12
 
         self._estimate_batch_matrix()
         self._init_matrices()
@@ -529,129 +518,6 @@ class PhotoNuclearInteractionRate(object):
         self._ratemat_zcache_gpu = None if is_override else z
         return True
 
-    # ------------------------------------------------------------------
-    # CPU/GPU hybrid: GPU dense-matvec lookahead
-    # ------------------------------------------------------------------
-    def _ensure_gpu_dense_setup(self):
-        """Upload ``_batch_matrix`` to GPU and allocate the result/stream.
-
-        Runs at most once per instance — subsequent calls are no-ops.
-        Uploads in float64 to keep the lookahead numerically equivalent
-        to the host ``np.dot`` baseline; the full-GPU cupy backend has
-        its own dtype dispatch (see :meth:`_ensure_coupling_mat_gpu`).
-        The ~165 MB batch matrix at max_mass=56 fits comfortably on a
-        24 GB RTX 3090.
-        """
-        if self._batch_matrix_gpu is not None:
-            return
-        if not config.has_cupy:
-            raise RuntimeError(
-                "PhotoNuclearInteractionRate: cupy is required for the GPU "
-                "dense-matvec lookahead but is not importable."
-            )
-        import cupy as cp
-
-        # _batch_matrix may already be a cupy ndarray on the cupy
-        # backend; in that case upload is a no-op pass-through.
-        if isinstance(self._batch_matrix, np.ndarray):
-            self._batch_matrix_gpu = cp.asarray(self._batch_matrix, dtype=np.float64)
-        else:
-            # cupy ndarray from the full-GPU backend (possibly fp32).
-            # The lookahead path always wants float64; upcast if needed.
-            if self._batch_matrix.dtype != np.float64:
-                self._batch_matrix_gpu = self._batch_matrix.astype(np.float64)
-            else:
-                self._batch_matrix_gpu = self._batch_matrix
-        self._dot_stream = cp.cuda.Stream(non_blocking=True)
-        self._pending_result_gpu = cp.empty(
-            self._batch_matrix_gpu.shape[0], dtype=np.float64
-        )
-
-    def schedule_rebuild(self, z, pfield=None):
-        """Dispatch the dense matvec for redshift ``z`` on a GPU stream.
-
-        Call before entering the cache window that ends in a refresh at
-        ``z``. The matvec runs on a non-blocking stream so the CPU can
-        continue with the current window's ETD2 steps. The result lands
-        on the device; :meth:`_consume_pending_into_batch_vec` performs
-        the D2H copy at consume time.
-
-        Idempotent up to the pending slot: if a rebuild for a different
-        z is already in flight, the new schedule is rejected unless
-        :meth:`drop_pending` was called first. The solver's lookahead
-        contract is one-anchor-deep, matching the
-        ``recomp_z_threshold``-spaced cache cadence.
-        """
-        self._ensure_gpu_dense_setup()
-        if self._pending_anchor_z is not None:
-            raise RuntimeError(
-                "schedule_rebuild: a rebuild for z="
-                f"{self._pending_anchor_z} is already pending. Consume "
-                "or drop it before scheduling another."
-            )
-        import cupy as cp
-
-        # Photon field eval stays on host (CIB interpolation + CMB
-        # analytic). Upload the small (dph,) result to GPU; D2H is
-        # negligible at ~600 B / anchor.
-        photon_host = np.ascontiguousarray(
-            self.photon_vector(z, pfield=pfield), dtype=np.float64
-        )
-        with self._dot_stream:
-            photon_gpu = cp.asarray(photon_host)
-            cp.dot(self._batch_matrix_gpu, photon_gpu, out=self._pending_result_gpu)
-            event = self._dot_stream.record()
-        self._pending_event = event
-        self._pending_anchor_z = float(z)
-        self._pending_pfield_id = id(pfield) if pfield is not None else None
-
-    def _consume_pending_into_batch_vec(self):
-        """Block on the pending GPU rebuild and D2H-copy to ``_batch_vec``.
-
-        Must be called when ``_pending_anchor_z`` matches the current
-        anchor. The default-stream ``cupy.asnumpy`` waits for the recorded
-        event before issuing the copy, so the host ``_batch_vec`` is
-        populated with the matvec result on return. Resets pending state.
-        """
-        import cupy as cp
-
-        # Wait for the dot's stream to finish before issuing the copy.
-        self._pending_event.synchronize()
-        # cupy.asnumpy with `out=` writes directly into the host buffer.
-        cp.asnumpy(self._pending_result_gpu, out=self._batch_vec)
-        self._pending_event = None
-        self._pending_anchor_z = None
-        self._pending_pfield_id = None
-
-    def drop_pending(self):
-        """Discard any in-flight GPU rebuild without consuming it.
-
-        Used when the lookahead's anchor schedule diverges from what the
-        solver actually requests (e.g. a ``force_update=True`` path
-        bypassing the deterministic grid). The pending event is allowed
-        to retire on its own; we just clear the slot so subsequent
-        schedules can proceed.
-        """
-        self._pending_event = None
-        self._pending_anchor_z = None
-        self._pending_pfield_id = None
-
-    def _try_consume_for(self, z, pfield):
-        """If a pending rebuild matches ``(z, pfield)``, consume and return True."""
-        if self._pending_anchor_z is None:
-            return False
-        if abs(self._pending_anchor_z - float(z)) > self._anchor_z_tol:
-            # Anchor mismatch — solver took a step grid we didn't predict.
-            # Drop the stale rebuild and fall back to the sync path.
-            self.drop_pending()
-            return False
-        target_id = id(pfield) if pfield is not None else None
-        if target_id != self._pending_pfield_id:
-            self.drop_pending()
-            return False
-        self._consume_pending_into_batch_vec()
-        return True
-
     def _update_rates(self, z, force_update=False, pfield=None):
         """Batch compute all nonel and inclusive rates if z changes.
 
@@ -676,17 +542,8 @@ class PhotoNuclearInteractionRate(object):
         if pfield is not None or self._ratemat_zcache != z or force_update:
             info(5, "Updating batch rate vectors.")
 
-            # CPU/GPU hybrid lookahead: if a GPU rebuild for this exact
-            # (z, pfield) is already in flight, consume it and skip the
-            # CPU dot. The solver dispatches these at cache-window
-            # boundaries via :meth:`schedule_rebuild`.
             backend = self.prince_run.backend
             if (
-                backend.use_cupy_dense_lookahead
-                and self._try_consume_for(z, pfield)
-            ):
-                pass  # _batch_vec already populated from GPU
-            elif (
                 backend.linear_algebra_backend.lower() == "mkl"
                 and config.has_mkl
                 and config.mkl is not None
