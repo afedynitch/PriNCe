@@ -6,13 +6,49 @@ CI runners and parallel test execution.
 """
 
 import os
-import pickle
-import time
-from pathlib import Path
 
-import numpy as np
+# Cap per-process BLAS / threadpool sizes BEFORE numpy/scipy/MKL get
+# imported below. pytest-xdist's ``-n auto`` spawns one worker per
+# logical CPU; without these caps each worker opens its own
+# ``cpu_count``-sized OpenBLAS/MKL/OMP pool, so the host ends up
+# running ~cpu_count^2 contended threads (server lockup on a 48-core
+# box). One thread per worker is the safe default; user can override
+# from the calling environment.
+for _name in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_name, "1")
 
-import prince_cr.config as config
+import pickle  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+import prince_cr.config as config  # noqa: E402
+
+# Belt-and-suspenders: if some BLAS backend already initialised its
+# threadpool from a default-on bonus path before this module ran (e.g.
+# imported transitively by another conftest), cap it now via
+# threadpoolctl. Tolerated as best-effort — threadpoolctl is in the
+# project's runtime extras but not strictly required by tests.
+try:
+    from threadpoolctl import threadpool_limits, threadpool_info
+
+    threadpool_limits(limits=1)
+    # Verbose-mode probe: surfaces the cap (or a missed pool) before tests
+    # start. Cheap; runs once per process.
+    if os.environ.get("PRINCE_TEST_VERBOSE_THREADS") == "1":
+        for tp in threadpool_info():
+            print(f"[threads] {tp['user_api']} via {tp['internal_api']}: "
+                  f"num_threads={tp['num_threads']}")
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------------
 # Global test configuration — applied before any test module is imported.
@@ -78,12 +114,33 @@ def prince_run_m14(pf, cs):
     return core.PriNCeRun(max_mass=14, photon_field=pf, cross_sections=cs)
 
 
+# Light-medium nuclei cap (oxygen-16). Pickled to tests/data/prince_run_m16.ppo
+# on first build; reloads in <1 s. ~10 s build vs the multi-GB Fe-56 cache.
+# Suitable as the default reference for end-to-end solver tests; opts out via
+# PRINCE_REGEN_FIXTURE=1.
+_M16_CACHE = Path(__file__).resolve().parent / "data" / "prince_run_m16.ppo"
+
+
+@pytest.fixture(scope="session")
+def prince_run_m16(pf, cs):
+    """Session-scoped PriNCeRun with max_mass=16 (H..O cap), pickled."""
+    if _M16_CACHE.exists() and not os.environ.get("PRINCE_REGEN_FIXTURE"):
+        with _M16_CACHE.open("rb") as fh:
+            return pickle.load(fh)
+    run = core.PriNCeRun(max_mass=16, photon_field=pf, cross_sections=cs)
+    _M16_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    with _M16_CACHE.open("wb") as fh:
+        pickle.dump(run, fh, protocol=-1)
+    return run
+
+
 # ---------------------------------------------------------------------------
 # Production-size cached kernel for solver benchmarking
 # ---------------------------------------------------------------------------
-# Build the .ppo with: python tests/_build_kernel_cache.py <output_path>
-# Then point PRINCE_KERNEL_CACHE at it. Falls back to a session-scoped build
-# if not set, which is slow (~3 min) but correct.
+# Build the .ppo with: python tests/_build_kernel_cache.py [--max-mass N]
+# <output_path>. Then point PRINCE_KERNEL_CACHE at it. Falls back to a
+# session-scoped build if not set, which is slow (~3 min at max_mass=56)
+# but correct.
 @pytest.fixture(scope="session")
 def cached_prince_run():
     """Production-size PriNCeRun (max_mass=56), loaded from pickle if available."""

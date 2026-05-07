@@ -8,17 +8,17 @@ from prince_cr.util import info, is_nucleus
 import prince_cr.config as config
 
 
-def _cupy_backend_active():
-    """Return True if the current ``config.linear_algebra_backend`` is cupy.
+def _cupy_backend_active(prince_run):
+    """Return True if the cupy backend is selected on this run.
 
     Checked at call time rather than module load — bench / test code
     flips the backend across solves on a single ``PriNCeRun``, so a
-    module-level cached flag goes stale. ``has_cupy`` gates the result
-    on cupy actually being importable.
+    cached flag goes stale. ``config.has_cupy`` gates the result on
+    cupy actually being importable in this process.
     """
     return (
         config.has_cupy
-        and config.linear_algebra_backend.lower() == "cupy"
+        and prince_run.backend.linear_algebra_backend.lower() == "cupy"
     )
 
 
@@ -55,8 +55,9 @@ class PhotoNuclearInteractionRate(object):
         self.coupling_mat = None
         self.dense_coupling_mat = None
 
-        # Stage 1.5 GPU dense-matvec lookahead state. Lazily populated
-        # when :meth:`schedule_rebuild` is called for the first time.
+        # GPU dense-matvec lookahead state (CPU/GPU hybrid backend).
+        # Lazily populated when :meth:`schedule_rebuild` is called for
+        # the first time.
         self._batch_matrix_gpu = None
         self._dot_stream = None
         self._pending_event = None
@@ -389,7 +390,7 @@ class PhotoNuclearInteractionRate(object):
     def _init_coupling_mat(self):
         """Initialises the coupling matrix directly in sparse (csr) format.
 
-        Always builds a host scipy CSR — the cupy backend (Stage 2)
+        Always builds a host scipy CSR — the full-GPU cupy backend
         lazily mirrors it to GPU on first use via
         :meth:`_ensure_coupling_mat_gpu`. Decoupling the GPU upload
         from PriNCeRun construction lets bench / test code flip
@@ -413,17 +414,17 @@ class PhotoNuclearInteractionRate(object):
         self._batch_cols = self._batch_cols[self.sortidx]
         self._batch_matrix = self._batch_matrix[self.sortidx, :]
 
-        # Stage 2 cupy mirror state. ``_coupling_mat_gpu`` shares its
-        # ``data`` buffer with ``_batch_vec_gpu`` so the cupy.dot result
-        # inhabits the CSR data slot directly — no scipy <-> cupy round-
-        # trip per cache window.
+        # cupy mirror state (full-GPU backend). ``_coupling_mat_gpu``
+        # shares its ``data`` buffer with ``_batch_vec_gpu`` when their
+        # dtypes match, so the cupy.dot result inhabits the CSR data
+        # slot directly — no scipy ↔ cupy round-trip per cache window.
         self._batch_matrix_gpu = None
         self._batch_vec_gpu = None
         self._coupling_mat_gpu = None
         self._ratemat_zcache_gpu = None
 
     # ------------------------------------------------------------------
-    # Stage 2: full cupy backend (GPU dense matvec + GPU SpMV)
+    # Full-GPU cupy backend (GPU dense matvec + GPU SpMV)
     # ------------------------------------------------------------------
     def _ensure_coupling_mat_gpu(self):
         """Lazily upload ``_batch_matrix`` and the coupling sparsity to GPU.
@@ -431,25 +432,37 @@ class PhotoNuclearInteractionRate(object):
         Runs at most once per PriNCeRun — subsequent calls are no-ops.
         Builds:
 
-        * ``_batch_matrix_gpu``:  fp32 cupy mirror of the dense rate
-          kernel (~80 MB at ``max_mass=56``).
-        * ``_batch_vec_gpu``:  fp32 cupy ndarray sized to the host
-          coupling matrix's ``nnz``. Holds the result of each cache-
-          window dense matvec; aliased into ``_coupling_mat_gpu.data``
-          so SpMVs against the coupling matrix see the freshest values
-          without a separate refresh.
-        * ``_coupling_mat_gpu``:  cupyx.scipy.sparse.csr_matrix backed
-          by ``_batch_vec_gpu`` (data) and the host CSR's
-          ``indices`` / ``indptr`` uploaded as int32.
+        * ``_batch_matrix_gpu``:  cupy mirror of the dense rate kernel
+          (~80 MB at ``max_mass=56``), in ``cupy_xs_dtype`` (fp32 for
+          the SGEMM win, fp64 for parity with scipy).
+        * ``_batch_vec_gpu``:  cupy ndarray sized to the host coupling
+          matrix's ``nnz``, in ``cupy_xs_dtype``. Receives the result
+          of each cache-window dense matvec.
+        * ``_coupling_mat_gpu``:  cupyx.scipy.sparse.csr_matrix in
+          ``cupy_dtype`` (the *solver* dtype). Its ``.data`` is what
+          the ETD2 hot path SpMVs against, so per-step arithmetic stays
+          at solver precision regardless of the SGEMM dtype.
+
+        When ``cupy_xs_dtype is None`` (default) or matches
+        ``cupy_dtype``, ``_batch_vec_gpu`` is aliased into
+        ``_coupling_mat_gpu.data`` (no per-window cast). When they
+        differ, ``_update_rates_gpu`` casts ``_batch_vec_gpu`` →
+        ``_coupling_mat_gpu.data`` once per cache window — that cast
+        is the only mixed-precision boundary in the pipeline.
         """
-        dt_active = np.dtype(getattr(config, "cupy_dtype", "float32"))
+        dt_solver = np.dtype(self.prince_run.backend.cupy_dtype)
+        xs_attr = self.prince_run.backend.cupy_xs_dtype
+        dt_xs = np.dtype(xs_attr) if xs_attr is not None else dt_solver
         if (
             self._coupling_mat_gpu is not None
-            and self._coupling_mat_gpu.dtype == dt_active
+            and self._coupling_mat_gpu.dtype == dt_solver
+            and self._batch_matrix_gpu is not None
+            and self._batch_matrix_gpu.dtype == dt_xs
         ):
             return
-        # Dtype switch (e.g. bench flipping fp32 ↔ fp64 between solves):
-        # drop the stale mirror so it rebuilds in the new dtype.
+        # Dtype switch (bench flipping fp32 ↔ fp64, or toggling the
+        # mixed-precision pipeline mid-process): drop the stale mirror
+        # so it rebuilds in the new dtype pair.
         self._coupling_mat_gpu = None
         self._batch_matrix_gpu = None
         self._batch_vec_gpu = None
@@ -461,15 +474,21 @@ class PhotoNuclearInteractionRate(object):
         import cupy as cp
         import cupyx.scipy.sparse as csp
 
-        dt = np.dtype(getattr(config, "cupy_dtype", "float32"))
-        self._batch_matrix_gpu = cp.asarray(self._batch_matrix, dtype=dt)
+        self._batch_matrix_gpu = cp.asarray(self._batch_matrix, dtype=dt_xs)
 
         host_mat = self.coupling_mat
         nnz = host_mat.data.size
-        self._batch_vec_gpu = cp.zeros(nnz, dtype=dt)
+        self._batch_vec_gpu = cp.zeros(nnz, dtype=dt_xs)
+        # When dtypes match, alias data ≡ _batch_vec_gpu (no per-window
+        # cast). When they differ, allocate a separate solver-dtype
+        # buffer; the cast happens in ``_update_rates_gpu``.
+        if dt_xs == dt_solver:
+            coupling_data = self._batch_vec_gpu
+        else:
+            coupling_data = cp.zeros(nnz, dtype=dt_solver)
         self._coupling_mat_gpu = csp.csr_matrix(
             (
-                self._batch_vec_gpu,
+                coupling_data,
                 cp.asarray(host_mat.indices, dtype=cp.int32),
                 cp.asarray(host_mat.indptr, dtype=cp.int32),
             ),
@@ -480,13 +499,15 @@ class PhotoNuclearInteractionRate(object):
         self._ratemat_zcache_gpu = None
 
     def _update_rates_gpu(self, z, pfield=None):
-        """Stage 2: GPU dense matvec → ``_batch_vec_gpu``.
+        """GPU dense matvec → ``_batch_vec_gpu`` (xs dtype), then upcast
+        (if needed) into ``_coupling_mat_gpu.data`` (solver dtype).
 
-        Dtype follows ``config.cupy_dtype`` (default fp32). Mirrors the
-        host ``_update_rates`` semantics: returns True if a recompute
-        happened, False if the (z, pfield) cache hit. The result lands
-        directly in the coupling matrix's data buffer (``_batch_vec_gpu``
-        is aliased to ``_coupling_mat_gpu.data``).
+        Mirrors the host ``_update_rates`` semantics: returns True if a
+        recompute happened, False if the (z, pfield) cache hit. When
+        ``cupy_xs_dtype == cupy_dtype`` (or unset), ``_batch_vec_gpu``
+        IS the coupling-matrix data buffer (no cast). When they differ
+        — the mixed-precision pipeline — the cast bridges fp32 SGEMM
+        output to the fp64 ETD2 hot path.
         """
         import cupy as cp
 
@@ -497,23 +518,29 @@ class PhotoNuclearInteractionRate(object):
         photon_host = self.photon_vector(z, pfield=pfield)
         photon_gpu = cp.asarray(photon_host, dtype=self._batch_matrix_gpu.dtype)
         cp.dot(self._batch_matrix_gpu, photon_gpu, out=self._batch_vec_gpu)
+        # Mixed-precision: bridge xs-dtype matvec result into the
+        # solver-dtype coupling-matrix data buffer. ``cp.copyto`` casts
+        # element-wise on the device. No-op when buffers are aliased
+        # (single-precision pipeline).
+        if self._coupling_mat_gpu.data is not self._batch_vec_gpu:
+            cp.copyto(self._coupling_mat_gpu.data, self._batch_vec_gpu)
         # Override path: don't latch the cache, so the next normal call
         # recomputes against the default photon field.
         self._ratemat_zcache_gpu = None if is_override else z
         return True
 
     # ------------------------------------------------------------------
-    # Stage 1.5 hybrid: GPU dense-matvec lookahead
+    # CPU/GPU hybrid: GPU dense-matvec lookahead
     # ------------------------------------------------------------------
     def _ensure_gpu_dense_setup(self):
         """Upload ``_batch_matrix`` to GPU and allocate the result/stream.
 
         Runs at most once per instance — subsequent calls are no-ops.
         Uploads in float64 to keep the lookahead numerically equivalent
-        to the host ``np.dot`` baseline; the existing legacy cupy branch
-        (``backend == 'cupy'``) downcasts to float32, which is a
-        separate concern (Stage 2). The ~165 MB batch matrix at
-        max_mass=56 fits comfortably on a 24 GB RTX 3090.
+        to the host ``np.dot`` baseline; the full-GPU cupy backend has
+        its own dtype dispatch (see :meth:`_ensure_coupling_mat_gpu`).
+        The ~165 MB batch matrix at max_mass=56 fits comfortably on a
+        24 GB RTX 3090.
         """
         if self._batch_matrix_gpu is not None:
             return
@@ -529,8 +556,8 @@ class PhotoNuclearInteractionRate(object):
         if isinstance(self._batch_matrix, np.ndarray):
             self._batch_matrix_gpu = cp.asarray(self._batch_matrix, dtype=np.float64)
         else:
-            # cupy ndarray (legacy cupy backend, possibly float32). The
-            # lookahead path always wants float64; upcast if needed.
+            # cupy ndarray from the full-GPU backend (possibly fp32).
+            # The lookahead path always wants float64; upcast if needed.
             if self._batch_matrix.dtype != np.float64:
                 self._batch_matrix_gpu = self._batch_matrix.astype(np.float64)
             else:
@@ -638,9 +665,9 @@ class PhotoNuclearInteractionRate(object):
         Returns:
             (bool): True if fields we indeed updated, False if nothing happened.
         """
-        # Stage 2: fully GPU. Bypasses the host ``_batch_vec`` and writes
-        # directly into the GPU coupling matrix's data buffer.
-        if _cupy_backend_active():
+        # Full-GPU cupy backend: bypass the host ``_batch_vec`` and
+        # write directly into the GPU coupling matrix's data buffer.
+        if _cupy_backend_active(self.prince_run):
             self._ensure_coupling_mat_gpu()
             if not (force_update or self._ratemat_zcache_gpu != z or pfield is not None):
                 return False
@@ -649,26 +676,28 @@ class PhotoNuclearInteractionRate(object):
         if pfield is not None or self._ratemat_zcache != z or force_update:
             info(5, "Updating batch rate vectors.")
 
-            # Stage 1.5: if a GPU rebuild for this exact (z, pfield) is
-            # already in flight, consume it and skip the CPU dot. The
-            # solver dispatches these in lookahead at cache-window
-            # boundaries (see propagation.py § Stage 1.5 lookahead).
+            # CPU/GPU hybrid lookahead: if a GPU rebuild for this exact
+            # (z, pfield) is already in flight, consume it and skip the
+            # CPU dot. The solver dispatches these at cache-window
+            # boundaries via :meth:`schedule_rebuild`.
+            backend = self.prince_run.backend
             if (
-                getattr(config, "use_cupy_dense_lookahead", False)
+                backend.use_cupy_dense_lookahead
                 and self._try_consume_for(z, pfield)
             ):
                 pass  # _batch_vec already populated from GPU
             elif (
-                config.linear_algebra_backend.lower() == "mkl"
+                backend.linear_algebra_backend.lower() == "mkl"
                 and config.has_mkl
                 and config.mkl is not None
-                and getattr(config, "use_mkl_dense_matvec", True)
+                and backend.use_mkl_dense_matvec
             ):
                 # Route through MKL CBLAS DGEMV so the dense matvec
-                # shares MKL's threadpool with the Sparse BLAS path. On
-                # Zen 2 this avoids the OpenBLAS-vs-MKL oversubscription
-                # that capped Stage 1's whole-solve at t=4. See
-                # wiki/methods/prince-mkl-cupy-backend.md § Stage 1.1.
+                # shares MKL's threadpool with the Sparse BLAS path,
+                # avoiding the OpenBLAS-vs-MKL oversubscription that
+                # otherwise caps the whole solve. Disabled by default
+                # because Zen + MKL 2026 dispatches DGEMV serially
+                # (see :data:`config.use_mkl_dense_matvec`).
                 from . import mkl_dense
 
                 mkl_dense.dgemv_y_eq_Ax(
@@ -697,12 +726,15 @@ class PhotoNuclearInteractionRate(object):
         """
         # Do not execute dot product if photon field didn't change
         if self._update_rates(z, force_update, pfield=pfield):
-            if _cupy_backend_active():
-                # Stage 2: data already lives in ``_batch_vec_gpu`` ≡
-                # ``_coupling_mat_gpu.data``. Apply the scale in place.
+            if _cupy_backend_active(self.prince_run):
+                # Full-GPU path: matvec already wrote (and cast, if
+                # mixed-precision) into ``_coupling_mat_gpu.data``.
+                # Apply the scale in place at solver precision so the
+                # ``scale_fac`` factor never roundtrips through fp32.
                 # Fast path for the common ``scale_fac == 1.0`` case.
                 if scale_fac != 1.0:
-                    self._batch_vec_gpu *= self._batch_vec_gpu.dtype.type(scale_fac)
+                    data = self._coupling_mat_gpu.data
+                    data *= data.dtype.type(scale_fac)
                 return
             # Sparsity-pattern contract (see CLAUDE.md): only `data` is mutated;
             # `indices`/`indptr` were fixed by `_init_coupling_mat`. SpMV backends
@@ -729,7 +761,7 @@ class PhotoNuclearInteractionRate(object):
     def get_hadr_jacobian(self, z, scale_fac=1.0, force_update=False, pfield=None):
         """Returns the nonel rate vector and coupling matrix."""
         self._update_coupling_mat(z, scale_fac, force_update, pfield=pfield)
-        if _cupy_backend_active():
+        if _cupy_backend_active(self.prince_run):
             return self._coupling_mat_gpu
         return self.coupling_mat
 

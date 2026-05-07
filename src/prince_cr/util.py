@@ -394,23 +394,32 @@ class AdditiveDictionary(dict):
 
 
 class PrinceProgressBar(object):
-    """This is a wrapper around tqdm to process some prince
-    argument handling, making it optional, for notebooks and
-    python scripts using the bar_type argument."""
+    """tqdm wrapper used by the solver ``solve(progressbar=...)`` arg.
 
-    def __init__(self, bar_type=None, nsteps=None):
-        if bar_type is None or bar_type is False:
+    ``bar_type`` semantics (matches the original 2020 API):
+
+    * ``None`` / ``False``       — disabled (no-op).
+    * ``True``                   — terminal bar.
+    * ``"notebook"``             — Jupyter widget bar.
+    * any other truthy string    — treated as a tqdm description.
+    """
+
+    def __init__(self, bar_type=None, nsteps=None, desc=None):
+        if not bar_type:
             self.pbar = None
-        elif bar_type == "notebook":
-            from tqdm import tqdm_notebook as tqdm
-
-            self.pbar = tqdm(total=nsteps)
-            self.pbar.update()
+            return
+        if bar_type == "notebook":
+            # tqdm.tqdm_notebook is deprecated since tqdm 4.x and
+            # raises DeprecationWarning under PriNCe's filterwarnings
+            # ``error::DeprecationWarning`` setting in pytest config.
+            from tqdm.notebook import tqdm
         else:
             from tqdm import tqdm
-
-            self.pbar = tqdm(total=nsteps)
-            self.pbar.update()
+        if desc is None and isinstance(bar_type, str) and bar_type not in (
+            "notebook",
+        ):
+            desc = bar_type
+        self.pbar = tqdm(total=nsteps, desc=desc)
 
     def __enter__(self):
         return self

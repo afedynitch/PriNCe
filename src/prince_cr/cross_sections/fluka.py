@@ -90,7 +90,13 @@ class FlukaPhotoNuclear(CrossSectionBase):
     def __init__(self, *args, **kwargs):
         # Tells the interpolator we have differential channels
         self.supports_redistributions = True
-        config.max_mass = kwargs.pop("max_mass", config.max_mass)
+        self.max_mass = kwargs.pop("max_mass", config.max_mass)
+        # Explicit db location overrides the module globals — pass when
+        # running multiple builds from the same process or in tests.
+        # ``None`` falls back to ``config.fluka_db_path`` /
+        # ``config.fluka_db_fname`` at load time.
+        self.db_path = kwargs.pop("db_path", None)
+        self.db_fname = kwargs.pop("db_fname", None)
         model_tag = kwargs.pop("model_tag", "FLUKA_2025")
         CrossSectionBase.__init__(self)
         self._load(model_tag)
@@ -103,7 +109,9 @@ class FlukaPhotoNuclear(CrossSectionBase):
         tables = db_handler.fluka_photo_nuclear_db(
             model_tag,
             e_range=config.cross_section_e_range,
-            max_mass=config.max_mass,
+            max_mass=self.max_mass,
+            db_path=self.db_path,
+            db_fname=self.db_fname,
         )
 
         self._egrid_tab = tables["energy_grid"]    # GeV
@@ -134,7 +142,7 @@ class FlukaPhotoNuclear(CrossSectionBase):
         ):
             mo = _normalize_pdg(raw_mo)
             A, _, _ = get_AZN(mo)
-            if A > config.max_mass:
+            if A > self.max_mass:
                 continue
             self._nonel_tab[mo] = sig              # cm^2
 
@@ -167,7 +175,7 @@ class FlukaPhotoNuclear(CrossSectionBase):
             if not is_nucleus(da) or A_da < 2 or A_da > A_mo:
                 _warn_misclassified(int(raw_mo), int(raw_da))
                 continue
-            if A_mo > config.max_mass:
+            if A_mo > self.max_mass:
                 continue
             # Daughter-only species: not a primary mother → kernel KeyError.
             # Drop with audit. Free nucleons (2212/2112) reach this code path
@@ -196,7 +204,7 @@ class FlukaPhotoNuclear(CrossSectionBase):
                 "A=56 production cap, OR rerun the FLUKA decay generator "
                 "after photo-nuclear so the missing isotopes get covered.".format(
                     len(_daughter_only_dropped),
-                    config.max_mass,
+                    self.max_mass,
                     sum(_daughter_only_dropped.values()),
                     preview,
                     "" if len(ranked) <= 15 else " (+{0} more)".format(len(ranked) - 15),
@@ -217,7 +225,7 @@ class FlukaPhotoNuclear(CrossSectionBase):
                 continue
             mo = _normalize_pdg(raw_mo)
             A_mo, _, _ = get_AZN(mo)
-            if A_mo > config.max_mass:
+            if A_mo > self.max_mass:
                 continue
             dsig_dx = yld_3d.T / xwidths[:, None]
             if A_mo > 1:

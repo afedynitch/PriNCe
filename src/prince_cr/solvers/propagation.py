@@ -5,7 +5,7 @@ import scipy.sparse as sp
 
 from prince_cr.cosmology import H
 from prince_cr.data import PRINCE_UNITS, EnergyGrid
-from prince_cr.util import info
+from prince_cr.util import PrinceProgressBar, info
 import prince_cr.config as config
 
 from .partial_diff import DifferentialOperator
@@ -194,8 +194,15 @@ class UHECRPropagationSolver(object):
         self.final_z = final_z + z_offset
         self.z_offset = z_offset
 
+        # Per-run backend dispatch handle. Solver code reads
+        # ``self.backend.<knob>`` rather than ``config.<knob>`` so a
+        # single process can run multiple PriNCeRun instances with
+        # different backend settings.
+        self.prince_run = prince_run
+        self.backend = prince_run.backend
+
         self.current_z_rates = None
-        self.recomp_z_threshold = config.update_rates_z_threshold
+        self.recomp_z_threshold = self.backend.update_rates_z_threshold
 
         self.spec_man = prince_run.spec_man
         self.egrid = prince_run.cr_grid.grid
@@ -318,25 +325,23 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self._etd2_apply_F = None
         self._etd2_apply_F_params = {"dldz": 1.0, "kappa": None, "b": None}
         self._etd2_b_buf = None
-        self._backend = config.linear_algebra_backend.lower()
-        # Stage 2 cupy backend uses the same GPU-side dense matvec
-        # path as Stage 1.5 (handled in interaction_rates), but
-        # consumes the result on-device rather than D2H-copying. The
-        # `_lookahead_*` machinery is re-used — see
-        # ``_schedule_next_lookahead_anchor``.
+        self._backend = self.backend.linear_algebra_backend.lower()
+        # The full-GPU cupy backend reuses the dense-matvec lookahead
+        # plumbing from the CPU/GPU hybrid backend (handled in
+        # ``interaction_rates``) but consumes the result on-device.
         self._is_cupy_backend = self._backend == "cupy"
-        # Stage 1.5 hybrid lookahead state. Populated at solve() start
+        # CPU/GPU hybrid lookahead state. Populated at solve() start
         # when ``config.use_cupy_dense_lookahead`` is True; reset after.
         self._lookahead_anchors = None
         self._next_anchor_idx = 0
-        # Stage 3 cupy persistent device buffers. Allocated once per
-        # solve (in :meth:`_ensure_apply_F_cupy`) and held for the
-        # whole integration so the per-step body is alloc-free —
-        # required for kernel fusion to pay off at the per-step scale
-        # and for stable buffer addresses inside captured CUDA Graphs.
-        # Per-step values (kappa, b, dldz, d) are refreshed in place;
-        # cache-window-bound values (M_diag, D_diag) are referenced by
-        # the apply_F closure and rebound on cache window refresh.
+        # cupy persistent device buffers. Allocated once per solve (in
+        # :meth:`_ensure_apply_F_cupy`) and held for the whole integration
+        # so the per-step body is alloc-free — required for kernel fusion
+        # to pay off at the per-step scale and for stable buffer addresses
+        # inside captured CUDA Graphs. Per-step values (kappa, b, dldz, d)
+        # are refreshed in place; cache-window-bound values (M_diag,
+        # D_diag) are referenced by the apply_F closure and rebound on
+        # cache window refresh.
         self._etd2_d_buf_cp = None
         self._etd2_kappa_buf_cp = None
         self._etd2_b_buf_cp = None
@@ -348,7 +353,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # the same handles via in-place data updates; the GPU path
         # currently re-splits — see :meth:`_refresh_z_caches`).
         self._etd2_apply_F_state_cp = None
-        # Stage 3 CUDA Graph machinery. Allocated lazily when
+        # CUDA Graph machinery. Allocated lazily when
         # ``config.use_cuda_graphs`` is True. Re-captured on each cache
         # window refresh because the SpMV kernel calls inside
         # ``apply_F`` close over the current ``M_off`` / ``D_off``
@@ -379,7 +384,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
 
         first_window = self._etd2_M_raw_off is None
         if self._is_cupy_backend:
-            # Stage 2 path: ``M`` is a cupyx.scipy.sparse.csr_matrix
+            # Full-GPU path: ``M`` is a cupyx.scipy.sparse.csr_matrix
             # already on-device (see :meth:`PhotoNuclearInteractionRate.
             # _update_rates_cupy`). The xp-aware ``split_operator``
             # returns cupy arrays. Re-splitting each cache window is a
@@ -389,10 +394,10 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             d_M, M_off = split_operator(M)
             self._etd2_M_raw_diag = d_M
             self._etd2_M_raw_off = M_off
-            # Stage 3: the apply_F closure dereferences M_off / D_off
-            # through a mutable container so we can swap pointers here
-            # without rebuilding it. Triggers re-capture of the CUDA
-            # graph (if active) on the next ``_operator_at_cupy``.
+            # The apply_F closure dereferences M_off / D_off through a
+            # mutable container so we can swap pointers here without
+            # rebuilding it. Triggers re-capture of the CUDA graph (if
+            # active) on the next ``_operator_at_cupy``.
             self._rebind_apply_F_cupy()
         elif first_window:
             d_M, M_off = split_operator(M)
@@ -433,10 +438,10 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
 
         self.current_z_rates = z
 
-        # Stage 1.5: dispatch the next anchor's GPU dense matvec in the
-        # background while this cache window's ETD2 steps run on CPU. The
-        # consume happens inside the next ``_refresh_z_caches`` call via
-        # ``had_int_rates._try_consume_for(z)``.
+        # CPU/GPU hybrid: dispatch the next anchor's GPU dense matvec in
+        # the background while this cache window's ETD2 steps run on CPU.
+        # The consume happens inside the next ``_refresh_z_caches`` call
+        # via ``had_int_rates._try_consume_for(z)``.
         self._schedule_next_lookahead_anchor()
 
     def _ensure_D_split(self):
@@ -466,14 +471,13 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 )
 
         if self._is_cupy_backend:
-            # Stage 2: upload D split to GPU once. Stored under the same
-            # attribute names as the host path — ``_make_apply_F_cupy``
-            # reads them as cupy arrays. Dtype follows ``config.cupy_dtype``
-            # (default fp32; see config.py).
+            # Full-GPU: upload D split to GPU once. Stored under the
+            # same attribute names as the host path — ``_make_apply_F_cupy``
+            # reads them as cupy arrays. Dtype follows ``config.cupy_dtype``.
             import cupy as cp
             import cupyx.scipy.sparse as csp
 
-            dt = np.dtype(getattr(config, "cupy_dtype", "float32"))
+            dt = np.dtype(self.backend.cupy_dtype)
             self._etd2_D_diag = cp.asarray(d_D, dtype=dt)
             D_off_cast = D_off.astype(dt)
             self._etd2_D_off = csp.csr_matrix(
@@ -574,7 +578,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         return off_to_M, diag_to_M
 
     # ------------------------------------------------------------------
-    # Stage 1.5: deterministic-grid lookahead for GPU dense matvec
+    # Hybrid-backend deterministic-grid lookahead for GPU dense matvec
     # ------------------------------------------------------------------
     def _compute_lookahead_anchors(self, z_grid):
         """Predict the redshifts at which ``_refresh_z_caches`` will fire.
@@ -597,7 +601,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
 
     def _lookahead_active(self):
         return (
-            getattr(config, "use_cupy_dense_lookahead", False)
+            self.backend.use_cupy_dense_lookahead
             and config.has_cupy
             and self._lookahead_anchors is not None
         )
@@ -613,8 +617,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self.had_int_rates.schedule_rebuild(z_next)
         self._next_anchor_idx = idx + 1
 
-    @staticmethod
-    def _build_mkl_handle(off, optimize=True, blocksize=_DEFAULT):
+    def _build_mkl_handle(self, off, optimize=True, blocksize=_DEFAULT):
         """Wrap a scipy CSR/COO/etc. off-diagonal into an MklSparseMatrix.
 
         Returns ``None`` if the matrix has zero nnz — the kernel skips the
@@ -628,11 +631,10 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         (PriNCe's photo-hadronic ``M_off``); ``True`` for matrices that
         are constant for the whole solve (the FD operator ``D_off``).
 
-        ``blocksize`` defaults to ``config.mkl_bsr_blocksize`` (currently 2,
-        the photo-hadronic sweet spot). Pass ``None`` to force CSR
-        regardless of the global default — used for matrices like the FD
-        operator where the BSR sweet spot wasn't measured and CSR opt=True
-        is already fast.
+        ``blocksize`` defaults to ``self.backend.mkl_bsr_blocksize``.
+        Pass ``None`` to force CSR regardless of the run setting — used
+        for matrices like the FD operator where the BSR sweet spot
+        wasn't measured and CSR opt=True is already fast.
         """
         from .. import mkl_sparse
 
@@ -643,7 +645,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         if off.nnz == 0:
             return None
         if blocksize is _DEFAULT:
-            blocksize = getattr(config, "mkl_bsr_blocksize", None)
+            blocksize = self.backend.mkl_bsr_blocksize
         return mkl_sparse.MklSparseMatrix(off, blocksize=blocksize, optimize=optimize)
 
     def _operator_at(self, z):
@@ -678,7 +680,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             self._refresh_z_caches(z)
 
         if self._etd2_apply_F is None:
-            # Stage 3 cupy path needs host kappa scratch up too —
+            # cupy path needs host kappa scratch too —
             # ``_ensure_apply_F_cupy`` allocates it alongside the
             # persistent device buffers. Both branches require
             # ``_refresh_z_caches`` to have run first (M_off must exist),
@@ -752,7 +754,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             self._etd2_apply_F = self._make_apply_F_scipy()
 
     def _operator_at_cupy(self, z, dldz, kappa_host, b_host):
-        """Stage 3 cupy variant: refresh persistent device buffers.
+        """cupy variant: refresh persistent device buffers.
 
         Writes per-step values into pre-allocated device buffers, then
         evaluates ``d = dldz · (M_diag + κ ⊙ D_diag)`` via the fused
@@ -822,7 +824,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         """
         import cupy as cp
 
-        dt = np.dtype(getattr(config, "cupy_dtype", "float32"))
+        dt = np.dtype(self.backend.cupy_dtype)
         n = self.dim_states
 
         # Host scratch for kappa accumulation (used by ``_operator_at``
@@ -895,7 +897,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         cache-window refresh path can swap them without rebuilding the
         closure.
 
-        Compared with the Stage 2 ``cp.copyto(out, M_off @ x)`` /
+        Compared with the eager ``cp.copyto(out, M_off @ x)`` /
         ``out += D_off @ kx`` / ``out *= dldz`` / ``out += b`` chain,
         this saves ~3 launches per ``apply_F`` call (2 calls/step) plus
         the implicit allocations in cupy's sparse ``@``.
@@ -996,8 +998,8 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             state,
         )
 
-    def _solve_loop_graphs(self, state, z_grid):
-        """Stage 3 graph-capture integration loop.
+    def _solve_loop_graphs(self, state, z_grid, step_hook=None):
+        """CUDA Graph capture/replay integration loop.
 
         Replaces :func:`etd2.integrate` for the cupy-with-graphs path.
         Per cache window: warmup step (eager), capture step (records
@@ -1010,6 +1012,13 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         dldz scalar) happens outside the captured region; the graph
         only contains the per-step kernel sequence built by
         :meth:`_step_body_cupy_graph`.
+
+        Parameters
+        ----------
+        step_hook : callable, optional
+            Invoked once per step after the device kernels are
+            scheduled (graph launch / eager body); used by
+            ``solve(progressbar=...)``.
         """
         import cupy as cp
         from .etd2 import _step_buffers, cupy_kernels
@@ -1130,6 +1139,9 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                     # Replay — single graph.launch per step.
                     self._etd2_graph_exec.launch(stream)
 
+            if step_hook is not None:
+                step_hook()
+
         stream.synchronize()
         return state
 
@@ -1226,7 +1238,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 "_etd2_M_raw_diag",
                 "_etd2_D_off",
                 "_etd2_D_diag",
-                # Stage 3 persistent device buffers + graph machinery.
+                # cupy persistent device buffers + graph machinery.
                 "_etd2_d_buf_cp",
                 "_etd2_kappa_buf_cp",
                 "_etd2_b_buf_cp",
@@ -1285,7 +1297,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # changes when ``_refresh_z_caches`` runs split_operator on the
         # first window — the CPU closure pins ``M_off`` by reference).
         self._etd2_apply_F = None
-        # On Stage 2 cupy backend, also drop the cupy D split so
+        # On the full-GPU cupy backend, also drop the cupy D split so
         # ``_ensure_D_split`` rebuilds it for this solve. (The host
         # path keeps D — it's truly constant for the lifetime of the
         # PriNCeRun, but the GPU mirror may have come from a prior
@@ -1293,8 +1305,8 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         if self._is_cupy_backend:
             self._etd2_D_diag = None
             self._etd2_D_off = None
-            # Stage 3 persistent cupy buffers + apply_F state. Dropped
-            # so this solve starts fresh — they get reallocated by
+            # Persistent cupy buffers + apply_F state. Dropped so this
+            # solve starts fresh — they get reallocated by
             # :meth:`_ensure_apply_F_cupy` on the first
             # :meth:`_operator_at_cupy` call.
             self._etd2_d_buf_cp = None
@@ -1314,44 +1326,51 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         if self._is_cupy_backend:
             import cupy as cp
 
-            dt = np.dtype(getattr(config, "cupy_dtype", "float32"))
+            dt = np.dtype(self.backend.cupy_dtype)
             state = cp.zeros(self.dim_states, dtype=dt)
         else:
             state = np.zeros(self.dim_states)
 
-        # Stage 1.5 lookahead bookkeeping. Compute the cache-window
-        # anchor schedule from the deterministic z_grid + threshold,
-        # drop any stale GPU rebuild from a previous solve, and
-        # prime the first anchor before entering the integrate loop —
-        # the first ``_refresh_z_caches`` call will consume it.
-        # Stage 2 cupy backend has its own GPU dense-matvec path and
-        # does not use the Stage 1.5 lookahead machinery.
+        # Hybrid-lookahead bookkeeping. Compute the cache-window anchor
+        # schedule from the deterministic z_grid + threshold, drop any
+        # stale GPU rebuild from a previous solve, and prime the first
+        # anchor before entering the integrate loop — the first
+        # ``_refresh_z_caches`` call will consume it. The full-GPU cupy
+        # backend has its own GPU dense-matvec path and does not use
+        # the lookahead machinery.
         if (
             not self._is_cupy_backend
-            and getattr(config, "use_cupy_dense_lookahead", False)
+            and self.backend.use_cupy_dense_lookahead
             and config.has_cupy
         ):
             self._lookahead_anchors = self._compute_lookahead_anchors(z_grid)
             self._next_anchor_idx = 0
             self.had_int_rates.drop_pending()
             self._schedule_next_lookahead_anchor()
-            info(2, f"ETD2 Stage 1.5: scheduled {len(self._lookahead_anchors)} "
-                    "GPU dense-matvec anchors for lookahead.")
+            info(2, f"ETD2: scheduled {len(self._lookahead_anchors)} "
+                    "GPU dense-matvec anchors for hybrid-backend lookahead.")
         else:
             self._lookahead_anchors = None
             self._next_anchor_idx = 0
 
         self.pre_step_hook(self.initial_z)
 
-        info(2, f"ETD2: integrating with {len(z_grid) - 1} steps of dz≈{dz_step:.2e}")
-        if (
-            self._is_cupy_backend
-            and getattr(config, "use_cuda_graphs", False)
-            and config.has_cupy
-        ):
-            self._solve_loop_graphs(state, z_grid)
-        else:
-            integrate(state, z_grid, operator_at=self._operator_at)
+        nsteps = len(z_grid) - 1
+        info(2, f"ETD2: integrating with {nsteps} steps of dz≈{dz_step:.2e}")
+        with PrinceProgressBar(bar_type=progressbar, nsteps=nsteps) as pbar:
+            step_hook = pbar.update if pbar.pbar is not None else None
+            if (
+                self._is_cupy_backend
+                and self.backend.use_cuda_graphs
+                and config.has_cupy
+            ):
+                self._solve_loop_graphs(state, z_grid, step_hook=step_hook)
+            else:
+                integrate(
+                    state, z_grid,
+                    operator_at=self._operator_at,
+                    step_hook=step_hook,
+                )
 
         # Done with the solve — clear lookahead state.
         if self._lookahead_anchors is not None:
@@ -1377,3 +1396,434 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             print(f"  steps: {len(z_grid) - 1}")
             print(f"  initial z: {self.initial_z} → final z: {self.final_z}")
             print(f"  wall time: {end_time - start_time:.3f} s")
+
+
+class _MultiRHSView:
+    """Per-RHS view of a :class:`MultiRHSPropagationSolverETD2`.
+
+    Each instance owns its own ``list_of_sources`` (the sources whose
+    injection feeds the k-th column of the multi-RHS state matrix) and
+    exposes ``.res`` returning a :class:`UHECRPropagationResult`
+    backed by column k of the parent's state.
+    """
+
+    def __init__(self, parent, k):
+        self.parent = parent
+        self.k = k
+        self.list_of_sources = []
+
+    def add_source_class(self, source_instance):
+        self.list_of_sources.append(source_instance)
+
+    @property
+    def state(self):
+        s = self.parent.state
+        if s.ndim == 2:
+            return s[:, self.k]
+        return s
+
+    @property
+    def res(self):
+        return UHECRPropagationResult(
+            self.state, self.parent.egrid, self.parent.spec_man
+        )
+
+
+class MultiRHSPropagationSolverETD2(UHECRPropagationSolverETD2):
+    """ETD2 integrator that propagates K independent RHSs simultaneously.
+
+    The operator ``L(z) = J(z) + dl/dz · D · diag(κ(z))``, the dense
+    rate-cache rebuild, and all diagonal factors (κ, eD, phi1, phi2)
+    depend only on z and are shared across all K solutions. Per-RHS
+    state lives as columns of a ``(dim_states, K)`` array; per-RHS
+    injection sources are attached via ``solver[k].add_source_class``.
+
+    Compared with K back-to-back single-RHS solves, this replaces the
+    four per-step CSR SpMVs with four CSR-SpMMs (M_off, D_off in each
+    of the two ``apply_F`` calls). At max_mass=24, scipy SpMM gives
+    ~3.5× per-RHS at K=64; cupy/cuSPARSE gives ~36×. Cache-window work
+    is K-independent.
+
+    v1 limitations:
+
+    * MKL backend falls through to scipy SpMM (we don't yet wrap
+      ``mkl_sparse_d_mm``). Set ``linear_algebra_backend = "scipy"`` or
+      ``"cupy"`` for explicit selection.
+    * CUDA Graph capture is not implemented for the multi-RHS path
+      (cupy 14 blocks cuSPARSE during capture; the eager cuSPARSE SpMM
+      is already K-amortised so the graph win is small).
+    """
+
+    def __init__(self, *args, K, **kwargs):
+        if K < 1:
+            raise ValueError(f"K must be >= 1, got {K!r}")
+        super().__init__(*args, **kwargs)
+        self._K = int(K)
+        self._views = [_MultiRHSView(self, k) for k in range(self._K)]
+        # Pre-allocate the host state shape so ``solver[k].state`` works
+        # before solve() (returns zeros, like the parent).
+        self.state = np.zeros((self.dim_states, self._K))
+        # Multi-RHS state-shape scratch buffers, allocated lazily by
+        # :meth:`_ensure_apply_F` / :meth:`_ensure_apply_F_cupy`.
+        self._etd2_KX_buf = None
+        self._etd2_KX_buf_cp = None
+        self._etd2_B_buf_cp = None
+
+    # ------------------------------------------------------------------
+    # View access
+    # ------------------------------------------------------------------
+    def __len__(self):
+        return self._K
+
+    def __getitem__(self, k):
+        return self._views[k]
+
+    @property
+    def K(self):
+        return self._K
+
+    def add_source_class(self, source_instance):
+        raise TypeError(
+            "MultiRHSPropagationSolverETD2 expects per-RHS sources via "
+            "solver[k].add_source_class(...). The k-th view's sources drive "
+            "the k-th column of the multi-RHS state."
+        )
+
+    @property
+    def list_of_sources(self):
+        # Parent's ``_operator_at`` checks this to decide whether to call
+        # ``injection``. Returning any view's source list makes the
+        # gate behave like "at least one RHS has a source".
+        for v in self._views:
+            if v.list_of_sources:
+                return v.list_of_sources
+        return []
+
+    @list_of_sources.setter
+    def list_of_sources(self, value):
+        # Parent's __init__ writes ``self.list_of_sources = []``; the
+        # setter is a no-op since per-view lists own that state.
+        if value:
+            raise TypeError(
+                "Use solver[k].add_source_class(...) to attach sources to "
+                "the k-th RHS view."
+            )
+
+    @property
+    def res(self):
+        raise TypeError(
+            "MultiRHSPropagationSolverETD2.res is per-view: use "
+            "solver[k].res for the k-th RHS."
+        )
+
+    # ------------------------------------------------------------------
+    # Injection — column k = view k's per-source-class sum
+    # ------------------------------------------------------------------
+    def injection(self, dz, z):
+        f = self.dldz(z) * dz * PRINCE_UNITS.cm2sec
+        out = np.zeros((self.dim_states, self._K))
+        for k, view in enumerate(self._views):
+            srcs = view.list_of_sources
+            if not srcs:
+                continue
+            if len(srcs) > 1:
+                col = np.sum([s.injection_rate(z) for s in srcs], axis=0)
+            else:
+                col = srcs[0].injection_rate(z)
+            out[:, k] = f * col
+        return out
+
+    # ------------------------------------------------------------------
+    # apply_F closures (multi-RHS)
+    # ------------------------------------------------------------------
+    def _ensure_apply_F(self):
+        if self._etd2_apply_F is not None:
+            return
+        # (n,) diag scratch (same as parent).
+        self._etd2_d_buf = np.empty(self.dim_states, dtype=np.float64)
+        self._etd2_kx_buf = np.empty(self.dim_states, dtype=np.float64)
+        self._etd2_kappa_buf = np.zeros_like(
+            self.adia_loss_rates_grid.energy_vector
+        )
+        # (n, K) state-shape scratch.
+        self._etd2_KX_buf = np.empty(
+            (self.dim_states, self._K), dtype=np.float64
+        )
+        # MKL SpMM is not wrapped; force scipy SpMM for v1.
+        self._etd2_apply_F = self._make_apply_F_scipy_multi()
+
+    def _make_apply_F_scipy_multi(self):
+        M_off = self._etd2_M_raw_off
+        D_off = self._etd2_D_off
+        params = self._etd2_apply_F_params
+        KX_buf = self._etd2_KX_buf
+
+        def apply_F(X, OUT):
+            # SpMM: scipy CSR ``@`` 2D dense returns (n, K) ndarray; no
+            # in-place option in scipy.sparse, so we copy into OUT.
+            np.copyto(OUT, M_off.dot(X))
+            kappa = params["kappa"]
+            if kappa is not None:
+                np.multiply(kappa[:, None], X, out=KX_buf)
+                np.add(OUT, D_off.dot(KX_buf), out=OUT)
+            np.multiply(OUT, params["dldz"], out=OUT)
+            B = params["b"]
+            if B is not None:
+                np.add(OUT, B, out=OUT)
+
+        return apply_F
+
+    def _make_apply_F_mkl(self):
+        # MKL Sparse BLAS gemv is single-RHS; mkl_sparse_d_mm not wrapped.
+        # Fall back to scipy SpMM.
+        return self._make_apply_F_scipy_multi()
+
+    def _ensure_apply_F_cupy(self):
+        import cupy as cp
+
+        dt = np.dtype(self.backend.cupy_dtype)
+        n = self.dim_states
+        K = self._K
+        if self._etd2_kappa_buf is None:
+            self._etd2_kappa_buf = np.zeros_like(
+                self.adia_loss_rates_grid.energy_vector
+            )
+        # (n,) device buffers.
+        self._etd2_d_buf_cp = cp.empty(n, dtype=dt)
+        self._etd2_kappa_buf_cp = cp.zeros(n, dtype=dt)
+        self._etd2_dldz_buf_cp = cp.empty(1, dtype=dt)
+        # (n, K) device buffers.
+        self._etd2_KX_buf_cp = cp.empty((n, K), dtype=dt)
+        self._etd2_B_buf_cp = cp.zeros((n, K), dtype=dt)
+        has_kappa = bool(self.enable_partial_diff_jacobian)
+        has_b = bool(self.enable_injection_jacobian) and any(
+            v.list_of_sources for v in self._views
+        )
+        self._etd2_apply_F_state_cp = {
+            "M_off": self._etd2_M_raw_off,
+            "D_off": self._etd2_D_off,
+            "has_kappa": has_kappa,
+            "has_b": has_b,
+        }
+        self._etd2_apply_F = self._make_apply_F_cupy_multi()
+
+    def _make_apply_F_cupy_multi(self):
+        import cupy as cp
+
+        kappa_buf = self._etd2_kappa_buf_cp
+        KX_buf = self._etd2_KX_buf_cp
+        B_buf = self._etd2_B_buf_cp
+        dldz_buf = self._etd2_dldz_buf_cp
+        state = self._etd2_apply_F_state_cp
+
+        def apply_F(X, OUT):
+            M_off = state["M_off"]
+            # eager cuSPARSE SpMM through cupyx.scipy.sparse ``@``.
+            cp.copyto(OUT, M_off @ X)
+            if state["has_kappa"]:
+                cp.multiply(kappa_buf[:, None], X, out=KX_buf)
+                cp.add(OUT, state["D_off"] @ KX_buf, out=OUT)
+            # Tail: out = out * dldz + B (broadcast scalar from
+            # 1-element device buffer).
+            cp.multiply(OUT, dldz_buf, out=OUT)
+            if state["has_b"]:
+                cp.add(OUT, B_buf, out=OUT)
+
+        return apply_F
+
+    def _operator_at_cupy(self, z, dldz, kappa_host, b_host):
+        """Multi-RHS variant: refresh device buffers, compute (n,) ``d``."""
+        import cupy as cp
+        from .etd2 import cupy_kernels
+
+        if self._etd2_apply_F is None:
+            self._ensure_apply_F_cupy()
+
+        dt = self._etd2_dldz_buf_cp.dtype
+        self._etd2_dldz_buf_cp[0] = dt.type(dldz)
+        if kappa_host is not None:
+            cp.copyto(
+                self._etd2_kappa_buf_cp,
+                cp.asarray(kappa_host, dtype=dt),
+            )
+        # B is (n, K) host; per-cycle upload mirrors the single-RHS
+        # path and stays within the cupy mempool's working set.
+        if b_host is not None:
+            cp.copyto(
+                self._etd2_B_buf_cp,
+                cp.asarray(b_host, dtype=dt),
+            )
+
+        K = cupy_kernels()
+        if kappa_host is not None:
+            K.compute_d(
+                self._etd2_M_raw_diag,
+                self._etd2_kappa_buf_cp,
+                self._etd2_D_diag,
+                self._etd2_dldz_buf_cp,
+                self._etd2_d_buf_cp,
+            )
+        else:
+            K.compute_d_no_kappa(
+                self._etd2_M_raw_diag,
+                self._etd2_dldz_buf_cp,
+                self._etd2_d_buf_cp,
+            )
+        return self._etd2_d_buf_cp, self._etd2_apply_F
+
+    def _solve_loop_graphs(self, *args, **kwargs):
+        raise NotImplementedError(
+            "CUDA Graph capture is not implemented for the multi-RHS "
+            "solver; the eager cuSPARSE SpMM is already K-amortised."
+        )
+
+    # ------------------------------------------------------------------
+    # solve() and integration loop
+    # ------------------------------------------------------------------
+    def solve(self, dz=1e-3, verbose=False, summary=False, progressbar=False):
+        from time import time
+
+        start_time = time()
+        info(2, f"ETD2 multi-RHS (K={self._K}): setting up integration")
+
+        dz_step = -float(abs(dz))
+        n_full = int(np.floor((self.final_z - self.initial_z) / dz_step))
+        z_grid = self.initial_z + np.arange(n_full + 1) * dz_step
+        if abs(z_grid[-1] - self.final_z) > 1e-12:
+            z_grid = np.concatenate([z_grid, [self.final_z]])
+
+        # Reset cache-window state so this solve rebuilds the rate
+        # matrix and the apply_F closure from scratch (mirrors parent).
+        self.current_z_rates = None
+        self._etd2_M_raw_off = None
+        self._etd2_M_off_to_M_idx = None
+        self._etd2_M_diag_to_M_idx = None
+        if self._etd2_M_raw_off_mkl is not None:
+            self._etd2_M_raw_off_mkl.close()
+            self._etd2_M_raw_off_mkl = None
+        self._etd2_apply_F = None
+        if self._is_cupy_backend:
+            self._etd2_D_diag = None
+            self._etd2_D_off = None
+            self._etd2_d_buf_cp = None
+            self._etd2_kappa_buf_cp = None
+            self._etd2_KX_buf_cp = None
+            self._etd2_B_buf_cp = None
+            self._etd2_dldz_buf_cp = None
+            self._etd2_apply_F_state_cp = None
+
+        self._ensure_D_split()
+
+        n = self.dim_states
+        K = self._K
+        if self._is_cupy_backend:
+            import cupy as cp
+
+            dt = np.dtype(self.backend.cupy_dtype)
+            STATE = cp.zeros((n, K), dtype=dt)
+        else:
+            STATE = np.zeros((n, K))
+
+        # Multi-RHS does not use the hybrid-backend lookahead machinery
+        # (which is single-RHS-only and tied to the dense matvec
+        # caching pattern); explicitly drop any prior bookkeeping.
+        self._lookahead_anchors = None
+        self._next_anchor_idx = 0
+
+        self.pre_step_hook(self.initial_z)
+        nsteps = len(z_grid) - 1
+        info(2, f"ETD2 multi-RHS: integrating with {nsteps} "
+                f"steps of dz≈{dz_step:.2e}")
+        with PrinceProgressBar(bar_type=progressbar, nsteps=nsteps) as pbar:
+            step_hook = pbar.update if pbar.pbar is not None else None
+            self._integrate_multi(STATE, z_grid, step_hook=step_hook)
+        self.post_step_hook(self.final_z)
+
+        if self._is_cupy_backend:
+            import cupy as cp
+
+            self.state = cp.asnumpy(STATE).astype(np.float64)
+        else:
+            self.state = STATE
+        end_time = time()
+        info(2, "ETD2 multi-RHS: integration completed in "
+                f"{end_time - start_time:.2f} s")
+
+        if summary or verbose:
+            print(f"ETD2 multi-RHS summary (K={self._K}):")
+            print(f"  steps: {len(z_grid) - 1}")
+            print(f"  initial z: {self.initial_z} → final z: {self.final_z}")
+            print(f"  wall time: {end_time - start_time:.3f} s")
+
+    def _integrate_multi(self, state, z_grid, step_hook=None):
+        """Multi-RHS ETD2 loop. ``state`` has shape ``(n, K)``.
+
+        ``step_hook`` is called once per step (after the state advance);
+        used by the ``solve(progressbar=...)`` path.
+        """
+        from .etd2 import _array_module, _step_buffers
+
+        xp = _array_module(state)
+        n, K = state.shape
+        dtype = state.dtype
+        # (n,) diag-shape scratch — populated by the host
+        # ``_compute_diag_factors`` or the cupy ``phi_compute`` kernel.
+        bufs = _step_buffers(n, xp=xp, dtype=dtype)
+        # (n, K) state-shape scratch — overrides the (n,) buffers
+        # ``_step_buffers`` allocated for the single-RHS path.
+        bufs["F_phi"] = xp.empty((n, K), dtype=dtype)
+        bufs["F_a"] = xp.empty((n, K), dtype=dtype)
+        bufs["a"] = xp.empty((n, K), dtype=dtype)
+        bufs["scratch_NK"] = xp.empty((n, K), dtype=dtype)
+
+        nsteps = len(z_grid) - 1
+        for k in range(nsteps):
+            z0 = z_grid[k]
+            z1 = z_grid[k + 1]
+            h = z1 - z0
+            d, apply_F = self._operator_at(z0)
+            self._etd2_step_multi(state, h, d, apply_F, bufs, xp)
+            if step_hook is not None:
+                step_hook()
+        return state
+
+    def _etd2_step_multi(self, state, h, d, apply_F, bufs, xp):
+        """One multi-RHS ETD2 step, in place on (n, K) ``state``.
+
+        Phi factors are (n,) functions of ``d`` and are broadcast over
+        the K column axis. Otherwise identical to
+        :func:`etd2._etd2_step_numpy` / ``_etd2_step_cupy``.
+        """
+        from .etd2 import _compute_diag_factors
+
+        if xp is np:
+            _compute_diag_factors(h, d, bufs, np)
+        else:
+            from .etd2 import cupy_kernels
+
+            K = cupy_kernels()
+            bufs["h_buf"][0] = h
+            K.phi_compute(d, bufs["h_buf"], bufs["eD"], bufs["phi1"], bufs["phi2"])
+
+        eD = bufs["eD"]
+        phi1 = bufs["phi1"]
+        phi2 = bufs["phi2"]
+        F_phi = bufs["F_phi"]
+        F_a = bufs["F_a"]
+        a = bufs["a"]
+        SCR = bufs["scratch_NK"]
+
+        apply_F(state, F_phi)
+        # a = eD * state + h * phi1 * F_phi
+        xp.multiply(eD[:, None], state, out=a)
+        xp.multiply(phi1[:, None], F_phi, out=SCR)
+        SCR *= h
+        xp.add(a, SCR, out=a)
+
+        apply_F(a, F_a)
+        # state <- a + h * phi2 * (F_a - F_phi)
+        xp.subtract(F_a, F_phi, out=SCR)
+        SCR *= h
+        xp.multiply(phi2[:, None], SCR, out=SCR)
+        xp.add(a, SCR, out=state)
+        return state

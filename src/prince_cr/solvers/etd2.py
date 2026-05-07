@@ -46,11 +46,11 @@ _INV_6 = 1.0 / 6.0
 _INV_24 = 1.0 / 24.0
 
 
-# Fused cupy ElementwiseKernels (Stage 3). Lazily compiled per dtype on
-# first call. The non-graph cupy path uses these directly; the graph path
-# captures their launches and reads scalar params (``h``, ``dldz``) from
-# 1-element ``raw T`` device buffers so the captured graph picks up new
-# values across replays without re-capture.
+# Fused cupy ElementwiseKernels. Lazily compiled per dtype on first call.
+# The non-graph cupy path uses these directly; the graph path captures
+# their launches and reads scalar params (``h``, ``dldz``) from 1-element
+# ``raw T`` device buffers so the captured graph picks up new values
+# across replays without re-capture.
 _CUPY_KERNELS = None
 
 
@@ -132,7 +132,7 @@ def _build_cupy_kernels(cp):
 
 
 def cupy_kernels():
-    """Return the (lazily compiled) Stage 3 cupy ElementwiseKernel set.
+    """Return the (lazily compiled) cupy ElementwiseKernel set.
 
     Module-level singleton — first call imports cupy and builds the
     kernels; subsequent calls return the cached namespace. ElementwiseKernel
@@ -238,11 +238,10 @@ def split_operator(L):
     on GPU. L is left untouched. L_off is returned in CSR format with
     explicit zeros eliminated.
 
-    Dtype convention: ``d`` keeps L's dtype on the cupy path (float32 for
-    the Stage 2 GPU backend), so elementwise ``exp(h*d)`` lands on fp32
-    without an extra cast. On the host path, ``d`` is upcast to float64
-    regardless of L's dtype so the downstream phi-function evaluation is
-    well-conditioned.
+    Dtype convention: ``d`` keeps L's dtype on the cupy path (so
+    elementwise ``exp(h*d)`` lands on the same precision as ``L``). On
+    the host path ``d`` is upcast to float64 regardless of L's dtype so
+    the downstream phi-function evaluation is well-conditioned.
     """
     if sp.issparse(L):
         d = np.asarray(L.diagonal(), dtype=np.float64)
@@ -317,12 +316,12 @@ def _step_buffers(dim, xp=np, dtype=None):
         "a": xp.empty(dim, dtype=dtype),
     }
     if xp is not np:
-        # Stage 3 fused kernels read ``h`` from a 1-element ``raw T``
-        # device buffer so a captured CUDA Graph can pick up updated
-        # ``h`` between replays without re-capture (uniform z-grid means
-        # the value never actually changes within a solve, but we keep
-        # the buffer for the truncated-final-step edge case and for
-        # symmetry with the per-step ``dldz_buf``).
+        # The fused kernels read ``h`` from a 1-element ``raw T`` device
+        # buffer so a captured CUDA Graph picks up updated ``h`` between
+        # replays without re-capture (uniform z-grid means the value
+        # never actually changes within a solve, but the buffer covers
+        # the truncated-final-step edge case and keeps symmetry with
+        # the per-step ``dldz_buf``).
         bufs["h_buf"] = xp.empty(1, dtype=dtype)
     return bufs
 
@@ -441,13 +440,13 @@ def _etd2_step_numpy(state, h, d, apply_F, bufs):
 
 
 def _etd2_step_cupy(state, h, d, apply_F, bufs):
-    """Stage 3 fused-kernel cupy step.
+    """Fused-kernel cupy step.
 
     Replaces the per-step ufunc chain (~17 launches in
     ``_compute_diag_factors`` + 4 launches each in the two post-apply
     blocks) with three ElementwiseKernels — ``phi_compute``,
-    ``post_apply1``, ``post_apply2`` — for a measured ~30 launches/step
-    saved at production grid (see wiki/results/prof-etd2-launch-bound.md).
+    ``post_apply1``, ``post_apply2`` — saving ~30 kernel launches/step
+    at production grid.
 
     ``apply_F`` itself remains the caller's responsibility (cupy variant
     in :class:`UHECRPropagationSolverETD2._make_apply_F_cupy`); its
@@ -476,7 +475,7 @@ def _etd2_step_cupy(state, h, d, apply_F, bufs):
     return state
 
 
-def integrate(state, z_grid, operator_at):
+def integrate(state, z_grid, operator_at, step_hook=None):
     """Integrate ``dn/dz = L(z) n + b(z)`` along ``z_grid`` with ETD2.
 
     ``state`` may be a numpy or a cupy ndarray; the integrator picks the
@@ -493,6 +492,9 @@ def integrate(state, z_grid, operator_at):
         Monotonic sequence of redshift values to step through.
     operator_at : callable
         ``(z) -> (d, apply_F)``. Invoked once per step.
+    step_hook : callable, optional
+        Called once per step after ``etd2_step`` advances the state.
+        Used by the solver ``solve(progressbar=...)`` path.
 
     Returns
     -------
@@ -509,5 +511,7 @@ def integrate(state, z_grid, operator_at):
         h = z1 - z0
         d, apply_F = operator_at(z0)
         etd2_step(state, h, d, apply_F, bufs, xp)
+        if step_hook is not None:
+            step_hook()
 
     return state

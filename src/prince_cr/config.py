@@ -1,4 +1,20 @@
-"""PriNCe configuration module."""
+"""PriNCe configuration module.
+
+Module-level globals here hold project-wide *defaults*. Per-run overrides
+live on :class:`BackendConfig`, which is attached to every
+:class:`prince_cr.core.PriNCeRun` as ``prince_run.backend``. The solver
+and the interaction-rate machinery read backend dispatch through that
+handle (``prince_run.backend.linear_algebra_backend`` etc.) so a single
+process can run multiple :class:`PriNCeRun` instances with different
+backend settings without mutating module globals.
+
+Two categories of state still live on this module:
+
+* ``debug_level``, grids, cosmological parameters — read once at
+  :class:`PriNCeRun` construction; safe as globals.
+* ``has_cupy``, ``has_mkl``, ``mkl_path``, ``mkl`` — autodetect /
+  process-level resource handles. Not user-facing dispatch knobs.
+"""
 
 import os
 import os.path as path
@@ -6,6 +22,8 @@ import platform
 import sys
 import importlib.util
 import pathlib
+from dataclasses import dataclass, field, fields
+from typing import Optional
 
 import numpy as np
 
@@ -134,52 +152,65 @@ update_rates_z_threshold = 0.01
 MKL_threads = 16
 
 # Sparse matrix-vector product from "CUPY"|"MKL"|"scipy"
-linear_algebra_backend = "MKL"
+linear_algebra_backend = "CUPY"
 
-# When True, the ETD2 solver uploads ``_batch_matrix`` to GPU once at
-# the first cache rebuild and routes the dense cache-rebuild matvec
-# through cupy on a non-blocking stream. Combined with deterministic
-# z-grid lookahead in the solver, the GPU dgemv for cache anchor k+1
-# overlaps with the CPU's ETD2 steps in cache window k. Per-step
-# SpMVs and state buffers stay on host/MKL (Stage 1.5 hybrid; full
-# cupy port is Stage 2). Default False — enable explicitly when
-# ``has_cupy`` is True and a working CUDA runtime is on the dynamic
-# linker path. See wiki/methods/prince-mkl-cupy-backend.md § Stage 1.5.
+# Hybrid CPU/GPU lookahead: upload ``_batch_matrix`` to GPU once and route
+# the dense cache-rebuild matvec through cupy on a non-blocking stream so
+# the GPU dgemv for cache anchor k+1 overlaps with the CPU's ETD2 steps in
+# cache window k. Per-step SpMVs and state buffers stay on host. Default
+# False; superseded for most workloads by the full-GPU ``"cupy"`` backend
+# (which keeps everything on-device). Kept for hosts where MKL Sparse BLAS
+# beats cuSPARSE on the per-step SpMV but the dense matvec is the bottleneck.
 use_cupy_dense_lookahead = False
 
 # MKL Sparse BLAS block size for the photo-hadronic ``M_off`` matrix.
 # ``None`` keeps it CSR; an integer ≥ 2 stores it as BSR with that
-# block size (auto-padding the matrix). Default ``None``: Stage 1.1's
-# per-op micro-bench found BSR(bs=2) ~5 % faster per SpMV than CSR
-# no-opt at production grid, but the per-cycle data refresh from PriNCe's
-# 1D CSR ``M_off.data`` into the BSR's flattened block layout costs
-# ~11 ms via fancy-index scatter (vs ~1 ms ``np.copyto`` for CSR). At
-# W=10 SpMVs/window the scatter overhead crushes the per-op gain. The
-# infrastructure (sort_indices + CSR→BSR index map in
-# :class:`prince_cr.mkl_sparse.MklSparseMatrix`) is preserved for hosts
-# or update cadences (W ≥ ~30) where BSR's per-op win could pay off.
+# block size (auto-padding the matrix). Per-op BSR(bs=2) is ~5 % faster
+# than CSR-no-opt at production grid, but refreshing the BSR's flattened
+# block layout from PriNCe's 1D CSR ``M_off.data`` costs ~11 ms via
+# fancy-index scatter (vs ~1 ms ``np.copyto`` for CSR). At W ≈ 10 SpMVs
+# per cache window the scatter dominates, so default is ``None``. The
+# CSR→BSR index map in :class:`prince_cr.mkl_sparse.MklSparseMatrix` is
+# preserved for hosts or update cadences (W ≥ ~30) where BSR pays off.
 mkl_bsr_blocksize = None
 
-# Float dtype used by the Stage 2 cupy backend. The project default is
-# fp32: consumer-grade NVIDIA hardware (RTX 3090 / Ampere) has its FP64
-# throughput throttled to ~1/64 of FP32, and the Ampere FP32 Tensor
-# Cores are unavailable in fp64. Set to ``"float64"`` only for parity
-# regression tests or when characterizing fp32 accumulated error —
-# ETD2's stiff multi-decade-dynamic-range propagation can accumulate
-# ~30 % L2 error vs scipy in fp32 over ~1000 steps even when the per-
-# step matvec is fp32-correct.
-cupy_dtype = "float32"
+# Float dtype for the cupy backend's ETD2 hot path (per-step SpMV, κ
+# multiplication, exp/φ chain). Default ``"float64"``: PriNCe's stiff
+# multi-decade-dynamic-range propagation accumulates a *systematic*
+# (not random) bias at fp32 over ~100-1000 steps that visibly distorts
+# the propagated CR spectrum — under-suppresses the low-E flux and
+# over-suppresses the GZK shoulder, mimicking missing continuous losses.
+# Switch to ``"float32"`` only for benchmarking on hardware that
+# throttles fp64 (e.g., consumer RTX Ampere with 1/64 fp64 throughput)
+# and where you have validated the fp32 spectrum against an fp64 / MKL
+# reference for your config.
+cupy_dtype = "float64"
 
-# Stage 3: capture the per-step ETD2 kernel sequence into a CUDA Graph
-# and replay it across each cache window (~10 steps), re-capturing on
-# every ``_refresh_z_caches`` (the cuSPARSE descriptors close over
-# ``M_off`` / ``D_off`` device pointers that change at each window).
-# Default False — independent of ``cupy_dtype``. Enable only when
+# Float dtype for the per-cache-window dense matvec that rebuilds the
+# photo-hadronic rate matrix (``_batch_matrix @ photon_vector``).
+# Default ``"float32"`` gives the *mixed-precision* pipeline against
+# the ``"float64"`` ``cupy_dtype`` default: SGEMM for the rate-cache
+# rebuild (the bandwidth-bound win on consumer GPUs that throttle
+# fp64), with the result cast up to ``cupy_dtype`` before it reaches
+# the ETD2 hot path (per-step SpMV, κ multiplication, exp/φ chain —
+# where the fp32 systematic bias originates and where keeping fp64
+# buys correctness). Measured on RTX 3090 / Ampere, the mixed
+# pipeline runs ~8× faster than full fp64 at L2rel ~3e-5 vs MKL
+# (well below source-modeling uncertainty), versus L2rel ≈ 1 for the
+# full-fp32 pipeline. Set to ``None`` to follow ``cupy_dtype`` (i.e.
+# disable mixed-precision and recover the single-precision pipeline),
+# or to ``"float64"`` to force fp64 SGEMM regardless of ``cupy_dtype``.
+# The cast is one nnz-sized copy per cache window (~10 ETD2 steps),
+# so the per-step cost is negligible vs the matvec itself.
+cupy_xs_dtype = "float32"
+
+# Capture the per-step ETD2 kernel sequence into a CUDA Graph and replay
+# it across each cache window (~10 steps), re-capturing on every
+# ``_refresh_z_caches`` (the cuSPARSE descriptors close over ``M_off`` /
+# ``D_off`` device pointers that change at each window). Enable only when
 # ``has_cupy`` is True and the cupy backend is selected; the launcher
-# falls back to the eager fused-kernel cupy path otherwise. See
-# wiki/results/prof-etd2-launch-bound.md § "CUDA Graph capture/replay"
-# for the launch-overhead measurements that motivate this path.
-use_cuda_graphs = False
+# falls back to the eager fused-kernel cupy path otherwise.
+use_cuda_graphs = True
 
 
 # When True AND ``linear_algebra_backend == "MKL"``, route the rate-
@@ -189,11 +220,64 @@ use_cuda_graphs = False
 # kernel regardless of ``mkl_set_num_threads`` (MKL's L2 BLAS heuristic
 # treats DGEMV as memory-bandwidth-bound and skips parallelization);
 # OpenBLAS DGEMV at the same shape parallelizes ~14× faster end-to-end.
-# See wiki § Stage 1.1 / Stage 1.2. The cleaner answer is to pair
-# OpenBLAS threads to MKL via ``threadpoolctl``, OR replace OpenBLAS
-# with AOCL-BLIS via a numpy-with-AOCL build. This flag is preserved
-# for hosts where MKL DGEMV does parallelize (e.g. Intel CPUs).
+# The clean alternative on Zen is :func:`set_thread_count` (pairs
+# OpenBLAS and MKL through threadpoolctl). Preserve this flag for hosts
+# where MKL DGEMV does parallelize (e.g. Intel CPUs).
 use_mkl_dense_matvec = False
+
+
+# =================================================================
+# Backend dispatch — per-run handle (BackendConfig)
+# =================================================================
+#
+# A small dataclass that gathers the dispatch knobs the solver and
+# interaction-rate machinery need to consult per-run. PriNCeRun creates
+# one of these in __init__ (defaults pulled from this module's globals)
+# and exposes it as ``prince_run.backend``. Code that has a PriNCeRun
+# handle should read ``prince_run.backend.<knob>`` rather than the
+# module global; the latter survives only as a default and as a
+# back-compat surface for notebooks that mutate it directly.
+
+@dataclass
+class BackendConfig:
+    """Per-run backend dispatch settings.
+
+    Defaults are pulled from the :mod:`prince_cr.config` module globals
+    of the same names at construction time. Mutate on a specific run
+    (e.g. ``prince_run.backend.linear_algebra_backend = "MKL"``) to
+    flip backends without touching the global; create a new solver
+    instance afterwards so it picks up the new setting.
+    """
+
+    linear_algebra_backend: str = ""
+    use_cuda_graphs: bool = False
+    use_cupy_dense_lookahead: bool = False
+    use_mkl_dense_matvec: bool = False
+    cupy_dtype: str = "float64"
+    cupy_xs_dtype: Optional[str] = "float32"
+    mkl_bsr_blocksize: Optional[int] = None
+    mkl_threads: int = 16
+    update_rates_z_threshold: float = 0.01
+
+    @classmethod
+    def from_globals(cls) -> "BackendConfig":
+        """Build a BackendConfig with values copied from the module globals.
+
+        Used by :class:`PriNCeRun` when no explicit ``backend=`` is
+        provided. The copy means later mutations of the module globals
+        do not affect previously-built runs.
+        """
+        return cls(
+            linear_algebra_backend=linear_algebra_backend,
+            use_cuda_graphs=use_cuda_graphs,
+            use_cupy_dense_lookahead=use_cupy_dense_lookahead,
+            use_mkl_dense_matvec=use_mkl_dense_matvec,
+            cupy_dtype=cupy_dtype,
+            cupy_xs_dtype=cupy_xs_dtype,
+            mkl_bsr_blocksize=mkl_bsr_blocksize,
+            mkl_threads=MKL_threads,
+            update_rates_z_threshold=update_rates_z_threshold,
+        )
 
 
 # Check for CUPY library for GPU support
@@ -307,8 +391,8 @@ def set_thread_count(nthreads):
     this project), this is what you want when running ETD2 with the
     MKL backend: the per-step SpMV uses MKL's pool and the dense
     cache-rebuild matvec uses OpenBLAS. Sized together, total threads
-    stay bounded; sized independently, they fight over Zen 2 cores
-    (Stage 1.1 wiki has the bench).
+    stay bounded; sized independently, the two pools fight over physical
+    cores under load.
 
     Effect:
 

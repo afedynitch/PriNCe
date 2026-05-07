@@ -10,17 +10,22 @@ import prince_cr.config as config
 
 
 class PriNCeRun(object):
-    """This is a draft of the main class.
-
-    This class is supposed to interprete the config options
-    and initialize all necessary stuff in order. This class is
-    meant to keep all separate ingredients together in one place,
-    and it is inteded to be passed to further classes via `self`.
+    """Top-level orchestrator: holds grids, species, cross sections,
+    photon field, interaction rates, and the per-run
+    :class:`~prince_cr.config.BackendConfig`. Solvers consume this as
+    a single handle.
     """
 
     def __init__(self, *args, **kwargs):
-        if "max_mass" in kwargs:
-            max_mass = kwargs.pop("max_mass", config.max_mass)
+        # max_mass: explicit kwarg wins; otherwise fall back to the
+        # module-global default. The previous gated-pop form silently
+        # NameError'd when neither kwargs nor species_list was given.
+        max_mass = kwargs.pop("max_mass", config.max_mass)
+
+        # Per-run backend dispatch handle. Solver and interaction-rate
+        # code reads ``self.backend.<knob>`` rather than ``config.<knob>``.
+        backend = kwargs.pop("backend", None)
+        self.backend = backend if backend is not None else config.BackendConfig.from_globals()
 
         # Initialize energy grid
         if config.grid_scale == "E":

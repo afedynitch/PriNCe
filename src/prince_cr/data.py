@@ -712,7 +712,8 @@ class PrinceDB(object):
 
         return db_entry
 
-    def fluka_photo_nuclear_db(self, model_tag, e_range=None, max_mass=None):
+    def fluka_photo_nuclear_db(self, model_tag, e_range=None, max_mass=None,
+                               db_path=None, db_fname=None):
         """Read photo_nuclear/<tag>/ from the FLUKA db (a separate file from
         ``db_fname``). Lazy: opens the file on each call.
 
@@ -725,6 +726,12 @@ class PrinceDB(object):
                 ``fragment_yields`` channel rows for heavier mothers, so
                 lighter caps load proportionally faster from a v2-sparse
                 db. ``None`` means no filter (read everything).
+            db_path / db_fname (str or None): explicit DB location. When
+                ``None``, the module-global ``config.fluka_db_path`` /
+                ``config.fluka_db_fname`` are consumed (legacy default).
+                Pass explicitly to bypass the global — useful in tests
+                or when running multiple builds against different dbs
+                from the same process.
 
         Returns:
             dict with keys: ``energy_grid``, ``xbins``, ``inel_mothers``,
@@ -733,12 +740,16 @@ class PrinceDB(object):
             (n_ch, n_E), ``elementary_yields`` (n_em, n_E, n_x).
         """
         info(10, "Reading FLUKA photo-nuclear db. tag={0}".format(model_tag))
-        fpath = path.join(config.fluka_db_path, config.fluka_db_fname)
+        if db_path is None:
+            db_path = config.fluka_db_path
+        if db_fname is None:
+            db_fname = config.fluka_db_fname
+        fpath = path.join(db_path, db_fname)
         if not path.isfile(fpath):
             raise FileNotFoundError(
                 f"FLUKA db not found at {fpath}. "
-                "Set prince_cr.config.fluka_db_path to its directory "
-                "(e.g. the prince-fluka-utils repo root)."
+                "Pass db_path/db_fname explicitly to FlukaPhotoNuclear, "
+                "or set prince_cr.config.fluka_db_path to its directory."
             )
 
         db_entry = {}
