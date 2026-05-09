@@ -305,6 +305,61 @@ def fluka_photo_nuclear_inel_mothers():
 _LN2 = float(np.log(2.0))
 
 
+def _synthesize_from_particle_db(pdg):
+    """Build a `spec_data`-shaped dict for `pdg` from the `particle`
+    package, or return None if the PDG isn't recognised.
+
+    Used as the canonical fallback for elementary species that don't
+    appear in the legacy `particle_data.ppo` (anti-baryons, K⁰_S/K⁰_L,
+    τ leptons, ...) but show up as photo-nuclear / decay daughters or as
+    Pythia decay mothers.
+
+    Unit conventions: `particle` reports mass in MeV, `three_charge` in
+    thirds, lifetime in ns. PriNCe's `spec_data` uses GeV for mass,
+    integer charge in units of e, seconds for lifetime; conversion is
+    done here. Stable particles (lifetime None or +inf in `particle`)
+    map to `lifetime=np.inf`, `stable=True`.
+    """
+    try:
+        from particle import Particle, ParticleNotFound  # type: ignore
+    except ImportError:
+        return None
+    try:
+        p = Particle.from_pdgid(pdg)
+    except ParticleNotFound:
+        return None
+
+    mass_MeV = p.mass
+    if mass_MeV is None or not np.isfinite(mass_MeV):
+        # Nominal-mass particles like neutrinos return None — fine for
+        # spec_data which only requires the field to exist.
+        mass_GeV = 0.0
+    else:
+        mass_GeV = float(mass_MeV) * 1e-3
+
+    if p.three_charge is None:
+        charge = 0
+    else:
+        charge = int(p.three_charge) // 3
+
+    lt_ns = p.lifetime
+    if lt_ns is None or lt_ns == float("inf") or not np.isfinite(lt_ns):
+        lifetime = np.inf
+        stable = True
+    else:
+        lifetime = float(lt_ns) * 1e-9
+        stable = False
+
+    return {
+        "mass": mass_GeV,
+        "charge": charge,
+        "lifetime": lifetime,
+        "stable": stable,
+        "incomplete": False,
+        "branchings": [],
+    }
+
+
 def _heuristic_beta_branching(mo_pdg):
     """β±-direction last-resort branching for unstable FLUKA decay
     mothers whose chromo / SPDCEV sampling failed (empty channels in
@@ -441,9 +496,14 @@ def _merge_tabulated_decays(spec_data):
         ld_da = pythia["light_daughters"][:, 1]
 
         # Pythia carries no lifetime field; PDG values from particle_data.ppo
-        # are kept. We only overwrite the branching list with Pythia's actual
-        # tabulated final-state composition + dN/dx tables.
-        for mo_raw in pythia["decay_mothers"]:
+        # are kept where they exist. We overwrite the branching list with
+        # Pythia's actual tabulated final-state composition + dN/dx tables,
+        # and synthesize a spec_data entry from the `particle` package for
+        # mothers the legacy ppo doesn't carry (e.g. K⁰_S/K⁰_L, anti-n).
+        # Pythia's `rest_masses` is the mass fallback if `particle` is
+        # somehow unavailable.
+        pythia_synth_added = []
+        for i_mo, mo_raw in enumerate(pythia["decay_mothers"]):
             mo_pdg = int(mo_raw)
             branchings = []
             for ch in np.where(ld_mo == mo_raw)[0]:
@@ -455,8 +515,28 @@ def _merge_tabulated_decays(spec_data):
                 branchings.append((mult, [da_pdg]))
                 _TABULATED_DECAY_DX[(mo_pdg, da_pdg)] = yld / xw
 
-            if mo_pdg in spec_data and branchings:
+            if mo_pdg not in spec_data:
+                synth = _synthesize_from_particle_db(mo_pdg)
+                if synth is None:
+                    # particle package missing or PDG unrecognised — fall
+                    # back to Pythia rest-mass + best-effort flags.
+                    synth = {
+                        "mass": float(pythia["rest_masses"][i_mo]),
+                        "charge": 0,
+                        "lifetime": np.inf,
+                        "stable": True,
+                        "incomplete": True,
+                        "branchings": [],
+                    }
+                spec_data[mo_pdg] = synth
+                pythia_synth_added.append(mo_pdg)
+
+            if branchings:
                 spec_data[mo_pdg]["branchings"] = branchings
+
+        if pythia_synth_added:
+            info(2, "Synthesized {0} Pythia mother spec_data entries: {1}"
+                    .format(len(pythia_synth_added), pythia_synth_added))
 
     # Synthesize stable-mother spec_data entries for photo-nuclear mothers
     # that the legacy ppo doesn't carry (everything beyond A=56 stable, plus
@@ -500,6 +580,71 @@ def _merge_tabulated_decays(spec_data):
         if n_added:
             info(2, "Synthesized {0} stable spec_data entries from photo-nuclear "
                     "inel_mothers".format(n_added))
+
+    # Scan all elementary daughter PDGs that show up in cross-section
+    # channels and tabulated decays, and synthesize spec_data entries from
+    # the `particle` package for any unknowns. Catches species that appear
+    # only as daughters (never as mothers) — anti-p is the canonical case:
+    # FLUKA emits it as a redistribution daughter from heavy mothers, but
+    # it isn't carried by the legacy ppo, isn't an unstable nuclear mother
+    # in the FLUKA decay db, and isn't a Pythia decay mother. Without this
+    # scan, the chain reducer's `if da not in spec_data: return` silently
+    # discards all flux through anti-p (cf. base.py:_DecayChainReducer.follow);
+    # the explicit-decay path would lift the discarded entries into
+    # `known_species` and trigger `KeyError(-2212)` at SpeciesManager init.
+    daughter_pdgs = set()
+    if fluka is not None:
+        daughter_pdgs.update(int(p) for p in fluka["nuclear_daughters"][:, 1])
+        daughter_pdgs.update(int(p) for p in fluka["light_daughters"][:, 1])
+    if pythia is not None:
+        daughter_pdgs.update(int(p) for p in pythia["light_daughters"][:, 1])
+
+    fpath = path.join(config.fluka_db_path, config.fluka_db_fname)
+    if path.isfile(fpath):
+        try:
+            with h5py.File(fpath, "r") as f:
+                ed_path = "photo_nuclear/FLUKA_2025/elementary_daughters"
+                if ed_path in f:
+                    ed = f[ed_path][:]
+                    daughter_pdgs.update(int(p) for p in ed.flatten())
+        except OSError:
+            pass
+
+    # Skip nuclei (10-digit PDG codes 10LZZZAAAI starting at 1e9) — those
+    # are handled by the inel_mothers synthesis above. Skip 0 (placeholder
+    # / null daughter rows in v2-sparse pads).
+    elementary_unknown = sorted(
+        pdg for pdg in daughter_pdgs
+        if pdg != 0 and abs(pdg) < 1_000_000_000 and pdg not in spec_data
+    )
+    synthesized_from_particle = []
+    skipped_unknown_to_particle = []
+    for da_pdg in elementary_unknown:
+        synth = _synthesize_from_particle_db(da_pdg)
+        if synth is None:
+            skipped_unknown_to_particle.append(da_pdg)
+            continue
+        spec_data[da_pdg] = synth
+        synthesized_from_particle.append(da_pdg)
+    if synthesized_from_particle:
+        info(2, "Synthesized {0} elementary spec_data entries from `particle` "
+                "package: {1}".format(len(synthesized_from_particle),
+                                       synthesized_from_particle))
+    if skipped_unknown_to_particle:
+        import warnings
+        warnings.warn(
+            "FLUKA db references {0} elementary PDG IDs that aren't in "
+            "spec_data and that the `particle` package doesn't recognise: "
+            "{1}. The chain reducer will silently drop cross-section flux "
+            "through these daughters, and explicit-decay mode will raise "
+            "KeyError on PriNCeRun init. Add hand-coded entries to "
+            "particle_data.ppo or extend the FLUKA db filter to drop these "
+            "channels at write time.".format(
+                len(skipped_unknown_to_particle), skipped_unknown_to_particle,
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     # Surface coverage gaps as a single RuntimeWarning so the operator
     # sees the full list of fudges at module load (instead of silently

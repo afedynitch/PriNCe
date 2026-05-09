@@ -37,7 +37,8 @@ dependencies = [
   "numpy",
   "tqdm",
   "h5py",
-  "requests"
+  "requests",
+  "particle"
 ]
 optional-dependencies = { test = ["pytest", "pytest-xdist", "matplotlib"] }
 

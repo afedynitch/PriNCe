@@ -203,6 +203,8 @@ class UHECRPropagationSolver(object):
         enable_photohad_losses=True,
         enable_injection_jacobian=True,
         enable_partial_diff_jacobian=True,
+        enable_decay=False,
+        enable_decay_jacobian=True,
         z_offset=0.0,
     ):
         self.initial_z = initial_z + z_offset
@@ -232,6 +234,16 @@ class UHECRPropagationSolver(object):
         # if False injection only per dz-step
         self.enable_injection_jacobian = enable_injection_jacobian
         self.enable_partial_diff_jacobian = enable_partial_diff_jacobian
+        # Explicit decay: when True, the constant Λ operator is folded into
+        # ``L(z)`` as a third-operator term ``dldz · Λ`` parallel to the
+        # photo-hadronic and continuous-loss blocks. Effective only when
+        # the cross-section chain reducer has been gated off so unstable
+        # mothers reach the state vector (``config.enable_explicit_decay``;
+        # see methods/explicit-decay-kernel-design.md). Silently a no-op
+        # otherwise — Λ_diag stays empty when no species in the state
+        # vector is unstable, so the per-step operator skips the add.
+        self.enable_decay = enable_decay
+        self.enable_decay_jacobian = enable_decay_jacobian
 
         self.had_int_rates = prince_run.int_rates
         self.adia_loss_rates_grid = prince_run.adia_loss_rates_grid
@@ -353,6 +365,15 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
 
     def _ensure_D_split(self):
         raise NotImplementedError
+
+    def _ensure_Lambda_split(self):
+        """Backend-specific build of the constant decay operator Λ.
+
+        Default no-op: backends that haven't implemented explicit decay
+        yet (cupy paths until Step E lands) silently skip the build, so
+        ``enable_decay=True`` simply has no effect on those backends.
+        """
+        pass
 
     def _init_state(self):
         raise NotImplementedError
@@ -501,6 +522,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self._etd2_apply_F = None
         self._reset_for_solve()
         self._ensure_D_split()
+        self._ensure_Lambda_split()
 
         state = self._init_state()
         self.pre_step_hook(self.initial_z)
@@ -561,6 +583,21 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
         # apply_F closure. ``dldz`` is a python float scalar; ``b`` is
         # either None or a per-step injection vector.
         self._etd2_apply_F_params = {"dldz": 1.0, "kappa": None, "b": None}
+        # Λ_diag: per-bin diagonal of the constant explicit-decay operator,
+        # ``-1/(c · γ · τ_rest)`` in cm⁻¹ per (species, bin). Populated
+        # lazily by :meth:`_ensure_Lambda_split` on first solve when
+        # ``enable_decay`` is True. Stays None when no species in the
+        # state vector is unstable (e.g. when the cross-section chain
+        # reducer has already folded them out — the default), in which
+        # case the per-step operator skips the add.
+        self._etd2_Lambda_diag = None
+        # Λ_off: off-diagonal daughter-redistribution block (CSR), built
+        # alongside Λ_diag. Each unstable mother contributes one block per
+        # (mother, daughter) branching, with the redistribution kernel
+        # pulled from ``decays.get_decay_matrix_bin_average`` and scaled
+        # by ``cm2sec / (γ_mo · τ_mo) · branching_ratio``. Stays None when
+        # no surviving branching has its daughter in the state vector.
+        self._etd2_Lambda_off = None
 
     # ------------------------------------------------------------------
     # Outer-driver hooks
@@ -715,6 +752,142 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
                     D_off, optimize=True, blocksize=None
                 )
 
+    def _ensure_Lambda_split(self):
+        """Build the constant explicit-decay operator Λ.
+
+        Two outputs:
+
+        * ``self._etd2_Lambda_diag``: per-(species, bin) diagonal,
+          ``-1/(c · γ · τ_rest)`` in cm⁻¹. Population loss term.
+        * ``self._etd2_Lambda_off``: off-diagonal CSR block, daughter
+          production from each (mother, daughter) branching with the
+          redistribution kernel from ``decays.get_decay_matrix_bin_average``
+          (same machinery the chain reducer uses, so explicit-decay mode
+          and chain-reduced mode use identical decay distributions).
+
+        One-shot for the whole solve. Stays a no-op when
+        ``enable_decay=False`` or when no species in the state vector is
+        unstable. The latter is the reachable state without
+        ``config.enable_explicit_decay`` (Step C): the chain reducer folds
+        unstable mothers into their stable daughters at cross-section
+        build time, so by the time the solver is built the state vector
+        contains only stable species and Λ would be identically zero — we
+        skip the buffers in that case so the per-step operator avoids a
+        useless add.
+        """
+        if self._etd2_Lambda_diag is not None or not self.enable_decay:
+            return
+
+        import scipy.sparse as sp
+        from ..data import spec_data, PRINCE_UNITS
+        from ..util import is_nucleus
+        from ..decays import get_decay_matrix_bin_average
+
+        e_grid = self.egrid  # per-bin energies, ascending log-spaced
+        m_proton = PRINCE_UNITS.m_proton
+        cm2sec = PRINCE_UNITS.cm2sec  # 1/c in cm units
+
+        # Build the (n_E, n_E) redistribution kernel on the cosmic-ray
+        # energy grid using the same form the chain reducer uses on its
+        # cross-section x-grid: ``int_scale × P(x)`` with
+        # ``int_scale[i, j] = Δlog E_j``. Proton daughter (boost-conserving,
+        # x ≈ 1) agrees with chain mode at <1 % rtol; differential daughters
+        # (β-decay neutrinos at x ≈ 10⁻³) inherit a ~factor-2 spectral-shape
+        # difference vs chain mode that traces to the discretization mismatch
+        # — the chain reducer evaluates the kernel on a 200-bin x-grid (36
+        # bins/dec) before folding into M via the photon-field convolution,
+        # while Λ_off acts directly on the 88-bin energy grid (8 bins/dec).
+        # Same physics in the limit of fine bins; tracked as a known
+        # discretization effect in the test's relaxed ν̄_e tolerance and
+        # in `wiki/open-questions.md`.
+        e_bins = self.ebins
+        e_centers = self.egrid
+        e_widths = e_bins[1:] - e_bins[:-1]
+        n_E = len(e_centers)
+        int_scale = np.tile(e_widths / e_centers, (n_E, 1))
+        dec_bins = np.outer(e_bins, 1.0 / e_centers)
+        dec_bins_lower = dec_bins[:-1]
+        dec_bins_upper = dec_bins[1:]
+
+        Lambda_diag = np.zeros(self.dim_states, dtype=np.float64)
+        # COO accumulator for Λ_off; CSR-converted at the end.
+        off_rows: list = []
+        off_cols: list = []
+        off_vals: list = []
+        # Per-(mo, da) cache so repeated lookups (e.g. multiple branching
+        # entries pointing at the same daughter) hit the same redistribution
+        # array. Mirrors `_DecayChainReducer._decay_cache`.
+        decay_cache: dict = {}
+        n_unstable = 0
+
+        for s in self.spec_man.species_refs:
+            tau = getattr(s, "lifetime", np.inf)
+            if not np.isfinite(tau) or tau <= 0.0:
+                continue
+            n_unstable += 1
+            # Per-nucleon convention for nuclei: γ = E_pn / m_p, A-independent.
+            # Light/hadronic species carry their total energy in the per-bin
+            # state, so γ = E_total / m_species.
+            if is_nucleus(s.pdgid):
+                gamma = e_grid / m_proton
+            else:
+                # Fall back to the species' own rest mass; spec_data carries
+                # masses in GeV alongside lifetimes (data.py:417, 429, 494).
+                m_sp = spec_data.get(s.pdgid, {}).get("mass", m_proton)
+                gamma = e_grid / m_sp
+            # Λ_diag = -1/(c · γ · τ) in cm⁻¹. cm2sec = 1/c (sec/cm), so
+            #   -1/(c · γτ) = -cm2sec/(γτ).
+            rate_per_cm = cm2sec / (gamma * tau)  # (n_E,), positive
+            Lambda_diag[s.lidx() : s.uidx()] = -rate_per_cm
+
+            # Off-diagonal: walk the mother's branchings and place a
+            # ``rate · branching · redistribution`` block at each surviving
+            # (mother -> daughter) pair.
+            branchings = spec_data.get(s.pdgid, {}).get("branchings", [])
+            mo_lidx = s.lidx()
+            for br, daughter_pdgs in branchings:
+                for da_pdg in daughter_pdgs:
+                    if da_pdg not in self.spec_man.pdgid2sref:
+                        # Daughter not in the state vector — flux leaks out
+                        # silently. Same behaviour as the chain reducer's
+                        # ``if da not in spec_data: return`` (base.py:646).
+                        continue
+                    da_ref = self.spec_man.pdgid2sref[da_pdg]
+                    key = (s.pdgid, da_pdg)
+                    dec_dist = decay_cache.get(key)
+                    if dec_dist is None:
+                        dec_dist = int_scale * get_decay_matrix_bin_average(
+                            s.pdgid, da_pdg, dec_bins_lower, dec_bins_upper
+                        )
+                        decay_cache[key] = dec_dist
+                    if not np.any(dec_dist):
+                        continue
+                    # block[i, j] = dec_dist[i, j] · br · rate_per_cm[j]
+                    # Per-mother-bin scaling broadcasts column-wise.
+                    block = dec_dist * (br * rate_per_cm)[None, :]
+                    nz = np.nonzero(block)
+                    if nz[0].size == 0:
+                        continue
+                    off_rows.append(da_ref.lidx() + nz[0])
+                    off_cols.append(mo_lidx + nz[1])
+                    off_vals.append(block[nz])
+
+        if n_unstable == 0:
+            # No unstable species reached the state vector — leave the
+            # buffers ``None`` so ``_operator_at`` / ``apply_F`` skip the add.
+            return
+
+        self._etd2_Lambda_diag = Lambda_diag
+        if off_rows:
+            rows = np.concatenate(off_rows)
+            cols = np.concatenate(off_cols)
+            vals = np.concatenate(off_vals)
+            self._etd2_Lambda_off = sp.coo_matrix(
+                (vals, (rows, cols)),
+                shape=(self.dim_states, self.dim_states),
+                dtype=np.float64,
+            ).tocsr()
+
     def _operator_at(self, z):
         """Return ``(d, apply_F)`` for the ETD2 step at redshift ``z``.
 
@@ -773,6 +946,11 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
             np.multiply(kappa, self._etd2_D_diag, out=self._etd2_kx_buf)
             np.multiply(self._etd2_kx_buf, dldz, out=self._etd2_kx_buf)
             np.add(d, self._etd2_kx_buf, out=d)
+        if self._etd2_Lambda_diag is not None:
+            # d += dldz · Λ_diag — Λ_diag is constant across the whole
+            # solve so it just rides the per-step ``dldz`` scalar.
+            np.multiply(self._etd2_Lambda_diag, dldz, out=self._etd2_kx_buf)
+            np.add(d, self._etd2_kx_buf, out=d)
 
         # Refresh the persistent apply_F closure's per-step params.
         params = self._etd2_apply_F_params
@@ -817,6 +995,7 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
         """
         M_off = self._etd2_M_raw_off
         D_off = self._etd2_D_off
+        Lambda_off = self._etd2_Lambda_off  # CSR or None; constant for the solve.
         params = self._etd2_apply_F_params
         kx_buf = self._etd2_kx_buf
 
@@ -826,6 +1005,10 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
             if kappa is not None:
                 np.multiply(kappa, x, out=kx_buf)
                 np.add(out, D_off.dot(kx_buf), out=out)
+            if Lambda_off is not None:
+                # Λ_off rides the same dldz scalar as M_off / D_off (see
+                # methods/explicit-decay-kernel-design.md). Constant in z.
+                np.add(out, Lambda_off.dot(x), out=out)
             np.multiply(out, params["dldz"], out=out)
             b = params["b"]
             if b is not None:
@@ -875,6 +1058,9 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
         kx_buf = self._etd2_kx_buf
         kx_p = get_p(kx_buf)
         params = self._etd2_apply_F_params
+        # Λ_off MKL-handle wrap deferred to Step E; for now, fall back to a
+        # scipy SpMV when explicit decay is enabled with the MKL backend.
+        Lambda_off = self._etd2_Lambda_off
 
         def apply_F(x, out):
             x_p = get_p(x)
@@ -884,6 +1070,8 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
             if kappa is not None:
                 np.multiply(kappa, x, out=kx_buf)
                 mkl_D_op(alpha_box, kx_p, beta_one, out_p)
+            if Lambda_off is not None:
+                np.add(out, Lambda_off.dot(x), out=out)
             np.multiply(out, params["dldz"], out=out)
             b = params["b"]
             if b is not None:

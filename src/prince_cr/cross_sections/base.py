@@ -269,6 +269,17 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         self.known_bc_channels = sorted(list(set(self.known_bc_channels)))
         self.known_diff_channels = sorted(list(set(self.known_diff_channels)))
 
+        # Ensure every nucleus in `known_species` has an entry in
+        # `reactions`. Default chain-reducer mode lands here with the
+        # invariant already satisfied (everything reached species-list
+        # status via being a mother in some channel); explicit-decay mode
+        # can leave a daughter-only nucleus (e.g. free n from He-4 photo-
+        # disintegration when neutron has no photo-nuclear of its own)
+        # without a mother entry, which downstream consumers query.
+        for sp in self.known_species:
+            if is_nucleus(sp) and sp not in self.reactions:
+                self.reactions[sp] = []
+
         for sp in self.known_species:
             if is_nucleus(sp) and (sp, sp) not in self.known_diff_channels:
                 self.known_bc_channels.append((mo, mo))
@@ -293,7 +304,14 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         are known are simply dropped (no forced beta decay).
         """
         threshold = config.tau_dec_threshold
+        # When ``config.enable_explicit_decay`` is set, the solver's Λ
+        # operator handles decay explicitly, so we keep unstable mothers in
+        # the cross-section index (and skip the chain walk further down).
+        # Unknown mothers (absent from ``spec_data``) are still dropped.
+        explicit_decay = getattr(config, "enable_explicit_decay", False)
         info(2, "Integrating out species with lifetime smaller than", threshold)
+        if explicit_decay:
+            info(2, "Explicit decay gate ON — chain reducer kept in index-only mode")
         info(
             3,
             (
@@ -305,7 +323,9 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         # Drop unstable mothers from the nonel dictionary first; the chain
         # reduction below only walks daughters of mothers that survive.
         for mother in sorted(self._nonel_tab.keys()):
-            if mother not in spec_data or spec_data[mother]["lifetime"] < threshold:
+            unknown = mother not in spec_data
+            short_lived = (not unknown) and spec_data[mother]["lifetime"] < threshold
+            if unknown or (short_lived and not explicit_decay):
                 info(
                     20,
                     "Primary species {0} does not fulfill stability criteria.".format(
@@ -347,15 +367,54 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         self._update_indices()
 
         # Walk every channel's decay chain and accumulate stable-final-state
-        # contributions into the reducer's two output dicts.
-        reducer = _DecayChainReducer(self, threshold)
-        for (mo, da), value in list(self._incl_tab.items()):
-            reducer.follow(mo, da, value)
-        for (mo, da), value in list(self._incl_diff_tab.items()):
-            reducer.follow(mo, da, value)
+        # contributions into the reducer's two output dicts. Skipped when
+        # ``enable_explicit_decay`` is on — daughters land where the cross
+        # section produces them, and the solver's Λ operator handles their
+        # subsequent decay.
+        if not explicit_decay:
+            reducer = _DecayChainReducer(self, threshold)
+            for (mo, da), value in list(self._incl_tab.items()):
+                reducer.follow(mo, da, value)
+            for (mo, da), value in list(self._incl_diff_tab.items()):
+                reducer.follow(mo, da, value)
 
-        self._incl_tab = dict(reducer.new_incl_tab)
-        self._incl_diff_tab = dict(reducer.new_dec_diff_tab)
+            self._incl_tab = dict(reducer.new_incl_tab)
+            self._incl_diff_tab = dict(reducer.new_dec_diff_tab)
+
+            # Surface unknown-daughter drops as a single aggregated warning.
+            # Each (mo, da) entry is a cross-section channel whose flux was
+            # silently discarded because `da not in spec_data`. Should be
+            # empty for any FLUKA db loaded with prince_cr ≥ the
+            # `_synthesize_from_particle_db` data-merge pass; non-empty
+            # output points at PDGs that the `particle` package can't
+            # resolve either, which need a hand-coded entry.
+            if reducer._unknown_daughter_drops:
+                import warnings
+                from collections import defaultdict
+                by_da = defaultdict(list)
+                for mo, da in reducer._unknown_daughter_drops:
+                    by_da[da].append(mo)
+                lines = []
+                for da in sorted(by_da):
+                    mos = sorted(set(by_da[da]))
+                    lines.append(
+                        "  daughter PDG={0}: {1} channel(s), "
+                        "mothers {2}".format(da, len(by_da[da]), mos)
+                    )
+                warnings.warn(
+                    "Chain reducer dropped {0} (mother, daughter) channels "
+                    "because the daughter has no spec_data entry. Cross-"
+                    "section flux through these channels is silently "
+                    "discarded. Add the missing PDGs to spec_data (extend "
+                    "data._synthesize_from_particle_db coverage, or hand-"
+                    "edit particle_data.ppo) or filter the channels at db "
+                    "build time:\n{1}".format(
+                        len(reducer._unknown_daughter_drops),
+                        "\n".join(lines),
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         info(
             3,
@@ -368,7 +427,9 @@ class CrossSectionBase(object, metaclass=ABCMeta):
         )
         info(
             2,
-            f"Cache used for decays: {reducer.decay_cache_size} entries.",
+            "Cache used for decays: {0} entries.".format(
+                reducer.decay_cache_size if not explicit_decay else 0
+            ),
         )
 
     def nonel_scale(self, mother, scale="A"):
@@ -591,6 +652,13 @@ class _DecayChainReducer(object):
 
         self._decay_cache = {}
 
+        # Accumulator for (first_mother, unknown_daughter) drops in
+        # `follow()`. Surfaced as a single aggregated RuntimeWarning by
+        # `_emit_drop_warning` after all chains have been walked, so the
+        # operator sees the full list of dropped channels at once instead
+        # of one info-level message per drop. Each entry: (first_mo, da).
+        self._unknown_daughter_drops = []
+
     @property
     def decay_cache_size(self):
         return len(self._decay_cache)
@@ -651,6 +719,7 @@ class _DecayChainReducer(object):
                 self._dbg_indent(reclev),
                 "daughter {0} unknown. Force beta decay not implemented!!".format(da),
             )
+            self._unknown_daughter_drops.append((first_mo, da))
             return
 
         if spec_data[da]["lifetime"] >= self.threshold:

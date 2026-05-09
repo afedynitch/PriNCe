@@ -113,6 +113,14 @@ tau_dec_threshold = np.inf  # All unstable particles decay
 # tau_dec_threshold = 0.  # None unstable particles decay
 # tau_dec_threshold = 850. # This value is for stable neutrons
 
+#: Gate the cross-section chain reducer so unstable mothers reach the state
+#: vector. When True, the lifetime-based drop and the chain-walk fold-out in
+#: ``_DecayChainReducer`` are skipped; decay is then handled explicitly by the
+#: solver's Λ operator (``enable_decay=True`` on ``UHECRPropagationSolverETD2``;
+#: see methods/explicit-decay-kernel-design.md). Unknown mothers (no entry in
+#: ``spec_data``) are still dropped — only the lifetime gate flips.
+enable_explicit_decay = False
+
 #: Cut on energy redistribution functions
 #: Resitribution below this x value are set to 0.
 #: "x_cut" : 0.,

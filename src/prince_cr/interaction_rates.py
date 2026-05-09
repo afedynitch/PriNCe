@@ -288,7 +288,14 @@ class PhotoNuclearInteractionRate(object):
             if not is_nucleus(moid):
                 continue
 
-            has_nonel = moid == daid
+            # Diagonal absorption term only fires when the mother actually has
+            # a non-elastic cross section. Default chain-reducer mode lands
+            # here with the invariant ``(moid == daid) ⇒ moid in nonel_dR``;
+            # explicit-decay mode can land us with daughter-only nuclei (e.g.
+            # free n from He-4 photo-disintegration; neutron has no
+            # photo-nuclear of its own) where the (n, n) pair has neither
+            # in_bc/in_diff membership nor a nonel entry — so we skip below.
+            has_nonel = (moid == daid) and (moid in nonel_dR)
             in_bc = (moid, daid) in bc_set
             in_diff = (moid, daid) in diff_set
 
