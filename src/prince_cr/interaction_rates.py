@@ -59,6 +59,16 @@ class PhotoNuclearInteractionRate(object):
         # :meth:`_ensure_coupling_mat_gpu` on the cupy backend.
         self._batch_matrix_gpu = None
 
+        # xs-dtype mirror of the dense rate kernel for the host
+        # (scipy / MKL) backends. Populated lazily by
+        # :meth:`_ensure_xs_buffers` once the BackendConfig is visible
+        # on the PriNCeRun. When ``backend.xs_dtype`` matches the host
+        # solver dtype (fp64), aliases the existing buffers — no extra
+        # memory, no per-window cast.
+        self._batch_matrix_xs = None
+        self._batch_vec_xs = None
+        self._photon_buf_xs = None
+
         self._estimate_batch_matrix()
         self._init_matrices()
         self._init_coupling_mat()
@@ -410,6 +420,13 @@ class PhotoNuclearInteractionRate(object):
         self._batch_cols = self._batch_cols[self.sortidx]
         self._batch_matrix = self._batch_matrix[self.sortidx, :]
 
+        # Invalidate any xs-dtype mirror that was built before the sort
+        # permutation (none should exist at this point, but guard anyway
+        # in case the order ever changes).
+        self._batch_matrix_xs = None
+        self._batch_vec_xs = None
+        self._photon_buf_xs = None
+
         # cupy mirror state (full-GPU backend). ``_coupling_mat_gpu``
         # shares its ``data`` buffer with ``_batch_vec_gpu`` when their
         # dtypes match, so the cupy.dot result inhabits the CSR data
@@ -418,6 +435,52 @@ class PhotoNuclearInteractionRate(object):
         self._batch_vec_gpu = None
         self._coupling_mat_gpu = None
         self._ratemat_zcache_gpu = None
+
+    # ------------------------------------------------------------------
+    # Host xs-dtype buffers (scipy / MKL backends)
+    # ------------------------------------------------------------------
+    def _ensure_xs_buffers(self):
+        """Prepare the xs-dtype mirror of ``_batch_matrix`` plus matching
+        host scratch buffers, used by the scipy / MKL ``_update_rates``
+        path to run the cache-rebuild dense matvec at ``backend.xs_dtype``.
+
+        When ``backend.xs_dtype`` is ``"float64"`` or ``None``, the
+        method aliases the existing fp64 buffers — no extra memory and
+        no per-window cast (zero-overhead default for parity bench /
+        legacy callers that explicitly request fp64).
+
+        When ``backend.xs_dtype`` differs from the host solver dtype
+        (the common case: fp32 SGEMV against fp64 solver state), a
+        fp32 cast of ``_batch_matrix`` is allocated alongside a fp32
+        ``_batch_vec_xs`` (size = ``nnz`` of the coupling matrix) and a
+        fp32 ``_photon_buf_xs`` (size = ``dph``). The matvec writes
+        into ``_batch_vec_xs`` in fp32; the upcast to the fp64 CSR
+        data buffer happens in ``_update_coupling_mat``.
+
+        Idempotent: re-runs only if no mirror exists yet or if a
+        mid-process ``backend.xs_dtype`` flip changed the requested
+        precision.
+        """
+        xs_attr = self.prince_run.backend.xs_dtype
+        dt_solver = np.dtype("float64")
+        dt_xs = np.dtype(xs_attr) if xs_attr is not None else dt_solver
+        if (
+            self._batch_matrix_xs is not None
+            and self._batch_matrix_xs.dtype == dt_xs
+        ):
+            return
+        if dt_xs == dt_solver:
+            self._batch_matrix_xs = self._batch_matrix
+            self._batch_vec_xs = self._batch_vec
+            self._photon_buf_xs = None
+        else:
+            self._batch_matrix_xs = np.ascontiguousarray(
+                self._batch_matrix, dtype=dt_xs
+            )
+            self._batch_vec_xs = np.zeros(self._batch_vec.size, dtype=dt_xs)
+            self._photon_buf_xs = np.zeros(
+                self._batch_matrix.shape[1], dtype=dt_xs
+            )
 
     # ------------------------------------------------------------------
     # Full-GPU cupy backend (GPU dense matvec + GPU SpMV)
@@ -429,25 +492,25 @@ class PhotoNuclearInteractionRate(object):
         Builds:
 
         * ``_batch_matrix_gpu``:  cupy mirror of the dense rate kernel
-          (~80 MB at ``max_mass=56``), in ``cupy_xs_dtype`` (fp32 for
-          the SGEMM win, fp64 for parity with scipy).
+          (~80 MB at ``max_mass=56``), in ``backend.xs_dtype`` (fp32
+          for the SGEMM win, fp64 for parity with scipy).
         * ``_batch_vec_gpu``:  cupy ndarray sized to the host coupling
-          matrix's ``nnz``, in ``cupy_xs_dtype``. Receives the result
-          of each cache-window dense matvec.
+          matrix's ``nnz``, in ``backend.xs_dtype``. Receives the
+          result of each cache-window dense matvec.
         * ``_coupling_mat_gpu``:  cupyx.scipy.sparse.csr_matrix in
           ``cupy_dtype`` (the *solver* dtype). Its ``.data`` is what
           the ETD2 hot path SpMVs against, so per-step arithmetic stays
           at solver precision regardless of the SGEMM dtype.
 
-        When ``cupy_xs_dtype is None`` (default) or matches
-        ``cupy_dtype``, ``_batch_vec_gpu`` is aliased into
-        ``_coupling_mat_gpu.data`` (no per-window cast). When they
-        differ, ``_update_rates_gpu`` casts ``_batch_vec_gpu`` →
-        ``_coupling_mat_gpu.data`` once per cache window — that cast
-        is the only mixed-precision boundary in the pipeline.
+        When ``backend.xs_dtype is None`` or matches ``cupy_dtype``,
+        ``_batch_vec_gpu`` is aliased into ``_coupling_mat_gpu.data``
+        (no per-window cast). When they differ, ``_update_rates_gpu``
+        casts ``_batch_vec_gpu`` → ``_coupling_mat_gpu.data`` once per
+        cache window — that cast is the only mixed-precision boundary
+        in the pipeline.
         """
         dt_solver = np.dtype(self.prince_run.backend.cupy_dtype)
-        xs_attr = self.prince_run.backend.cupy_xs_dtype
+        xs_attr = self.prince_run.backend.xs_dtype
         dt_xs = np.dtype(xs_attr) if xs_attr is not None else dt_solver
         if (
             self._coupling_mat_gpu is not None
@@ -500,7 +563,7 @@ class PhotoNuclearInteractionRate(object):
 
         Mirrors the host ``_update_rates`` semantics: returns True if a
         recompute happened, False if the (z, pfield) cache hit. When
-        ``cupy_xs_dtype == cupy_dtype`` (or unset), ``_batch_vec_gpu``
+        ``backend.xs_dtype == cupy_dtype`` (or unset), ``_batch_vec_gpu``
         IS the coupling-matrix data buffer (no cast). When they differ
         — the mixed-precision pipeline — the cast bridges fp32 SGEMM
         output to the fp64 ETD2 hot path.
@@ -550,31 +613,49 @@ class PhotoNuclearInteractionRate(object):
             info(5, "Updating batch rate vectors.")
 
             backend = self.prince_run.backend
+            self._ensure_xs_buffers()
+            photon = self.photon_vector(z, pfield=pfield)
+            use_mixed = self._batch_matrix_xs is not self._batch_matrix
             if (
                 backend.linear_algebra_backend.lower() == "mkl"
                 and config.has_mkl
                 and config.mkl is not None
                 and backend.use_mkl_dense_matvec
+                and not use_mixed
             ):
                 # Route through MKL CBLAS DGEMV so the dense matvec
                 # shares MKL's threadpool with the Sparse BLAS path,
                 # avoiding the OpenBLAS-vs-MKL oversubscription that
                 # otherwise caps the whole solve. Disabled by default
                 # because Zen + MKL 2026 dispatches DGEMV serially
-                # (see :data:`config.use_mkl_dense_matvec`).
+                # (see :data:`config.use_mkl_dense_matvec`). The MKL
+                # binding is fp64-only; when ``backend.xs_dtype`` is
+                # fp32 (the default) the mixed-precision branch below
+                # takes over via numpy's BLAS dispatch (SGEMV under
+                # OpenBLAS/Accelerate).
                 from . import mkl_dense
 
                 mkl_dense.dgemv_y_eq_Ax(
                     self._batch_matrix,
-                    np.ascontiguousarray(
-                        self.photon_vector(z, pfield=pfield), dtype=np.float64
-                    ),
+                    np.ascontiguousarray(photon, dtype=np.float64),
                     self._batch_vec,
+                )
+            elif use_mixed:
+                # Mixed-precision: cast photon down to xs dtype, run
+                # the matvec in xs dtype (SGEMV-fast on every BLAS at
+                # this shape), leave the result in ``_batch_vec_xs``.
+                # ``_update_coupling_mat`` does the fp32→fp64 cast on
+                # the copy into the CSR data buffer.
+                np.copyto(self._photon_buf_xs, photon)
+                np.dot(
+                    self._batch_matrix_xs,
+                    self._photon_buf_xs,
+                    out=self._batch_vec_xs,
                 )
             else:
                 np.dot(
                     self._batch_matrix,
-                    self.photon_vector(z, pfield=pfield),
+                    photon,
                     out=self._batch_vec,
                 )
             # Invalidate cache for one-shot pfield overrides so the next
@@ -614,12 +695,20 @@ class PhotoNuclearInteractionRate(object):
             # MKL Sparse BLAS handle that pinned ``coupling_mat.data`` valid
             # across windows (relevant if the MKL handle ever wraps the
             # downstream ``M`` directly rather than its ``M_off`` copy).
-            assert self.coupling_mat.data.size == self._batch_vec.size
+            #
+            # ``_batch_vec_xs`` is the matvec output buffer at
+            # ``backend.xs_dtype`` (fp32 by default); when that matches
+            # the host solver dtype, it IS ``_batch_vec``. ``np.copyto`` /
+            # ``np.multiply`` upcast fp32 → fp64 on the write into the
+            # CSR data buffer — that cast is the only mixed-precision
+            # boundary in the host pipeline (mirrors the cupy path).
+            src = self._batch_vec_xs if self._batch_vec_xs is not None else self._batch_vec
+            assert self.coupling_mat.data.size == src.size
             if scale_fac == 1.0:
-                np.copyto(self.coupling_mat.data, self._batch_vec)
+                np.copyto(self.coupling_mat.data, src)
             else:
                 np.multiply(
-                    self._batch_vec, scale_fac, out=self.coupling_mat.data
+                    src, scale_fac, out=self.coupling_mat.data
                 )
 
     def get_hadr_jacobian(self, z, scale_fac=1.0, force_update=False, pfield=None):

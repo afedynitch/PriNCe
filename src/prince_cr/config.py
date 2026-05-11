@@ -187,21 +187,23 @@ cupy_dtype = "float64"
 
 # Float dtype for the per-cache-window dense matvec that rebuilds the
 # photo-hadronic rate matrix (``_batch_matrix @ photon_vector``).
-# Default ``"float32"`` gives the *mixed-precision* pipeline against
-# the ``"float64"`` ``cupy_dtype`` default: SGEMM for the rate-cache
-# rebuild (the bandwidth-bound win on consumer GPUs that throttle
-# fp64), with the result cast up to ``cupy_dtype`` before it reaches
-# the ETD2 hot path (per-step SpMV, κ multiplication, exp/φ chain —
-# where the fp32 systematic bias originates and where keeping fp64
-# buys correctness). Measured on RTX 3090 / Ampere, the mixed
-# pipeline runs ~8× faster than full fp64 at L2rel ~3e-5 vs MKL
-# (well below source-modeling uncertainty), versus L2rel ≈ 1 for the
-# full-fp32 pipeline. Set to ``None`` to follow ``cupy_dtype`` (i.e.
-# disable mixed-precision and recover the single-precision pipeline),
-# or to ``"float64"`` to force fp64 SGEMM regardless of ``cupy_dtype``.
-# The cast is one nnz-sized copy per cache window (~10 ETD2 steps),
-# so the per-step cost is negligible vs the matvec itself.
-cupy_xs_dtype = "float32"
+# Applies to every backend (scipy, MKL, cupy): the matvec is
+# bandwidth-bound at this shape (rows ≫ cols), so the dtype halves the
+# byte traffic and ~doubles throughput on every BLAS we run.
+# Default ``"float32"`` gives the *mixed-precision* pipeline: SGEMM /
+# DGEMV at the rate-cache rebuild, with the result cast up to the
+# solver dtype (fp64) before it reaches the ETD2 hot path (per-step
+# SpMV, κ multiplication, exp/φ chain — where the fp32 systematic
+# bias originates and where keeping fp64 buys correctness). On cupy /
+# RTX 3090 the mixed pipeline runs ~8× faster than full fp64 at
+# L2rel ~3e-5 vs MKL; on Apple Accelerate the dense matvec alone is
+# ~2× faster (`_batch_matrix` is 263 MB at max_mass=24 → bandwidth-
+# bound dgemv → sgemv) translating to ~10–15 % wall save on host
+# scipy. Set to ``"float64"`` to force fp64 GEMM (parity baseline),
+# or to ``None`` to follow the solver dtype. The cast is one
+# nnz-sized copy per cache window (~10 ETD2 steps), so the per-step
+# cost is negligible vs the matvec itself.
+xs_dtype = "float32"
 
 # Capture the per-step ETD2 kernel sequence into a CUDA Graph and replay
 # it across each cache window (~10 steps), re-capturing on every
@@ -252,7 +254,7 @@ class BackendConfig:
     use_cuda_graphs: bool = False
     use_mkl_dense_matvec: bool = False
     cupy_dtype: str = "float64"
-    cupy_xs_dtype: Optional[str] = "float32"
+    xs_dtype: Optional[str] = "float32"
     mkl_bsr_blocksize: Optional[int] = None
     mkl_threads: int = 16
     update_rates_z_threshold: float = 0.01
@@ -270,7 +272,7 @@ class BackendConfig:
             use_cuda_graphs=use_cuda_graphs,
             use_mkl_dense_matvec=use_mkl_dense_matvec,
             cupy_dtype=cupy_dtype,
-            cupy_xs_dtype=cupy_xs_dtype,
+            xs_dtype=xs_dtype,
             mkl_bsr_blocksize=mkl_bsr_blocksize,
             mkl_threads=MKL_threads,
             update_rates_z_threshold=update_rates_z_threshold,
@@ -286,7 +288,7 @@ try:
     mempool.free_all_blocks()
 except ModuleNotFoundError:
     print("CUPY not found for GPU support. Degrading to MKL.")
-    if linear_algebra_backend == "cupy":
+    if linear_algebra_backend.lower() == "cupy":
         linear_algebra_backend = "MKL"
     has_cupy = False
 
