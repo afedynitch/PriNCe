@@ -30,6 +30,39 @@ from pathlib import Path  # noqa: E402
 
 import numpy as np  # noqa: E402
 
+# Load machine-local path config from the bookkeeping repo's `.env`
+# (python-dotenv) before reading any env-var defaults below. PriNCe
+# lives next to UH-UHECR-Fluka-Prince/ on every machine we run on; we
+# walk a small fixed candidate list rather than `find_dotenv` to avoid
+# picking up an unrelated `.env` somewhere upstream of $PWD. Quiet
+# fallback to the legacy hardcoded path if neither python-dotenv nor a
+# bookkeeping clone is reachable.
+_UH_REPO_CANDIDATES = [
+    os.environ.get("UH_REPO"),
+    str(Path(__file__).resolve().parents[2] / "UH-UHECR-Fluka-Prince"),
+    os.path.expanduser("~/work/devel/UH-UHECR-Fluka-Prince"),
+    os.path.expanduser("~/devel_mac/UH-UHECR-Fluka-Prince"),
+]
+for _uh_root in _UH_REPO_CANDIDATES:
+    if _uh_root and (Path(_uh_root) / ".env").is_file():
+        try:
+            from dotenv import load_dotenv  # noqa: E402
+
+            load_dotenv(Path(_uh_root) / ".env")
+        except ImportError:
+            # Minimal manual parser: KEY=value with ${VAR} expansion.
+            # Sufficient for the path-only schema in .env.mac/.env.satori.
+            with open(Path(_uh_root) / ".env") as _envf:
+                for _line in _envf:
+                    _line = _line.strip()
+                    if not _line or _line.startswith("#"):
+                        continue
+                    _k, _, _v = _line.partition("=")
+                    os.environ.setdefault(
+                        _k.strip(), os.path.expandvars(_v.strip())
+                    )
+        break
+
 import prince_cr.config as config  # noqa: E402
 
 # Belt-and-suspenders: if some BLAS backend already initialised its
@@ -65,13 +98,22 @@ config.x_cut_proton = 1e-2
 config.tau_dec_threshold = np.inf
 config.max_mass = 14
 
-# FLUKA smoke db ships v2-sparse format under the bookkeeping repo's run
-# directory. Override fluka_db_path / fluka_db_fname to retarget elsewhere.
-_FLUKA_SMOKE_DB_DIR = os.path.expanduser(
-    "~/work/devel/UH-UHECR-Fluka-Prince/runs/2026-05-04_pfu-v1-smoke"
+# FLUKA smoke db ships v2-sparse format under the bookkeeping repo's
+# `runs/2026-05-04_pfu-v1-smoke/`. Path is machine-specific: prefer the
+# env vars sourced from the bookkeeping repo's `.env` (.env.mac /
+# .env.satori); fall back to the legacy SATORI hardcode if neither
+# the env vars nor a discoverable .env are present.
+_FLUKA_SMOKE_DB_DIR = os.environ.get(
+    "PRINCE_FLUKA_SMOKE_DB_DIR",
+    os.path.expanduser(
+        "~/work/devel/UH-UHECR-Fluka-Prince/runs/2026-05-04_pfu-v1-smoke"
+    ),
+)
+_FLUKA_SMOKE_DB_FNAME = os.environ.get(
+    "PRINCE_FLUKA_SMOKE_DB_FNAME", "prince_db_v1_smoke.h5"
 )
 config.fluka_db_path = _FLUKA_SMOKE_DB_DIR
-config.fluka_db_fname = "prince_db_v1_smoke.h5"
+config.fluka_db_fname = _FLUKA_SMOKE_DB_FNAME
 
 # ---------------------------------------------------------------------------
 # Fixtures
