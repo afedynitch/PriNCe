@@ -820,6 +820,17 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
         decay_cache: dict = {}
         n_unstable = 0
 
+        # Cache the daughter-indexed tracked-species map (decay-routed
+        # variants only) for the duration of this build. Empty when no
+        # tracked species were registered or all are photo-nuclear-only.
+        tracked_for_da = {}
+        for trk in self.spec_man.species_refs:
+            if not getattr(trk, "is_tracking", False):
+                continue
+            if trk.process_class == "photo-nuclear":
+                continue
+            tracked_for_da.setdefault(trk.real_pdgid, []).append(trk)
+
         for s in self.spec_man.species_refs:
             tau = getattr(s, "lifetime", np.inf)
             if not np.isfinite(tau) or tau <= 0.0:
@@ -827,18 +838,29 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
             n_unstable += 1
             # Per-nucleon convention for nuclei: γ = E_pn / m_p, A-independent.
             # Light/hadronic species carry their total energy in the per-bin
-            # state, so γ = E_total / m_species.
-            if is_nucleus(s.pdgid):
+            # state, so γ = E_total / m_species. For tracked species the
+            # ``is_nucleus`` check on the synthetic PDG returns False; we
+            # dispatch on ``real_pdgid`` instead so tracked nuclei get the
+            # per-nucleon γ that matches their real counterpart.
+            eff_pdgid = getattr(s, "real_pdgid", None) or s.pdgid
+            if is_nucleus(eff_pdgid):
                 gamma = e_grid / m_proton
             else:
                 # Fall back to the species' own rest mass; spec_data carries
                 # masses in GeV alongside lifetimes (data.py:417, 429, 494).
-                m_sp = spec_data.get(s.pdgid, {}).get("mass", m_proton)
+                m_sp = spec_data.get(eff_pdgid, {}).get("mass", m_proton)
                 gamma = e_grid / m_sp
             # Λ_diag = -1/(c · γ · τ) in cm⁻¹. cm2sec = 1/c (sec/cm), so
             #   -1/(c · γτ) = -cm2sec/(γτ).
             rate_per_cm = cm2sec / (gamma * tau)  # (n_E,), positive
             Lambda_diag[s.lidx() : s.uidx()] = -rate_per_cm
+
+            # Passive-observer guard: tracked species participate in Λ_diag
+            # (they lose flux to their own decay) but do NOT seed Λ_off
+            # productions — their decay daughters do not feed back into the
+            # network. See methods/tracking-species-design.md § Loss term.
+            if getattr(s, "is_tracking", False):
+                continue
 
             # Off-diagonal: walk the mother's branchings and place a
             # ``rate · branching · redistribution`` block at each surviving
@@ -871,6 +893,19 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
                     off_rows.append(da_ref.lidx() + nz[0])
                     off_cols.append(mo_lidx + nz[1])
                     off_vals.append(block[nz])
+                    # Tracking hook: duplicate the same block into each
+                    # tracked species whose ``real_pdgid`` matches this
+                    # daughter and whose ``parent_pdgs`` admits this
+                    # mother. ``process_class`` was filtered when building
+                    # ``tracked_for_da`` (photo-nuclear-only trackers are
+                    # excluded). No e_gamma_range applies on the decay
+                    # side — the kernel has no photon-energy axis here.
+                    for trk in tracked_for_da.get(da_pdg, ()):
+                        if s.pdgid not in trk.parent_pdgs:
+                            continue
+                        off_rows.append(trk.lidx() + nz[0])
+                        off_cols.append(mo_lidx + nz[1])
+                        off_vals.append(block[nz])
 
         if n_unstable == 0:
             # No unstable species reached the state vector — leave the

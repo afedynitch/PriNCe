@@ -294,6 +294,26 @@ class PhotoNuclearInteractionRate(object):
         bc_set = self.cross_sections.known_bc_channels_set
         diff_set = self.cross_sections.known_diff_channels_set
 
+        # Tracked-species e_gamma masks. Built once per kernel construction
+        # and applied to the corresponding ``(mo, tracked_pdg)`` tile before
+        # it lands in ``_batch_matrix``. The mask zeros out photon-energy
+        # bins outside the species' ``e_gamma_range`` so only in-window
+        # photon kinematics contribute to the tracked-species rows.
+        # ``None`` value means no filtering. See
+        # methods/tracking-species-design.md § "Energy-range filtering".
+        ph_centers = self.e_photon.grid
+        _tracked_pdg_mask = {}
+        for s in spec_man.species_refs:
+            if not getattr(s, "is_tracking", False):
+                continue
+            if s.e_gamma_range is None:
+                _tracked_pdg_mask[s.pdgid] = None
+            else:
+                E_lo, E_hi = s.e_gamma_range
+                _tracked_pdg_mask[s.pdgid] = (
+                    (ph_centers >= E_lo) & (ph_centers < E_hi)
+                )
+
         for moid, daid in itertools.product(known_species_rev, known_species_rev):
             if not is_nucleus(moid):
                 continue
@@ -321,6 +341,12 @@ class PhotoNuclearInteractionRate(object):
                     tile += factor_mo[:, None] * incl_dR[(moid, daid)][A_2d]
                 if has_nonel:
                     tile -= factor_mo[:, None] * nonel_dR[moid][A_2d]
+                # Energy-range filter for tracked species: zero out photon-
+                # energy bins outside ``trk.e_gamma_range``. No-op for real
+                # species and for tracked species with no window set.
+                _msk = _tracked_pdg_mask.get(daid) if _tracked_pdg_mask else None
+                if _msk is not None:
+                    tile[:, ~_msk] = 0.0
 
                 self._batch_matrix[ibatch:ibatch + dcr, :] = tile
                 ibatch += dcr
@@ -350,6 +376,14 @@ class PhotoNuclearInteractionRate(object):
                     nonel_tile = factor_mo[:, None] * nonel_dR[moid][A_2d]
                     # Subtract on the diagonal i_mo == i_da
                     res[diag, diag, :] -= nonel_tile
+
+                # Energy-range filter on the photon-energy axis for tracked
+                # species. Applied here so the cut still lands ahead of the
+                # x-cut filter / extraction below — masked bins drop out of
+                # both the kept-rows count and the kernel values.
+                _msk = _tracked_pdg_mask.get(daid) if _tracked_pdg_mask else None
+                if _msk is not None:
+                    res[..., ~_msk] = 0.0
 
                 # x-cut filter (depends only on (i_mo, i_da))
                 cut_low = x_cut_proton if daid == 2212 else x_cut
@@ -407,8 +441,16 @@ class PhotoNuclearInteractionRate(object):
 
         from scipy.sparse import csr_matrix
 
+        # Pin the CSR shape to the full state-vector dimension so
+        # daughter-only species (e.g. tracked rows whose mother column
+        # never appears) don't shrink the column axis below
+        # ``dim_states``. Without this, ``split_operator`` later sees a
+        # rectangular matrix and raises on the diagonal subtraction.
+        n = self.prince_run.dim_states
         self.coupling_mat = csr_matrix(
-            (self._batch_vec, (self._batch_rows, self._batch_cols)), copy=True
+            (self._batch_vec, (self._batch_rows, self._batch_cols)),
+            shape=(n, n),
+            copy=True,
         )
 
         # create an index to sort by rows and then columns,

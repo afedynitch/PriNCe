@@ -27,6 +27,13 @@ class PriNCeRun(object):
         backend = kwargs.pop("backend", None)
         self.backend = backend if backend is not None else config.BackendConfig.from_globals()
 
+        # Tracked-species spec: list of kwargs dicts to pass to
+        # ``SpeciesManager.add_tracking_species``. Resolved after
+        # spec_man is built but before interaction_rates / response,
+        # so the matrix builders see the augmented species set.
+        # See methods/tracking-species-design.md.
+        tracked_species = kwargs.pop("tracked_species", None) or []
+
         # Initialize energy grid
         if config.grid_scale == "E":
             info(1, "initialising Energy grid")
@@ -74,6 +81,19 @@ class PriNCeRun(object):
 
         # Initialize species manager for all species for which cross sections are known
         self.spec_man = data.SpeciesManager(system_species, self.cr_grid.d)
+
+        # Register tracked species (passive observers) before sizing the
+        # state vector. Each entry is a kwargs dict for
+        # ``SpeciesManager.add_tracking_species``; tracked species are
+        # appended to ``species_refs`` with synthetic PDG IDs.
+        for spec in tracked_species:
+            self.spec_man.add_tracking_species(**spec)
+        if self.spec_man.has_tracked_species():
+            # Mirror matching (mo, real_da) channels onto (mo, tracked_pdg)
+            # so the response builder and rate kernel pick them up. Hook
+            # is a no-op when no tracked species require photo-nuclear
+            # tracking (e.g. all are decay-only).
+            self.cross_sections.emit_tracking_channels(self.spec_man)
 
         # Total dimension of system
         self.dim_states = self.cr_grid.d * self.spec_man.nspec

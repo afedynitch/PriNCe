@@ -1076,6 +1076,8 @@ class PrinceSpecies(object):
         self.lifetime = np.inf
         #: (bool) particle is an alias (PDG ID encodes special scoring behavior)
         self.is_alias = False
+        #: (bool) passive tracking copy (see :class:`PrinceTrackedSpecies`)
+        self.is_tracking = False
         #: (str) species name in string representation
         self.sname = None
         #: decay channels if any
@@ -1189,6 +1191,79 @@ class PrinceSpecies(object):
         return (self.princeidx + 1) * (self.grid_dims[grid_tag] + 1)
 
 
+#: Synthetic PDG namespace for tracked species. Chosen disjoint from the
+#: nuclear PDG range (max ~1.01e9 at ``10LZZZAAAI``) and the hadron/lepton
+#: range (|PDG| < 10^6). ``util.is_nucleus`` / ``util.get_AZN`` return
+#: False / (0,0,0) for IDs in this band, so kernel branches that dispatch
+#: on PDG arithmetic naturally skip tracked species as mothers — passive-
+#: observer semantics fall out without an explicit guard.
+_TRACKING_PDG_BASE = 2_000_000_000
+
+
+_TRACKING_PROCESS_CLASSES = ("photo-nuclear", "decay", "both")
+
+
+class PrinceTrackedSpecies(PrinceSpecies):
+    """Passive tracking copy of an existing :class:`PrinceSpecies`.
+
+    The species occupies its own slot in the state vector but takes all
+    physics (``is_nucleus``, ``A/Z/N``, ``lifetime``, ``mass``,
+    ``has_redist``, decay channels) from a *real* daughter identified by
+    ``real_pdgid``. The synthetic ``pdgid`` is only an indexing key.
+
+    See ``wiki/methods/tracking-species-design.md`` for the design.
+    """
+
+    def __init__(
+        self,
+        real_pdgid,
+        tracking_pdgid,
+        princeidx,
+        d,
+        *,
+        parent_pdgs,
+        process_class,
+        e_gamma_range=None,
+        alias=None,
+    ):
+        if process_class not in _TRACKING_PROCESS_CLASSES:
+            raise ValueError(
+                "process_class must be one of {0}, got {1!r}".format(
+                    _TRACKING_PROCESS_CLASSES, process_class
+                )
+            )
+        if process_class == "decay" and e_gamma_range is not None:
+            raise ValueError(
+                "e_gamma_range applies to the photon-energy axis of the "
+                "photo-nuclear kernel; decay-only trackers must pass None."
+            )
+        self.real_pdgid = int(real_pdgid)
+        self._tracking_alias = alias
+        self.parent_pdgs = frozenset(int(p) for p in parent_pdgs)
+        self.process_class = process_class
+        self.e_gamma_range = (
+            (float(e_gamma_range[0]), float(e_gamma_range[1]))
+            if e_gamma_range is not None
+            else None
+        )
+        super().__init__(tracking_pdgid, princeidx, d)
+        # ``PrinceSpecies.__init__`` set is_tracking=False; flip after super.
+        self.is_tracking = True
+
+    def _init_species(self):
+        """Dispatch physics on ``self.real_pdgid`` while keeping
+        ``self.pdgid`` set to the synthetic indexing key.
+        """
+        synthetic = self.pdgid
+        self.pdgid = self.real_pdgid
+        try:
+            super()._init_species()
+        finally:
+            self.pdgid = synthetic
+        if self._tracking_alias:
+            self.sname = self._tracking_alias
+
+
 class SpeciesManager(object):
     """Provides a database with particle and species."""
 
@@ -1215,6 +1290,16 @@ class SpeciesManager(object):
         self.princeidx2pname = {}
         #: (int) Total number of species
         self.nspec = 0
+
+        #: Counter for synthetic tracked-species PDGs. Each
+        #: :meth:`add_tracking_species` call increments and offsets
+        #: ``_TRACKING_PDG_BASE`` to allocate a fresh synthetic ID.
+        self._tracking_counter = 0
+        #: Dict[int, list[PrinceTrackedSpecies]]: maps a *real* daughter
+        #: PDG to the list of tracked species that mirror it. Built by
+        #: :meth:`add_tracking_species`; consumed by cross-section and
+        #: solver tracking hooks.
+        self._tracked_by_real_da = {}
 
         self._gen_species(pdgid_list)
         self._init_species_tables()
@@ -1251,6 +1336,203 @@ class SpeciesManager(object):
             self.sname2sref[s.sname] = s
 
         self.nspec = len(self.species_refs)
+
+    def add_tracking_species(
+        self,
+        *,
+        parent_pdgs,
+        daughter_pdg,
+        process_class="both",
+        e_gamma_range=None,
+        alias=None,
+    ):
+        """Register a passive tracked copy of ``daughter_pdg``.
+
+        ``parent_pdgs`` may be an iterable of PDG IDs or a predicate
+        ``callable(PrinceSpecies) -> bool``; predicates are resolved
+        against the current ``species_refs`` and frozen at registration
+        time.
+
+        Returns the new :class:`PrinceTrackedSpecies`. The species is
+        appended to ``species_refs`` with a fresh ``princeidx``; callers
+        must register all tracked species *before* dimensions like
+        ``PriNCeRun.dim_states`` are computed and *before* the
+        interaction-rate / solver matrices are built.
+        """
+        daughter_pdg = int(daughter_pdg)
+        if daughter_pdg not in self.pdgid2sref:
+            raise KeyError(
+                "Real daughter PDG {0} is not in the species set; add it to "
+                "the species list before registering a tracked copy.".format(
+                    daughter_pdg
+                )
+            )
+
+        if callable(parent_pdgs):
+            predicate = parent_pdgs
+            resolved = [
+                s.pdgid for s in self.species_refs
+                if not getattr(s, "is_tracking", False) and predicate(s)
+            ]
+        else:
+            resolved = [int(p) for p in parent_pdgs]
+        if not resolved:
+            raise ValueError(
+                "No parent species matched for tracked daughter {0}; check "
+                "the parent_pdgs argument.".format(daughter_pdg)
+            )
+
+        self._tracking_counter += 1
+        synthetic = _TRACKING_PDG_BASE + self._tracking_counter
+
+        if alias is None:
+            real_sname = self.pdgid2sref[daughter_pdg].sname
+            alias = "{0}_tracked_{1}".format(real_sname, self._tracking_counter)
+        if alias in self.sname2sref:
+            raise ValueError(
+                "Tracked-species alias {0!r} clashes with an existing "
+                "species name; pass a unique ``alias=``.".format(alias)
+            )
+
+        # Sanity-warn on overlapping e_gamma windows in the same
+        # (parent_set, daughter, process_class) bucket.
+        if e_gamma_range is not None:
+            import warnings
+
+            E_lo, E_hi = float(e_gamma_range[0]), float(e_gamma_range[1])
+            for other in self._tracked_by_real_da.get(daughter_pdg, []):
+                if other.process_class != process_class:
+                    continue
+                if other.parent_pdgs != frozenset(resolved):
+                    continue
+                if other.e_gamma_range is None:
+                    continue
+                o_lo, o_hi = other.e_gamma_range
+                # Half-open [lo, hi) — touching edges don't overlap.
+                if E_lo < o_hi and o_lo < E_hi:
+                    warnings.warn(
+                        "Tracked species {0!r} overlaps energy window of "
+                        "existing {1!r} ([{2}, {3}) vs [{4}, {5})); the "
+                        "overlap region will be double-counted across "
+                        "trackers.".format(
+                            alias, other.sname, E_lo, E_hi, o_lo, o_hi
+                        ),
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+        princeidx = len(self.species_refs)
+        trk = PrinceTrackedSpecies(
+            real_pdgid=daughter_pdg,
+            tracking_pdgid=synthetic,
+            princeidx=princeidx,
+            d=self.grid_dims["default"],
+            parent_pdgs=resolved,
+            process_class=process_class,
+            e_gamma_range=e_gamma_range,
+            alias=alias,
+        )
+        # Apply any non-default grid_tags registered before this call so the
+        # new species reports correct lidx / uidx for them.
+        trk.grid_dims = self.grid_dims
+
+        self.species_refs.append(trk)
+        self.pdgid2princeidx[synthetic] = princeidx
+        self.sname2princeidx[alias] = princeidx
+        self.princeidx2pdgid[princeidx] = synthetic
+        self.princeidx2pname[princeidx] = alias
+        self.pdgid2sref[synthetic] = trk
+        self.princeidx2sref[princeidx] = trk
+        self.sname2sref[alias] = trk
+        self.known_species.append(synthetic)
+        if trk.has_redist:
+            self.redist_species.append(synthetic)
+        else:
+            self.boost_conserv_species.append(synthetic)
+        self.nspec = len(self.species_refs)
+        self._tracked_by_real_da.setdefault(daughter_pdg, []).append(trk)
+        return trk
+
+    def tracked_species_for(self, da_real_pdg):
+        """Return tracked species whose ``real_pdgid`` equals
+        ``da_real_pdg``; empty list when none exist."""
+        return list(self._tracked_by_real_da.get(int(da_real_pdg), ()))
+
+    def has_tracked_species(self):
+        return self._tracking_counter > 0
+
+    def add_tracking_neutrinos_from_nuclei(self, min_A=2):
+        """Register six tracked neutrinos (ν_e, ν̄_e, ν_μ, ν̄_μ, ν_τ, ν̄_τ)
+        each capturing the flux produced from decays of nuclei with
+        ``A >= min_A``. Returns the list of new tracked species. Skips
+        flavours whose real species is absent from the state vector.
+        """
+        nu_pdgs = (12, -12, 14, -14, 16, -16)
+        from prince_cr.util import is_nucleus, get_AZN
+        registered = []
+        for nu in nu_pdgs:
+            if nu not in self.pdgid2sref:
+                continue
+            real_sname = self.pdgid2sref[nu].sname
+            trk = self.add_tracking_species(
+                parent_pdgs=lambda s, _min=min_A: (
+                    is_nucleus(s.pdgid) and get_AZN(s.pdgid)[0] >= _min
+                ),
+                daughter_pdg=nu,
+                process_class="decay",
+                alias="{0}_from_nuclei".format(real_sname),
+            )
+            registered.append(trk)
+        return registered
+
+    def add_tracking_charge_exchange(self, parent_pdgid=2212, daughter_pdgid=2112):
+        """Register a tracked daughter (default: neutron) capturing the
+        flux produced from photo-hadronic conversion of ``parent_pdgid``
+        (default: proton). Returns the new tracked species."""
+        real = self.pdgid2sref[int(daughter_pdgid)].sname
+        parent = self.pdgid2sref[int(parent_pdgid)].sname
+        return self.add_tracking_species(
+            parent_pdgs=[int(parent_pdgid)],
+            daughter_pdg=int(daughter_pdgid),
+            process_class="photo-nuclear",
+            alias="{0}_from_{1}".format(real, parent),
+        )
+
+    def add_tracking_photo_nuclear_regimes(
+        self,
+        *,
+        parent_pdgs,
+        daughter_pdg,
+        e_gamma_partition,
+    ):
+        """Register one tracked species per energy bucket in
+        ``e_gamma_partition``. Each partition entry is
+        ``(E_lo, E_hi, label)``; the resulting alias is
+        ``"<daughter_sname>_from_<parent_alias>_<label>"``. The buckets
+        are not checked for full coverage — caller can pass an extra
+        ``e_gamma_range=None`` tracker as a sum-rule check.
+
+        Returns the list of new tracked species in the order given.
+        """
+        parents = list(parent_pdgs)
+        if len(parents) == 1:
+            parent_label = self.pdgid2sref[int(parents[0])].sname
+        else:
+            parent_label = "_".join(
+                self.pdgid2sref[int(p)].sname for p in parents
+            )
+        real = self.pdgid2sref[int(daughter_pdg)].sname
+        registered = []
+        for E_lo, E_hi, label in e_gamma_partition:
+            trk = self.add_tracking_species(
+                parent_pdgs=parents,
+                daughter_pdg=int(daughter_pdg),
+                process_class="photo-nuclear",
+                e_gamma_range=(E_lo, E_hi),
+                alias="{0}_from_{1}_{2}".format(real, parent_label, label),
+            )
+            registered.append(trk)
+        return registered
 
     def add_grid(self, grid_tag, dimension):
         """Defines additional grid dimensions under a certain tag.

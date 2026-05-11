@@ -432,6 +432,91 @@ class CrossSectionBase(object, metaclass=ABCMeta):
             ),
         )
 
+    def emit_tracking_channels(self, spec_man):
+        """Augment the reduced ``_incl_tab`` / ``_incl_diff_tab`` and the
+        membership lists with synthetic tracked-species entries.
+
+        For each :class:`PrinceTrackedSpecies` registered on ``spec_man``,
+        scan the post-reduction channel dicts and, for every entry
+        ``(mo, real_da)`` whose mother is in the tracked species' parent
+        set, install a parallel entry ``(mo, synthetic_pdg)`` carrying a
+        *reference* to the same cross-section array. The response builder
+        and kernel pick the new entries up the same way they pick up any
+        ordinary channel — tracked species end up with their own rows in
+        ``M_off`` produced from a shared cross-section spline.
+
+        Called once from :meth:`PriNCeRun.__init__` after
+        :class:`SpeciesManager` has registered all tracked species, and
+        before the response / interaction-rate matrices are built.
+        Idempotent for the matching channels — re-running adds the same
+        keys, never duplicates.
+
+        ``process_class`` is honoured loosely in v1: every matching
+        ``(mo, real_da)`` entry mirrors regardless of whether it reached
+        the reduced table via photo-nuclear or chain-folded decay. With
+        ``config.enable_explicit_decay`` on, the chain walker is skipped
+        so the only entries left in ``_incl_tab`` are photo-nuclear; the
+        decay-step contributions to tracked species are handled by the
+        solver's :meth:`_ensure_Lambda_split` hook. With it off the
+        chain reducer has already folded decays into the photo-nuclear
+        tables, so mirroring captures both routes via M_off.
+        """
+        if not getattr(spec_man, "has_tracked_species", lambda: False)():
+            return
+
+        new_bc = {}
+        new_diff = {}
+        for trk in spec_man.species_refs:
+            if not getattr(trk, "is_tracking", False):
+                continue
+            if trk.process_class == "decay":
+                # Decay-step tracking is wired in Λ_off (see
+                # `solvers/propagation.py::_ensure_Lambda_split`). Skipping
+                # here avoids double counting in explicit-decay mode and
+                # leaves chain-reducer mode tracking decay-via-M_off only
+                # via process_class in {"photo-nuclear", "both"}.
+                continue
+            real_da = trk.real_pdgid
+            for (mo, da), arr in self._incl_tab.items():
+                if da != real_da or mo not in trk.parent_pdgs:
+                    continue
+                new_bc[(mo, trk.pdgid)] = arr
+            for (mo, da), arr in self._incl_diff_tab.items():
+                if da != real_da or mo not in trk.parent_pdgs:
+                    continue
+                new_diff[(mo, trk.pdgid)] = arr
+        if not new_bc and not new_diff:
+            return
+
+        self._incl_tab.update(new_bc)
+        self._incl_diff_tab.update(new_diff)
+        # Mirror the post-reducer bookkeeping that
+        # `_optimize_and_generate_index` would do for these channels.
+        for mo, da in new_bc:
+            if (mo, da) not in self.known_bc_channels_set:
+                self.known_bc_channels.append((mo, da))
+                self.known_bc_channels_set.add((mo, da))
+            self.reactions.setdefault(mo, [])
+            if (mo, da) not in self.reactions[mo]:
+                self.reactions[mo].append((mo, da))
+        for mo, da in new_diff:
+            if (mo, da) not in self.known_diff_channels_set:
+                self.known_diff_channels.append((mo, da))
+                self.known_diff_channels_set.add((mo, da))
+            self.reactions.setdefault(mo, [])
+            if (mo, da) not in self.reactions[mo]:
+                self.reactions[mo].append((mo, da))
+
+        tracked_pdgs = {trk.pdgid for trk in spec_man.species_refs
+                        if getattr(trk, "is_tracking", False)}
+        for pdg in tracked_pdgs:
+            if pdg not in self.known_species:
+                self.known_species.append(pdg)
+        self.known_species = sorted(set(self.known_species))
+        self.known_bc_channels = sorted(set(self.known_bc_channels))
+        self.known_diff_channels = sorted(set(self.known_diff_channels))
+        self._update_indices()
+
     def nonel_scale(self, mother, scale="A"):
         """Returns the nonel cross section scaled by `scale`.
 
