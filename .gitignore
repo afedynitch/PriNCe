@@ -27,3 +27,4 @@ tests/_outputs/
 tests/data/baseline_state.npz
 # Light-cap PriNCeRun pickle — built on first use of the prince_run_m16 fixture
 tests/data/prince_run_m16.ppo
+.env
