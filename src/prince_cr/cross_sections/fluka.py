@@ -116,6 +116,12 @@ class FlukaPhotoNuclear(CrossSectionBase):
 
         self._egrid_tab = tables["energy_grid"]    # GeV
         self.xbins = tables["xbins"]               # log-spaced [1e-5, 3], 200 bins
+        # Schema version: v4+ stores elementary_yields in per-nucleon x
+        # convention (rescale applied at write time in prince-fluka-utils'
+        # schema.py::_rescale_ey_to_per_nucleon). v3 and earlier need the
+        # load-time per-mother log-bin shift below. Default v3 if the attr
+        # is absent (older dbs).
+        self._schema_version = int(tables.get("schema_version", 3))
         # FLUKA db stores elementary yields as σ_inel · P(x_bin) (count-per-bin
         # convention); the response builder expects dσ/dx. Divide by bin width
         # on load so _incl_diff_tab matches SOPHIA's per-density convention.
@@ -228,10 +234,12 @@ class FlukaPhotoNuclear(CrossSectionBase):
             if A_mo > self.max_mass:
                 continue
             dsig_dx = yld_3d.T / xwidths[:, None]
-            if A_mo > 1:
-                # Vectorized log-bin shift: for each kernel bin k the source bin
-                # is at fractional index (k - shift); linear-interp between
-                # neighbours and zero outside. dσ/dx_kernel = dσ/dx_FLUKA / A_mo.
+            if A_mo > 1 and self._schema_version < 4:
+                # v3 and earlier dbs store x in FLUKA convention. Apply the
+                # per-mother log-bin shift + A_mo Jacobian here at load time.
+                # v4+ has this baked in at write time (see
+                # prince-fluka-utils/schema.py::_rescale_ey_to_per_nucleon)
+                # so we skip the rescale entirely.
                 shift = np.log10(float(A_mo)) / log_step_x
                 src_idx = np.arange(n_x) - shift
                 i_lo = np.floor(src_idx).astype(int)
@@ -249,6 +257,7 @@ class FlukaPhotoNuclear(CrossSectionBase):
                 ) / A_mo
                 self._incl_diff_tab[mo, da_pdg] = rescaled
             else:
+                # v4+ or A_mo == 1: data is already in per-nucleon convention.
                 self._incl_diff_tab[mo, da_pdg] = dsig_dx
 
         # Initial range = full egrid

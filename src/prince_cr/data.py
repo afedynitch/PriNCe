@@ -902,6 +902,11 @@ class PrinceDB(object):
             self._check_subgroup_exists(fdb["photo_nuclear"], model_tag)
             grp = fdb["photo_nuclear"][model_tag]
 
+            # schema_version is a v4 addition; older dbs lack the attr.
+            # Default to v3 (no per-nucleon rescale at write time) so existing
+            # v3 dbs keep loading exactly as before.
+            db_entry["schema_version"] = int(grp.attrs.get("schema_version", 3))
+
             egrid_full = grp["energy_grid"][:]
             sl = self._energy_slice(egrid_full, e_range)
             db_entry["energy_grid"] = egrid_full[sl]
