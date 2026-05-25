@@ -226,6 +226,55 @@ class AugerFitSource(CosmicRaySource):
         return result
 
 
+class SechCutoffSource(CosmicRaySource):
+    """Source class with a smooth ``sech[(E/E_cut)²]`` rigidity-dependent cutoff.
+
+    Functional form (no break — smooth across all energies):
+
+        inj(E) = norm · A · (E_k / 1 GeV)^{-gamma} · sech[(E_k / E_cut)²]
+
+    where ``E_k = A · E`` and ``E_cut = Z · Rcut``.
+
+    The cutoff shape is taken from Comisso, Farrar & Muzio 2024 (ApJL 977
+    L18; arXiv:2410.05546), who derived it from first-principles PIC
+    simulations of magnetically-dominated turbulence. **Only the
+    functional form is borrowed** — the cutoff scale ``Rcut`` remains a
+    free fit parameter (NOT derived from ``B_rms · l_c · κ``), and the
+    spectral index ``gamma`` is also unconstrained (not anchored at the
+    PIC value of 2.1).
+
+    In contrast to :class:`AugerFitSource`, which uses a broken
+    `exp(1 − E/E_cut)` form (pure power law below E_cut, exponential
+    suppression above), this class applies sech smoothly across all
+    energies: at ``E ≪ E_cut`` the sech factor → 1, at ``E = E_cut`` it's
+    sech(1) ≈ 0.648, and at ``E ≫ E_cut`` it falls off as
+    ``2 · exp[−(E/E_cut)²]``, sharper than the AugerFitSource cutoff in
+    the transition region.
+
+    params defined as ``{pid: gamma, Rcut, norm}``.
+    """
+
+    def injection_spectrum(self, pid, energy, params):
+        spectral_index, rcut, relnorm = params
+        inj_spec = self.spec_man.pdgid2sref[pid]
+        A = float(inj_spec.A)
+        emax = rcut * inj_spec.Z
+        e_k = A * energy
+        ratio_sq = (e_k / emax) ** 2
+        # 1/cosh(ratio²) — overflow-safe at large ratio (cosh diverges at
+        # ratio² ≳ 700 in float64). Replace overflow with 0.
+        with np.errstate(over="ignore"):
+            cutoff = 1.0 / np.cosh(ratio_sq)
+        cutoff = np.where(np.isfinite(cutoff), cutoff, 0.0)
+        result = (
+            relnorm
+            * A
+            * (e_k / 1e9) ** (-spectral_index)
+            * cutoff
+        )
+        return result
+
+
 class RigidityFlexSource(CosmicRaySource):
     """Simple source class with spectral index and rigidity dependent cutoff
     Parameter alpha to scaled the rigidity dependence
