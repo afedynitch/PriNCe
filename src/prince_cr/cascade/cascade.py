@@ -104,6 +104,7 @@ def run_cascade(
     eps=None,
     max_generations=40,
     tol=1e-3,
+    escape_mode="smooth",
 ):
     """Develop a saturated EM cascade from a mono-energetic photon injection.
 
@@ -142,24 +143,25 @@ def run_cascade(
     gamma_spec[inj_idx] = 1.0 / dE[inj_idx]  # one photon
 
     escaped = np.zeros_like(E)
-    above = E > E_abs
-    below = ~above
     E_inj_tot = E_inj  # total injected energy
 
+    if escape_mode == "smooth":
+        # per-photon escape probability exp(-tau_gg(E, z)); the complement
+        # interacts. Physical, smooth rollover (matches CRPropa).
+        tau_E = tau_gg(E, z, photon_field, eps_min=1e-14, eps_max=1e-7)
+        P_esc = np.exp(-tau_E)
+    else:  # "sharp": step at E_abs (legacy)
+        P_esc = np.where(E > E_abs, 0.0, 1.0)
+
     for _gen in range(max_generations):
-        # photons below E_abs escape
-        escaped[below] += gamma_spec[below]
-        gamma_spec[below] = 0.0
-        # remaining (above E_abs) pair-produce -> electrons
-        e_spec = P @ (gamma_spec * dE)  # dN_e/dE on grid E
-        # electrons fully cool -> photons
+        esc_now = gamma_spec * P_esc
+        escaped += esc_now
+        interacting = gamma_spec - esc_now  # = gamma_spec * (1 - P_esc)
+        # interacting photons pair-produce -> e±, which fully IC-cool -> photons
+        e_spec = P @ (interacting * dE)
         gamma_spec = Mic @ (e_spec * dE)
-        # energy remaining above threshold
-        E_above = trapz((E * gamma_spec)[above], E[above]) if np.any(above) else 0.0
-        if E_above / E_inj_tot < tol:
-            # only sub-threshold photons escape; discard the (<tol) above-E_abs
-            # residual rather than counting absorbed photons as escaped.
-            escaped[below] += gamma_spec[below]
+        if trapz(E * gamma_spec, E) / E_inj_tot < tol:
+            escaped += gamma_spec * P_esc  # flush the small low-E remainder
             break
 
     escaped_E = trapz(E * escaped, E)
