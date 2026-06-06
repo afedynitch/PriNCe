@@ -36,6 +36,62 @@ from prince_cr.cascade.kernels import (
 from prince_cr.cascade.opacity import tau_gg
 
 
+def cascade_transfer_matrix(E, z, photon_field, eps=None, max_generations=40,
+                            tol=1e-3):
+    """Linear transfer matrix T for the locally-saturated EM cascade at z.
+
+    ``T[i, j]`` = escaping-photon dN/dE in bin i per unit injected dN/dE in
+    bin j. Sharp escape at ``E_abs(z) = absorption_energy(z)``: EM injected
+    above E_abs cascades down to the universal pile-up below E_abs (the stiff
+    part, solved here to convergence — *semi-analytic*); injection already
+    below E_abs passes through unchanged (T is the identity there). Energy is
+    conserved column-wise.
+
+    This is the per-step EM operator for the co-evolved transport
+    (``UHECRPropagationSolverETD2(enable_em_cascade=True)``): each z-step the
+    EM particles produced by the nuclei are reprocessed by T, while ETD2
+    carries the redshift transport of the sub-E_abs photons. The cascade is
+    local (develops over ≪ a z-step), so per-step application is exact; ETD2's
+    exact diagonal would otherwise mishandle the stiff off-diagonal production.
+
+    Args:
+        E (ndarray): photon/electron energy grid [GeV] (the species grid).
+        z (float): redshift.
+        photon_field: CMB(+EBL) target.
+        eps, max_generations, tol: cascade integration controls.
+
+    Returns:
+        ndarray (n, n): the transfer matrix T.
+    """
+    if eps is None:
+        eps = np.logspace(-15, -9, 400)
+    n_eps = np.asarray(photon_field.get_photon_density(eps, z), dtype="double")
+    n_eps = np.where(np.isfinite(n_eps) & (n_eps > 0), n_eps, 0.0)
+    n = E.size
+    dE = np.gradient(E)
+    E_abs = absorption_energy(z, photon_field)
+
+    P = _energy_conserving_matrix(pair_matrix(E, E, eps, n_eps), E, E)
+    Mic = _energy_conserving_matrix(cooled_ic_photon_matrix(E, E, eps, n_eps), E, E)
+    P_esc = np.where(E > E_abs, 0.0, 1.0)[:, None]  # escape below E_abs
+
+    # Run the (linear) generation cascade on the identity → response columns.
+    G = np.eye(n)                       # column j: unit dN/dE at bin j
+    escaped = np.zeros((n, n))
+    E_in = (E * dE)                     # energy weight per bin
+    tot0 = E_in @ G  # = E (per column); used for the stop test
+    for _ in range(max_generations):
+        esc_now = P_esc * G
+        escaped += esc_now
+        interacting = G - esc_now
+        e_spec = P @ (interacting * dE[:, None])
+        G = Mic @ (e_spec * dE[:, None])
+        if np.max((E_in @ G) / tot0) < tol:
+            escaped += P_esc * G
+            break
+    return escaped
+
+
 def absorption_energy(z, photon_field, e_lo=10.0, e_hi=1e8, n=60, **tau_kw):
     """Energy where tau_gg(E, z) crosses 1 (the cascade escape energy) [GeV]."""
     E = np.logspace(np.log10(e_lo), np.log10(e_hi), n)

@@ -248,6 +248,19 @@ class UHECRPropagationSolver(object):
         self.had_int_rates = prince_run.int_rates
         # EM cascade Jacobian (γ/e± couplings), summed into M(z) if enabled.
         self.em_int_rates = getattr(prince_run, "em_int_rates", None)
+        # Co-evolved EM cascade (operator-split): each z-step the EM particles
+        # produced by the nuclei are reprocessed by the per-z saturated cascade
+        # transfer T(z) (semi-analytic for the stiff γγ/IC part), while ETD2
+        # carries the redshift transport. See cascade.cascade_transfer_matrix
+        # and methods/em-cascade-in-transport.
+        self.enable_em_cascade = getattr(prince_run, "enable_em_cascade", False)
+        self._em_T = None
+        self._em_T_cache = None  # (z_nodes, [T(z)]) built once per solve
+        if self.enable_em_cascade:
+            sm = prince_run.spec_man
+            self._em_gamma_sl = sm.pdgid2sref[22].sl
+            self._em_lep_sl = [sm.pdgid2sref[p].sl for p in (11, -11) if p in sm.pdgid2sref]
+            self._em_E = prince_run.cr_grid.grid  # γ/e± have A=1 → grid == E
         self.adia_loss_rates_grid = prince_run.adia_loss_rates_grid
         self.pair_loss_rates_grid = prince_run.pair_loss_rates_grid
         self.adia_loss_rates_bins = prince_run.adia_loss_rates_bins
@@ -387,6 +400,37 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
     def _run_integration(self, state, z_grid, step_hook=None):
         raise NotImplementedError
 
+    def _em_transfer_at(self, z):
+        """Nearest precomputed cascade transfer T(z). T varies slowly with z,
+        so build it once on a coarse z-grid spanning the solve (decoupling the
+        expensive tau_gg + IC/pair kernel builds from the per-step cadence) and
+        select the nearest. ~15 builds total instead of one per z-step."""
+        if self._em_T_cache is None:
+            from prince_cr.cascade.cascade import cascade_transfer_matrix
+            zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
+            # coarse grid even in log(1+z); ~15 nodes
+            zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), 15))
+            field = self.prince_run.photon_field
+            Ts = [cascade_transfer_matrix(self._em_E, zz, field) for zz in zc]
+            self._em_T_cache = (zc, Ts)
+        zc, Ts = self._em_T_cache
+        return Ts[int(np.argmin(np.abs(zc - z)))]
+
+    def _apply_em_cascade(self, state):
+        """Operator-split EM step (co-evolved cascade): reprocess the EM
+        particles (γ + e±) through the per-z saturated cascade transfer
+        ``self._em_T`` and deposit the escaping photons back into γ. The stiff
+        above-E_abs γγ/IC cascade is handled semi-analytically by ``T``;
+        sub-E_abs photons pass through unchanged; e± are fully converted to
+        photons. Energy-conserving. ``state`` is mutated in place."""
+        if self._em_T is None:
+            return
+        em = np.array(state[self._em_gamma_sl])
+        for sl in self._em_lep_sl:
+            em = em + state[sl]
+            state[sl] = 0.0
+        state[self._em_gamma_sl] = self._em_T @ em
+
     def _finalize_state(self, state):
         """Backend-specific post-solve transform (e.g. cupy → host array)."""
         return state
@@ -522,6 +566,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self.current_z_rates = None
         self._etd2_M_raw_off = None
         self._etd2_apply_F = None
+        self._em_T_cache = None
         self._reset_for_solve()
         self._ensure_D_split()
         self._ensure_Lambda_split()
@@ -532,7 +577,18 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         nsteps = len(z_grid) - 1
         info(2, f"ETD2: integrating with {nsteps} steps of dz≈{dz_step:.2e}")
         with PrinceProgressBar(bar_type=progressbar, nsteps=nsteps) as pbar:
-            step_hook = pbar.update if pbar.pbar is not None else None
+            _pbar_update = pbar.update if pbar.pbar is not None else None
+            if self.enable_em_cascade:
+                # Operator-split: after each ETD2 step, reprocess the EM
+                # particles through the per-z saturated cascade transfer T(z).
+                # T(z) is refreshed in _refresh_z_caches; ``state`` is updated
+                # in place by the integrator, so the closure sees the latest.
+                def step_hook():
+                    self._apply_em_cascade(state)
+                    if _pbar_update is not None:
+                        _pbar_update()
+            else:
+                step_hook = _pbar_update
             self._run_integration(state, z_grid, step_hook=step_hook)
 
         self.post_step_hook(self.final_z)
@@ -731,6 +787,9 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
             self._etd2_kappa_pair_cached = self.pair_loss_rates_grid.loss_vector(z)
         else:
             self._etd2_kappa_pair_cached = None
+
+        if self.enable_em_cascade:
+            self._em_T = self._em_transfer_at(z)
 
         self.current_z_rates = z
 
@@ -1273,6 +1332,9 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
             self._etd2_kappa_pair_cached = self.pair_loss_rates_grid.loss_vector(z)
         else:
             self._etd2_kappa_pair_cached = None
+
+        if self.enable_em_cascade:
+            self._em_T = self._em_transfer_at(z)
 
         self.current_z_rates = z
 

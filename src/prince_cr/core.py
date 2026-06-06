@@ -44,7 +44,13 @@ class PriNCeRun(object):
         # Initialize energy grid
         if config.grid_scale == "E":
             info(1, "initialising Energy grid")
-            self.cr_grid = EnergyGrid(*config.cosmic_ray_grid)
+            cr_cfg = config.cosmic_ray_grid
+            # EM cascade products (γ, e±) reach down to ~0.1 GeV; extend the
+            # shared grid's low end when the co-evolved EM cascade is on.
+            if self.enable_em_cascade:
+                lo, hi, ppd = cr_cfg
+                cr_cfg = (min(lo, -1), hi, ppd)
+            self.cr_grid = EnergyGrid(*cr_cfg)
             self.ph_grid = EnergyGrid(*config.photon_grid)
         else:
             raise Exception(
@@ -81,10 +87,15 @@ class PriNCeRun(object):
         # Disable photo-meson production
         if not config.secondaries:
             system_species = [s for s in system_species if is_nucleus(s)]
-        # Remove particles that are explicitly excluded
+        # Remove particles that are explicitly excluded. Keep the EM species
+        # (γ, e±) as active species when the co-evolved EM cascade is on.
+        em_keep = {22, 11, -11} if self.enable_em_cascade else set()
         for pid in config.ignore_particles:
-            if pid in system_species:
+            if pid in system_species and pid not in em_keep:
                 system_species.remove(pid)
+        for pid in em_keep:
+            if pid not in system_species:
+                system_species.append(pid)
 
         # Initialize species manager for all species for which cross sections are known
         self.spec_man = data.SpeciesManager(system_species, self.cr_grid.d)
@@ -123,13 +134,11 @@ class PriNCeRun(object):
         # Initialize the interaction rates
         self.int_rates = interaction_rates.PhotoNuclearInteractionRate(prince_run=self)
 
-        # EM cascade rates (γ/e± couplings), summed into M(z) by the solver.
-        if self.enable_em_cascade:
-            from prince_cr.cascade.transport_rates import EMInteractionRate
-
-            self.em_int_rates = EMInteractionRate(prince_run=self)
-        else:
-            self.em_int_rates = None
+        # Co-evolved EM cascade: γ/e± are active species; the per-z saturated
+        # cascade transfer is applied by the solver (operator-split per step,
+        # see solvers/propagation). The stiff γγ/IC reprocessing is handled
+        # semi-analytically there, NOT as an M-sink — so em_int_rates is unused.
+        self.em_int_rates = None
 
         # Let species manager know about the photon grid dimensions (for idx calculations)
         # it is accesible under index "ph" for lidx(), uidx() calls
