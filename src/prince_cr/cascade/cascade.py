@@ -83,7 +83,15 @@ def cascade_transfer_matrix(E, z, photon_field, eps=None, max_generations=40,
 
     P = _energy_conserving_matrix(pair_matrix(E, E, eps, n_eps), E, E)
     Mic = _energy_conserving_matrix(cooled_ic_photon_matrix(E, E, eps, n_eps), E, E)
-    P_esc = np.where(E > E_abs, 0.0, 1.0)[:, None]  # escape below E_abs
+    # Smooth per-photon escape exp(-tau_gg(E,z)) — the gammapy/CRPropa-validated
+    # opacity. The complement (1-exp(-tau)) interacts. A SHARP step at E_abs
+    # (legacy) pins the cascade E^2dN/dE peak at E_abs and is grid-floor
+    # sensitive; the smooth rollover reproduces CRPropa's peak at ~0.2-0.3 E_abs
+    # (e.g. z=0.3: ours 60 GeV vs CRPropa 87 GeV, E_abs=319 GeV) and is
+    # floor-stable. This is the same fix `run_cascade` already carries; the
+    # transport transfer was missed. See results/em-cascade-crpropa-validation.
+    tau_E = tau_gg(E, z, photon_field, eps_min=1e-14, eps_max=1e-7)
+    P_esc = np.exp(-tau_E)[:, None]
 
     # Run the (linear) generation cascade on the identity → response columns.
     G = np.eye(n)                       # column j: unit dN/dE at bin j
