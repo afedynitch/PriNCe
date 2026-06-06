@@ -61,7 +61,17 @@ def cascade_transfer_matrix(E, z, photon_field, eps=None, max_generations=40,
         eps, max_generations, tol: cascade integration controls.
 
     Returns:
-        ndarray (n, n): the transfer matrix T.
+        tuple(ndarray, ndarray): ``(T_gamma, T_electron)``, each (n, n).
+        ``T_gamma`` maps an injected *photon* dN/dE to the escaping-photon
+        dN/dE; ``T_electron`` maps an injected *electron/positron* dN/dE to the
+        escaping-photon dN/dE. An electron does NOT γγ-pair-produce — it first
+        fully IC-cools to a photon spectrum (``Mic``), which then enters the
+        same photon cascade. So ``T_electron = T_gamma @ Mic @ diag(dE)``.
+        Treating e± as photons (the old single-matrix path) inserts a spurious
+        pair-production step; for the *saturated* high-E cascade the escaped
+        shape converges either way, but the channels differ for low-E e±
+        injection (e.g. Bethe-Heitler / π±→μ→e photo-hadronic electrons that
+        are already near or below E_abs), so we keep them separate.
     """
     if eps is None:
         eps = np.logspace(-15, -9, 400)
@@ -89,7 +99,9 @@ def cascade_transfer_matrix(E, z, photon_field, eps=None, max_generations=40,
         if np.max((E_in @ G) / tot0) < tol:
             escaped += P_esc * G
             break
-    return escaped
+    # Electron channel: cool to photons (Mic @ ·dE) then run the photon cascade.
+    T_electron = escaped @ (Mic * dE[None, :])
+    return escaped, T_electron
 
 
 def absorption_energy(z, photon_field, e_lo=10.0, e_hi=1e8, n=60, **tau_kw):

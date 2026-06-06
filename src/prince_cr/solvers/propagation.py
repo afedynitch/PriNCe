@@ -411,6 +411,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             # coarse grid even in log(1+z); ~15 nodes
             zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), 15))
             field = self.prince_run.photon_field
+            # each entry is (T_gamma, T_electron)
             Ts = [cascade_transfer_matrix(self._em_E, zz, field) for zz in zc]
             self._em_T_cache = (zc, Ts)
         zc, Ts = self._em_T_cache
@@ -425,11 +426,14 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         photons. Energy-conserving. ``state`` is mutated in place."""
         if self._em_T is None:
             return
-        em = np.array(state[self._em_gamma_sl])
+        T_gamma, T_electron = self._em_T
+        ph = np.array(state[self._em_gamma_sl])
+        lep = np.zeros_like(ph)
         for sl in self._em_lep_sl:
-            em = em + state[sl]
+            lep = lep + state[sl]
             state[sl] = 0.0
-        state[self._em_gamma_sl] = self._em_T @ em
+        # photons γγ-cascade (T_gamma); e± IC-cool first then cascade (T_electron)
+        state[self._em_gamma_sl] = T_gamma @ ph + T_electron @ lep
 
     def _finalize_state(self, state):
         """Backend-specific post-solve transform (e.g. cupy → host array)."""

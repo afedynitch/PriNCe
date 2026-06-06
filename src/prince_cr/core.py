@@ -49,7 +49,16 @@ class PriNCeRun(object):
             # shared grid's low end when the co-evolved EM cascade is on.
             if self.enable_em_cascade:
                 lo, hi, ppd = cr_cfg
-                cr_cfg = (min(lo, -1), hi, ppd)
+                # EM cascade products (γ, e±) reach down to ~0.1 GeV by default.
+                # The cooled-IC pile-up below the cascade break E_X (≈ the IC
+                # energy of E_abs electrons on the CMB, ~0.1 GeV) lands BELOW a
+                # 0.1 GeV floor; the energy-conserving transfer then crams it
+                # onto the lowest bin, flattening the (rising, E^-1.5) universal
+                # segment. Lower ``config.em_cascade_grid_lo`` (log10 GeV) to
+                # resolve that segment — at the cost of more bins on the shared
+                # transport grid (the perf trade-off this floor encodes).
+                em_lo = getattr(config, "em_cascade_grid_lo", -1)
+                cr_cfg = (min(lo, em_lo), hi, ppd)
             self.cr_grid = EnergyGrid(*cr_cfg)
             self.ph_grid = EnergyGrid(*config.photon_grid)
         else:
