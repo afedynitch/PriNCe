@@ -246,6 +246,8 @@ class UHECRPropagationSolver(object):
         self.enable_decay_jacobian = enable_decay_jacobian
 
         self.had_int_rates = prince_run.int_rates
+        # EM cascade Jacobian (γ/e± couplings), summed into M(z) if enabled.
+        self.em_int_rates = getattr(prince_run, "em_int_rates", None)
         self.adia_loss_rates_grid = prince_run.adia_loss_rates_grid
         self.pair_loss_rates_grid = prince_run.pair_loss_rates_grid
         self.adia_loss_rates_bins = prince_run.adia_loss_rates_bins
@@ -685,6 +687,12 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
             # Zero matrix with full sparsity preserved.
             M = M.copy()
             M.data[:] = 0
+
+        # Sum the EM cascade Jacobian (γ/e± couplings, 1/cm) into M. The union
+        # sparsity pattern is z-stable, so the first-window index maps stay valid.
+        if self.em_int_rates is not None:
+            M = M + self.em_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+            M.sort_indices()
 
         first_window = self._etd2_M_raw_off is None
         if first_window:
@@ -1237,6 +1245,16 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
         if not self.enable_photohad_losses:
             M = M.copy()
             M.data[:] = 0
+
+        # Sum the EM cascade Jacobian. NOTE: untested on the cupy backend —
+        # the EM rate is built host-side (scipy); convert to device CSR before
+        # the add. (CPU/scipy path is the validated one for the EM cascade.)
+        if self.em_int_rates is not None:
+            import cupyx.scipy.sparse as _cpsp
+
+            M = M + _cpsp.csr_matrix(
+                self.em_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+            )
 
         # Re-splitting each cache window is a few ms on the GPU at
         # production grid; we skip a host-style index-map gather (the

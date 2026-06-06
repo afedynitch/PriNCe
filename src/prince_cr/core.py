@@ -34,6 +34,13 @@ class PriNCeRun(object):
         # See methods/tracking-species-design.md.
         tracked_species = kwargs.pop("tracked_species", None) or []
 
+        # EM cascade: evolve γ/e± as active species in transport (opt-in).
+        # Default off keeps the nuclear-only path bit-for-bit unchanged.
+        # See methods/em-cascade-in-transport.md.
+        self.enable_em_cascade = kwargs.pop(
+            "enable_em_cascade", getattr(config, "enable_em_cascade", False)
+        )
+
         # Initialize energy grid
         if config.grid_scale == "E":
             info(1, "initialising Energy grid")
@@ -115,6 +122,14 @@ class PriNCeRun(object):
 
         # Initialize the interaction rates
         self.int_rates = interaction_rates.PhotoNuclearInteractionRate(prince_run=self)
+
+        # EM cascade rates (γ/e± couplings), summed into M(z) by the solver.
+        if self.enable_em_cascade:
+            from prince_cr.cascade.transport_rates import EMInteractionRate
+
+            self.em_int_rates = EMInteractionRate(prince_run=self)
+        else:
+            self.em_int_rates = None
 
         # Let species manager know about the photon grid dimensions (for idx calculations)
         # it is accesible under index "ph" for lidx(), uidx() calls
