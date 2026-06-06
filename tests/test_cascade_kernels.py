@@ -85,3 +85,34 @@ def test_absorption_energy_decreases_with_redshift():
     e_hi = absorption_energy(0.03, field)
     assert e_hi > e_lo  # higher z -> lower transparency energy
     assert 50.0 < absorption_energy(1.0, field) < 300.0  # ~100 GeV at z=1
+
+
+def test_cascade_linear_spectrum_injection():
+    """run_cascade is linear: cascade(δ_A+δ_B) == cascade(δ_A)+cascade(δ_B),
+    so an injection spectrum is handled in one pass (inheriting the
+    CRPropa-validated mono response). Also checks energy conservation for a
+    power-law injection."""
+    import numpy as np
+    from prince_cr import photonfields as pf
+    from prince_cr.cascade.cascade import run_cascade
+
+    field = pf.CombinedPhotonField([pf.CMBPhotonSpectrum, pf.CIBDominguez2D])
+    z, Etop, ng = 0.1, 1e7, 60
+    E = np.logspace(0, np.log10(Etop), ng)
+    dE = np.gradient(E)
+
+    def delta(Etgt):
+        v = np.zeros(ng)
+        i = np.argmin(np.abs(E - Etgt))
+        v[i] = 1.0 / dE[i]
+        return v
+
+    kw = dict(n_grid=ng, e_min=1.0)
+    rA = run_cascade(Etop, z, field, inject_dNdE=delta(1e6), **kw)["dNdE"]
+    rB = run_cascade(Etop, z, field, inject_dNdE=delta(3e4), **kw)["dNdE"]
+    rAB = run_cascade(Etop, z, field, inject_dNdE=delta(1e6) + delta(3e4), **kw)["dNdE"]
+    m = (rA + rB) > 1e-12 * np.max(rA + rB)
+    assert np.max(np.abs(rAB[m] / (rA[m] + rB[m]) - 1.0)) < 1e-6
+
+    res = run_cascade(Etop, z, field, inject_dNdE=E**-2.0, **kw)
+    assert res["energy_ratio"] == pytest.approx(1.0, rel=0.02)

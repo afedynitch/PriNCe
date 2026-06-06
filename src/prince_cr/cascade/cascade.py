@@ -105,23 +105,35 @@ def run_cascade(
     max_generations=40,
     tol=1e-3,
     escape_mode="smooth",
+    inject_dNdE=None,
 ):
-    """Develop a saturated EM cascade from a mono-energetic photon injection.
+    """Develop a saturated EM cascade and return the escaping (observed-at-z=0)
+    photon spectrum.
+
+    The cascade is linear, so a single pass handles either a mono-energetic
+    injection (default) or an arbitrary injection spectrum (``inject_dNdE``).
+    With ``escape_mode="smooth"`` the escape probability uses the full-path
+    ``tau_gg(E, z)``, so the output is already the spectrum observed at Earth
+    from a source at redshift ``z``.
 
     Args:
-        E_inj (float): injected photon energy [GeV].
-        z (float): redshift of the cascade environment.
+        E_inj (float): top of the energy grid [GeV] (and the mono-energetic
+            injection energy when ``inject_dNdE`` is None).
+        z (float): source / cascade-environment redshift.
         photon_field: CMB(+EBL) target with ``get_photon_density``.
-        n_grid (int): energy bins per decade-spanning log grid.
+        n_grid (int): grid points (log-spaced ``e_min``..``E_inj``).
         e_min (float): low end of the spectrum grid [GeV].
         eps (ndarray): target photon energy grid; default brackets CMB.
         max_generations (int): cap on cascade generations.
         tol (float): stop when fractional energy above E_abs drops below this.
+        inject_dNdE (callable or ndarray, optional): γ injection spectrum
+            dN/dE [1/GeV]. A callable is evaluated on the internal grid; an
+            ndarray must match ``n_grid``. Default: one photon at ``E_inj``.
 
     Returns:
         dict with grid ``E`` [GeV], escaped photon spectrum ``dNdE``
-        [1/GeV per injected photon], ``E_abs`` [GeV], ``E_inj``,
-        energy-conservation ``energy_ratio`` (escaped/injected).
+        [1/GeV], ``E_abs`` [GeV], ``E_inj``, energy-conservation
+        ``energy_ratio`` (escaped/injected).
     """
     if eps is None:
         eps = np.logspace(-15, -9, 500)
@@ -135,15 +147,22 @@ def run_cascade(
     P = _energy_conserving_matrix(pair_matrix(E, E, eps, n_eps), E, E)
     Mic = _energy_conserving_matrix(cooled_ic_photon_matrix(E, E, eps, n_eps), E, E)
 
-    # photon spectrum (number per bin via dN/dE on grid E)
-    gamma_spec = np.zeros_like(E)
-    # inject delta at the bin closest to E_inj (as a narrow dN/dE)
-    inj_idx = np.argmin(np.abs(E - E_inj))
     dE = np.gradient(E)
-    gamma_spec[inj_idx] = 1.0 / dE[inj_idx]  # one photon
+    # initial photon spectrum (dN/dE on grid E)
+    gamma_spec = np.zeros_like(E)
+    if inject_dNdE is None:
+        inj_idx = np.argmin(np.abs(E - E_inj))
+        gamma_spec[inj_idx] = 1.0 / dE[inj_idx]  # one photon at E_inj
+    elif callable(inject_dNdE):
+        gamma_spec = np.asarray(inject_dNdE(E), dtype="double")
+    else:
+        gamma_spec = np.asarray(inject_dNdE, dtype="double")
+        if gamma_spec.shape != E.shape:
+            raise ValueError("inject_dNdE array must match the grid (n_grid).")
+    E_inj_energy = trapz(E * gamma_spec, E)  # total injected energy
 
     escaped = np.zeros_like(E)
-    E_inj_tot = E_inj  # total injected energy
+    E_inj_tot = E_inj_energy  # total injected energy
 
     if escape_mode == "smooth":
         # per-photon escape probability exp(-tau_gg(E, z)); the complement
