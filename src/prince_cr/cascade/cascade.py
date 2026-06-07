@@ -28,6 +28,7 @@ import numpy as np
 from scipy.integrate import trapezoid as trapz
 
 from prince_cr.cascade.kernels import (
+    C_CM,
     M_E,
     ic_emission_spectrum,
     ic_energy_loss_rate,
@@ -37,28 +38,37 @@ from prince_cr.cascade.opacity import tau_gg
 
 
 def cascade_transfer_matrix(E, z, photon_field, eps=None, max_generations=40,
-                            tol=1e-3):
-    """Linear transfer matrix T for the locally-saturated EM cascade at z.
+                            tol=1e-3, dz=None):
+    """Linear EM-cascade transfer matrix T at redshift z (stiffness-split).
 
-    ``T[i, j]`` = escaping-photon dN/dE in bin i per unit injected dN/dE in
-    bin j. Sharp escape at ``E_abs(z) = absorption_energy(z)``: EM injected
-    above E_abs cascades down to the universal pile-up below E_abs (the stiff
-    part, solved here to convergence — *semi-analytic*); injection already
-    below E_abs passes through unchanged (T is the identity there). Energy is
-    conserved column-wise.
+    ``T[i, j]`` = post-step-photon dN/dE in bin i per unit injected dN/dE in
+    bin j. Energy is conserved column-wise (nothing leaves the EM pool here;
+    photons escape the *system* only at z=0, via the integration ending).
 
-    This is the per-step EM operator for the co-evolved transport
-    (``UHECRPropagationSolverETD2(enable_em_cascade=True)``): each z-step the
-    EM particles produced by the nuclei are reprocessed by T, while ETD2
-    carries the redshift transport of the sub-E_abs photons. The cascade is
-    local (develops over ≪ a z-step), so per-step application is exact; ETD2's
-    exact diagonal would otherwise mishandle the stiff off-diagonal production.
+    **Stiffness boundary (``dz`` given — the co-evolved transport mode).**
+    The escape probability is the *per-z-step* survival ``exp(-Δτ_step(E))``,
+    with ``Δτ_step(E) = (dτ_gg/dl)(E,z)·Δl_step`` and ``Δl_step = c·|dz|/((1+z)
+    H(z))``. So only the **stiff** EM (E ≫ E_abs, mfp ≪ one z-step,
+    Δτ_step ≫ 1) interacts and cascades down *within this step*; the
+    **non-stiff** EM near/below E_abs (mfp ~ Hubble length, Δτ_step ≪ 1) passes
+    through (T ≈ identity there) and is carried by ETD2 to the next step, where
+    it redshifts and is gradually absorbed. Over the integration the surviving
+    photons pile up at the *evolving* (z→0) γγ horizon — not the high-z
+    injection horizon. This fixes the saturated-per-z bug that pinned each
+    shell's pile-up at E_abs(z_inject) (see lessons/em-cascade-transfer-*).
+
+    **Saturated mode (``dz`` None — standalone single-shot).** Falls back to the
+    full-path smooth escape ``exp(-τ_gg(E,z))``: the fully-developed cascade
+    observed at z=0 from a source at z (the `run_cascade` semantics). Use for
+    single-source spectra, not for per-step transport.
 
     Args:
         E (ndarray): photon/electron energy grid [GeV] (the species grid).
         z (float): redshift.
         photon_field: CMB(+EBL) target.
         eps, max_generations, tol: cascade integration controls.
+        dz (float, optional): integration step. If given, T is the per-step
+            (stiffness-split) operator; if None, the saturated full-path one.
 
     Returns:
         tuple(ndarray, ndarray): ``(T_gamma, T_electron)``, each (n, n).
@@ -83,15 +93,24 @@ def cascade_transfer_matrix(E, z, photon_field, eps=None, max_generations=40,
 
     P = _energy_conserving_matrix(pair_matrix(E, E, eps, n_eps), E, E)
     Mic = _energy_conserving_matrix(cooled_ic_photon_matrix(E, E, eps, n_eps), E, E)
-    # Smooth per-photon escape exp(-tau_gg(E,z)) — the gammapy/CRPropa-validated
-    # opacity. The complement (1-exp(-tau)) interacts. A SHARP step at E_abs
-    # (legacy) pins the cascade E^2dN/dE peak at E_abs and is grid-floor
-    # sensitive; the smooth rollover reproduces CRPropa's peak at ~0.2-0.3 E_abs
-    # (e.g. z=0.3: ours 60 GeV vs CRPropa 87 GeV, E_abs=319 GeV) and is
-    # floor-stable. This is the same fix `run_cascade` already carries; the
-    # transport transfer was missed. See results/em-cascade-crpropa-validation.
-    tau_E = tau_gg(E, z, photon_field, eps_min=1e-14, eps_max=1e-7)
-    P_esc = np.exp(-tau_E)[:, None]
+    if dz is None:
+        # Saturated single-shot: full-path smooth escape exp(-tau_gg(E,z)).
+        tau_E = tau_gg(E, z, photon_field, eps_min=1e-14, eps_max=1e-7)
+        P_esc = np.exp(-tau_E)[:, None]
+    else:
+        # Per-z-step (stiffness-split) escape: Δτ_step = (dτ_gg/dl)·Δl_step.
+        # Stiff (Δτ_step≫1) cascades this step; non-stiff (Δτ_step≪1) is carried
+        # by ETD2 to the next step → pile-up forms at the evolving z→0 horizon.
+        from prince_cr.cascade.opacity import _kernel_per_length
+        from prince_cr.cosmology import H
+
+        eps_o = np.logspace(-12, -7, 256)
+        mu = np.linspace(-1.0, 1.0, 128)
+        dtau_dl = np.array(
+            [_kernel_per_length(float(Ei), z, photon_field, eps_o, mu) for Ei in E]
+        )
+        dl_step = C_CM * abs(dz) / ((1.0 + z) * H(z))  # proper length per step [cm]
+        P_esc = np.exp(-dtau_dl * dl_step)[:, None]
 
     # Run the (linear) generation cascade on the identity → response columns.
     G = np.eye(n)                       # column j: unit dN/dE at bin j

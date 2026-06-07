@@ -256,6 +256,7 @@ class UHECRPropagationSolver(object):
         self.enable_em_cascade = getattr(prince_run, "enable_em_cascade", False)
         self._em_T = None
         self._em_T_cache = None  # (z_nodes, [T(z)]) built once per solve
+        self._em_dz = 1e-2  # per-step EM transfer step; set in solve()
         if self.enable_em_cascade:
             sm = prince_run.spec_man
             self._em_gamma_sl = sm.pdgid2sref[22].sl
@@ -403,16 +404,24 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
     def _em_transfer_at(self, z):
         """Nearest precomputed cascade transfer T(z). T varies slowly with z,
         so build it once on a coarse z-grid spanning the solve (decoupling the
-        expensive tau_gg + IC/pair kernel builds from the per-step cadence) and
-        select the nearest. ~15 builds total instead of one per z-step."""
+        expensive opacity + IC/pair kernel builds from the per-step cadence) and
+        select the nearest. ~15 builds total instead of one per z-step.
+
+        The transfer is the *per-z-step* (stiffness-split) operator: it is
+        passed ``dz=self._em_dz`` so only the stiff EM cascades within a step;
+        the non-stiff near-E_abs photons are carried by ETD2 between steps and
+        pile up at the evolving z→0 horizon (see cascade_transfer_matrix)."""
         if self._em_T_cache is None:
             from prince_cr.cascade.cascade import cascade_transfer_matrix
             zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
             # coarse grid even in log(1+z); ~15 nodes
             zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), 15))
             field = self.prince_run.photon_field
-            # each entry is (T_gamma, T_electron)
-            Ts = [cascade_transfer_matrix(self._em_E, zz, field) for zz in zc]
+            # each entry is (T_gamma, T_electron); dz → per-step stiffness split
+            Ts = [
+                cascade_transfer_matrix(self._em_E, zz, field, dz=self._em_dz)
+                for zz in zc
+            ]
             self._em_T_cache = (zc, Ts)
         zc, Ts = self._em_T_cache
         return Ts[int(np.argmin(np.abs(zc - z)))]
@@ -571,6 +580,8 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self._etd2_M_raw_off = None
         self._etd2_apply_F = None
         self._em_T_cache = None
+        # Step size for the per-step (stiffness-split) EM cascade transfer.
+        self._em_dz = float(abs(dz))
         self._reset_for_solve()
         self._ensure_D_split()
         self._ensure_Lambda_split()
