@@ -257,11 +257,17 @@ class UHECRPropagationSolver(object):
         self._em_T = None
         self._em_T_cache = None  # (z_nodes, [T(z)]) built once per solve
         self._em_dz = 1e-2  # per-step EM transfer step; set in solve()
+        # Bethe-Heitler e± source: per-z energy-normalized pair shape R(z).
+        self._em_bh = None
+        self._em_bh_cache = None   # (z_nodes, [R_BH(z)]) built once per solve
+        self._em_z = None          # current redshift (for dl_step in BH inject)
         if self.enable_em_cascade:
             sm = prince_run.spec_man
             self._em_gamma_sl = sm.pdgid2sref[22].sl
             self._em_lep_sl = [sm.pdgid2sref[p].sl for p in (11, -11) if p in sm.pdgid2sref]
             self._em_E = prince_run.cr_grid.grid  # γ/e± have A=1 → grid == E
+            # proton slice + grid for the BH pair source (protons drive BH)
+            self._em_proton_sl = sm.pdgid2sref[2212].sl if 2212 in sm.pdgid2sref else None
         self.adia_loss_rates_grid = prince_run.adia_loss_rates_grid
         self.pair_loss_rates_grid = prince_run.pair_loss_rates_grid
         self.adia_loss_rates_bins = prince_run.adia_loss_rates_bins
@@ -444,6 +450,58 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         # photons γγ-cascade (T_gamma); e± IC-cool first then cascade (T_electron)
         state[self._em_gamma_sl] = T_gamma @ ph + T_electron @ lep
 
+    def _em_bh_at(self, z):
+        """Nearest precomputed Bethe-Heitler e± pair-shape matrix R_BH(z).
+
+        ``R_BH[i, j]`` is the energy-normalized e± spectrum dN/dE_e (one lepton
+        sign) from a proton at ``E[j]`` on the photon field at z, with columns
+        scaled so the *pair* carries E[j] (``2·∫E_e R[:,j] dE_e = E[j]``). The
+        per-step injection (``_inject_bh_pairs``) rescales each column by the
+        proton's actual BH energy-loss rate, so the deposited pair energy equals
+        the energy the proton sink removes — exact conservation. Built once on a
+        coarse z-grid (R_BH shape varies slowly; energy is pinned per-z)."""
+        if self._em_bh_cache is None:
+            from prince_cr.cascade.bethe_heitler import bh_pair_shape_matrix
+            zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
+            zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), 8))
+            field = self.prince_run.photon_field
+            E = self._em_E
+            eps = np.logspace(-12.5, -7.0, 40)  # CMB+EBL band [GeV]
+            Rs = []
+            for zz in zc:
+                n_eps = np.asarray(field.get_photon_density(eps, zz), dtype="double")
+                n_eps = np.where(np.isfinite(n_eps) & (n_eps > 0), n_eps, 0.0)
+                Rs.append(bh_pair_shape_matrix(E, E, eps, n_eps))
+            self._em_bh_cache = (zc, Rs)
+        zc, Rs = self._em_bh_cache
+        return Rs[int(np.argmin(np.abs(zc - z)))]
+
+    def _inject_bh_pairs(self, state):
+        """Inject Bethe-Heitler e⁺e⁻ into the EM species for this z-step.
+
+        The proton already loses BH energy via the continuous pair-loss term;
+        here we deposit that energy as e± (per sign) with the W-kernel shape
+        ``self._em_bh`` (R_BH), scaled by the proton's BH energy-loss rate so
+        total injected pair energy = proton energy lost (energy-conserving).
+        Mutates ``state`` in place; call BEFORE ``_apply_em_cascade``."""
+        if self._em_bh is None or self._em_proton_sl is None:
+            return
+        from prince_cr.cosmology import H
+        from prince_cr.data import PRINCE_UNITS
+
+        z = self._em_z
+        E = self._em_E
+        dE = np.gradient(E)
+        n_p = np.asarray(state[self._em_proton_sl], dtype="double")
+        loss = self.pair_loss_rates_grid.loss_vector(z)[self._em_proton_sl]  # GeV/cm
+        dl_step = PRINCE_UNITS.c * abs(self._em_dz) / ((1.0 + z) * H(z))      # cm
+        # column weight: (energy lost per proton this step) / E_p  → fraction
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w = np.where(E > 0, loss * dl_step / E, 0.0) * n_p * dE
+        e_src = self._em_bh @ w  # dN/dE_e per lepton sign added this step
+        for sl in self._em_lep_sl:
+            state[sl] = state[sl] + e_src
+
     def _finalize_state(self, state):
         """Backend-specific post-solve transform (e.g. cupy → host array)."""
         return state
@@ -580,6 +638,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self._etd2_M_raw_off = None
         self._etd2_apply_F = None
         self._em_T_cache = None
+        self._em_bh_cache = None
         # Step size for the per-step (stiffness-split) EM cascade transfer.
         self._em_dz = float(abs(dz))
         self._reset_for_solve()
@@ -599,6 +658,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
                 # T(z) is refreshed in _refresh_z_caches; ``state`` is updated
                 # in place by the integrator, so the closure sees the latest.
                 def step_hook():
+                    self._inject_bh_pairs(state)   # BH e± source (before cascade)
                     self._apply_em_cascade(state)
                     if _pbar_update is not None:
                         _pbar_update()
@@ -805,6 +865,8 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
 
         if self.enable_em_cascade:
             self._em_T = self._em_transfer_at(z)
+            self._em_bh = self._em_bh_at(z)
+            self._em_z = float(z)
 
         self.current_z_rates = z
 
@@ -1350,6 +1412,8 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
 
         if self.enable_em_cascade:
             self._em_T = self._em_transfer_at(z)
+            self._em_bh = self._em_bh_at(z)
+            self._em_z = float(z)
 
         self.current_z_rates = z
 
