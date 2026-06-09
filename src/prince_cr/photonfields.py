@@ -155,11 +155,17 @@ class EBLSplined2D(PhotonField):
             return self.int2d(E, z)
 
 
-class CIBFranceschini2D(EBLSplined2D):
-    """CIB model "1" by Fraceschini et al.
+class CIBFranceschini2D_legacy(EBLSplined2D):
+    """LEGACY Franceschini (2008) EBL — kept as a backup. DEPRECATED.
 
-    CIB photon distribution for z = 0...2. Requires availability of
-    an `scipy.interp2d` object file `data/CIB_franceschini_int2D.ppo`.
+    Reads the prince_db ``Francescini2008`` grid via the (linear) 2D
+    interpolator. This implementation over-estimates the gamma-gamma optical
+    depth by ~8-18% relative to the paper's own opacity Table 3 (prince_db
+    grid offset ~8% + linear-vs-log-log interpolation ~5%). Superseded by
+    :class:`CIBFranceschini2008` (loads the paper's Tables 1-2 with log-log
+    interpolation, reproduces Table 3 to ~1%). The default name
+    ``CIBFranceschini2D`` now aliases the corrected class; use this legacy
+    class explicitly only to reproduce pre-fix results.
 
     Ref.:
         A. Franceschini et al., Astron. Astrphys. 487, 837 (2008) [arXiv:0805.1841]
@@ -213,6 +219,55 @@ class CIBGilmore2D(EBLSplined2D):
 
         self.int2d = db_handler.ebl_spline("Gilmore2011", model)
         self.simple_scaling = simple_scaling
+
+
+class CIBFranceschini2008(PhotonField):
+    """Franceschini, Rodighiero & Vaccari (2008) EBL, loaded directly from the
+    paper's published Tables 1 & 2 (proper photon density n(eps,z) for
+    z = 0..2) with **log-log** interpolation.
+
+    This is an authoritative, validated alternative to ``CIBFranceschini2D``
+    (whose prince_db grid + linear interpolation inflate the gamma-gamma
+    optical depth by ~8-18%). Integrating these tables through
+    :func:`prince_cr.cascade.opacity.tau_gg` reproduces the paper's own
+    opacity Table 3 to ~1% across z=0.01-2. Data file
+    ``franceschini2008_ebl_tables.npz`` ships in ``config.data_dir``.
+
+    Ref.: A. Franceschini, G. Rodighiero, M. Vaccari, A&A 487, 837 (2008)
+          [arXiv:0805.1841], Tables 1-2.
+    """
+
+    def __init__(self, simple_scaling=False, **kwargs):
+        # simple_scaling accepted for drop-in compatibility with the legacy
+        # CIBFranceschini2D signature; ignored (these are full tabulated tables).
+        from os import path
+        from scipy.interpolate import RegularGridInterpolator
+        import prince_cr.config as config
+
+        f = np.load(path.join(config.data_dir, "franceschini2008_ebl_tables.npz"))
+        self._z = f["z"]
+        self._leps_GeV = f["log10_eps_eV"] - 9.0          # log10 eps [GeV]
+        # stored is log10(eps dn/deps)[cm^-3]; convert to log10(dn/deps)[GeV^-1 cm^-3]
+        # log10(dn/deps) = log10(eps dn/deps) - log10(eps[GeV])
+        self._log_dnde = f["log10_eps_dndeps_cm3"] - self._leps_GeV[None, :]
+        self._rgi = RegularGridInterpolator(
+            (self._z, self._leps_GeV), self._log_dnde,
+            method="linear", bounds_error=False, fill_value=-np.inf,
+        )
+
+    def get_photon_density(self, E, z):
+        """Proper dn/deps [GeV^-1 cm^-3] at photon energy E [GeV], redshift z.
+        Log-log interpolation; zero outside the tabulated band / z>2."""
+        E = np.atleast_1d(np.asarray(E, dtype="double"))
+        zz = np.full_like(E, float(z))
+        out = self._rgi(np.column_stack([zz, np.log10(E)]))
+        return 10.0 ** out
+
+
+#: Default Franceschini-2008 EBL name -> the corrected (Tables 1-2, log-log)
+#: implementation. The pre-fix prince_db/linear version remains available as
+#: ``CIBFranceschini2D_legacy``.
+CIBFranceschini2D = CIBFranceschini2008
 
 
 class CIBDominguez2D(EBLSplined2D):

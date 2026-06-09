@@ -99,9 +99,14 @@ class TestCombinedPhotonField:
 
 
 class TestCIBFranceschini2D:
+    # CIBFranceschini2D now aliases the corrected CIBFranceschini2008 (paper
+    # Tables 1-2, log-log); the legacy prince_db grid is CIBFranceschini2D_legacy.
     def test_init(self):
-        cib = CIBFranceschini2D()
-        assert cib.int2d is not None
+        cib = CIBFranceschini2D()  # corrected class
+        E = np.logspace(-11, -8, 20)  # within the tabulated 0.12..1240 um band
+        result = cib.get_photon_density(E, 0.0)
+        assert result.shape == E.shape
+        assert np.all(np.isfinite(result)) and result.max() > 0
 
     def test_get_photon_density(self):
         cib = CIBFranceschini2D()
@@ -109,11 +114,19 @@ class TestCIBFranceschini2D:
         result = cib.get_photon_density(E, 0.0)
         assert result.shape == E.shape
 
-    def test_simple_scaling(self):
+    def test_simple_scaling_kwarg_accepted(self):
+        # accepted for drop-in compat with the legacy signature; ignored
         cib = CIBFranceschini2D(simple_scaling=True)
-        E = np.logspace(-12, -9, 20)
+        E = np.logspace(-11, -8, 20)
         result = cib.get_photon_density(E, 0.5)
         assert np.all(np.isfinite(result))
+
+    def test_legacy_still_available(self):
+        from prince_cr.photonfields import CIBFranceschini2D_legacy
+        cib = CIBFranceschini2D_legacy()
+        assert cib.int2d is not None
+        E = np.logspace(-12, -9, 20)
+        assert cib.get_photon_density(E, 0.0).shape == E.shape
 
 
 class TestCIBInoue2D:

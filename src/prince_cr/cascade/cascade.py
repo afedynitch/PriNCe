@@ -131,6 +131,138 @@ def cascade_transfer_matrix(E, z, photon_field, eps=None, max_generations=40,
     return escaped, T_electron
 
 
+def _ic_single_scatter_matrices(E, eps, n_eps):
+    """Build the per-scatter inverse-Compton operators (KINETIC cascade).
+
+    Returns (Sg, De, R) where, for an electron at ``E[j]`` that makes ONE IC
+    scatter:
+      * ``Sg[i, j]`` = emitted-photon spectrum dN/dE_gamma at ``E[i]`` per
+        scatter (normalized to exactly one photon: ``sum_i Sg[i,j] dE_i = 1``),
+      * ``De[i, j]`` = degraded-electron spectrum dN/dE_e' at ``E[i]`` per
+        scatter (the electron recoils to ``E_e' = E[j] - E_gamma``; one
+        electron out per scatter),
+      * ``R[j]`` = IC scattering rate [s^-1] (for reference; the generation
+        iteration is per-scatter so the absolute rate cancels).
+
+    Unlike :func:`cooled_ic_photon_matrix` (continuous full-cooling in one
+    step), these let the cascade follow the electron through discrete scatters
+    so the hard (high-E) IC photons are emitted *before* the electron cools and
+    can pair-produce again — building the multi-generation E_X..E_abs plateau.
+    """
+    dE = np.gradient(E)
+    n = E.size
+    emis = np.zeros((n, n))                       # emis[i,j] = dN/(dt dE_i) for e at E[j]
+    for j, Ej in enumerate(E):
+        emis[:, j] = ic_emission_spectrum(E, Ej, eps, n_eps)
+    R = (emis * dE[:, None]).sum(axis=0)          # scatters/s per electron
+    Sg = np.where(R[None, :] > 0, emis / np.where(R > 0, R, 1.0)[None, :], 0.0)
+    # Degraded electron: each emitted photon E_gamma=E[k] (number weight
+    # w_k = Sg[k,j]*dE_k) recoils the electron to E_e' = E[j] - E[k]. Deposit
+    # w_k onto the grid with an energy-conserving cloud-in-cell split between
+    # the two bracketing bins (conserves both electron NUMBER and ENERGY; a
+    # plain interpolation leaks ~8% per scatter near E_e'~E[j] where the log
+    # grid is coarse).
+    De = np.zeros((n, n))
+    logE = np.log(E)
+    for j in range(n):
+        if R[j] <= 0:
+            continue
+        for k in range(n):
+            w = Sg[k, j] * dE[k]
+            if w <= 0:
+                continue
+            Eep = E[j] - E[k]                     # degraded electron energy
+            if Eep <= E[0]:
+                continue
+            b = int(np.searchsorted(E, Eep) - 1)
+            b = min(max(b, 0), n - 2)
+            # linear CIC: f*E[b] + (1-f)*E[b+1] = Eep  -> conserves number AND energy
+            f = (E[b + 1] - Eep) / (E[b + 1] - E[b])
+            f = min(max(f, 0.0), 1.0)
+            De[b, j] += w * f / dE[b]
+            De[b + 1, j] += w * (1.0 - f) / dE[b + 1]
+    return Sg, De, R
+
+
+def kinetic_cascade_transfer(E, z, photon_field, eps=None, max_scatter=4000,
+                             tol=1e-4, dz=None, cool_floor_frac=0.1):
+    """KINETIC single-scatter EM-cascade transfer matrix (photon channel).
+
+    Same interface/return as :func:`cascade_transfer_matrix` (``T_gamma``,
+    ``T_electron``), but the inverse-Compton step is **per-scatter** with
+    explicit electron degradation, rather than the cooled single-step
+    (``cooled_ic_photon_matrix``). This reproduces the multi-generation
+    development that fills the universal E_X..E_abs plateau (the cooled path
+    undershoots it — see the Kalashev Fig 2 comparison).
+
+    Each iteration: photons escape (``exp(-tau)``) or pair-produce -> electrons;
+    every electron makes ONE IC scatter -> one photon (``Sg``) + one degraded
+    electron (``De``); emitted photons re-enter the photon pool, degraded
+    electrons scatter again. Iterates until the in-box electron+photon energy
+    falls below ``tol`` of the injected energy. ``cool_floor_frac``: electrons
+    whose mean IC photon is below ``cool_floor_frac * E`` no longer pump the
+    >E_abs cascade meaningfully and are dumped via the cooled integral to keep
+    the iteration count bounded (exact for the soft, escaping tail).
+    """
+    if eps is None:
+        eps = np.logspace(-15, -9, 400)
+    n_eps = np.asarray(photon_field.get_photon_density(eps, z), dtype="double")
+    n_eps = np.where(np.isfinite(n_eps) & (n_eps > 0), n_eps, 0.0)
+    n = E.size
+    dE = np.gradient(E)
+
+    P = _energy_conserving_matrix(pair_matrix(E, E, eps, n_eps), E, E)
+    Sg, De, R = _ic_single_scatter_matrices(E, eps, n_eps)
+    Mic = _energy_conserving_matrix(cooled_ic_photon_matrix(E, E, eps, n_eps), E, E)
+
+    if dz is None:
+        tau_E = tau_gg(E, z, photon_field, eps_min=1e-14, eps_max=1e-7)
+        P_esc = np.exp(-tau_E)[:, None]
+    else:
+        from prince_cr.cascade.opacity import _kernel_per_length
+        from prince_cr.cosmology import H
+        eps_o = np.logspace(-12, -7, 256)
+        mu = np.linspace(-1.0, 1.0, 128)
+        dtau_dl = np.array(
+            [_kernel_per_length(float(Ei), z, photon_field, eps_o, mu) for Ei in E]
+        )
+        dl_step = C_CM * abs(dz) / ((1.0 + z) * H(z))
+        P_esc = np.exp(-dtau_dl * dl_step)[:, None]
+
+    # mean emitted-photon energy per electron (for the cool-floor dump test)
+    Egam_mean = (E[:, None] * Sg * dE[:, None]).sum(axis=0)  # <E_gamma>(E_j)
+
+    G = np.eye(n)                  # injected photon delta per column
+    e = np.zeros((n, n))           # electron pool
+    escaped = np.zeros((n, n))
+    E_in = E * dE
+    tot0 = E_in @ G
+    for _ in range(max_scatter):
+        # photons: escape or interact (pair-produce)
+        escaped += P_esc * G
+        interacting = G - P_esc * G
+        e = e + P @ (interacting * dE[:, None])
+        # split electrons: "hot" (still pump the >E_abs cascade) vs "cold" (dump)
+        cold = (Egam_mean < cool_floor_frac * E) | (R <= 0)
+        e_cold = e * cold[:, None]
+        e_hot = e * (~cold)[:, None]
+        # cold electrons fully cool -> escaping photons (exact soft tail)
+        G_cold = Mic @ (e_cold * dE[:, None])
+        # hot electrons make one scatter -> one photon + degraded electron
+        G_hot = Sg @ (e_hot * dE[:, None])
+        e = De @ (e_hot * dE[:, None])
+        G = G_hot + G_cold
+        # cold-dumped photons escape immediately (they are below the horizon)
+        escaped += P_esc * G_cold
+        G = G - P_esc * G_cold     # avoid double-counting cold escape next round
+        in_box = (E_in @ G) + (E_in @ e)
+        if np.max(in_box / tot0) < tol:
+            escaped += P_esc * G
+            break
+    T_electron = escaped @ (Mic * dE[None, :])
+    return escaped, T_electron
+
+
 def absorption_energy(z, photon_field, e_lo=10.0, e_hi=1e8, n=60, **tau_kw):
     """Energy where tau_gg(E, z) crosses 1 (the cascade escape energy) [GeV]."""
     E = np.logspace(np.log10(e_lo), np.log10(e_hi), n)
@@ -202,7 +334,19 @@ def run_cascade(
     escape_mode="smooth",
     inject_dNdE=None,
 ):
-    """Develop a saturated EM cascade and return the escaping (observed-at-z=0)
+    """DEPRECATED — DO NOT USE. Buggy/approximate EM-cascade helper.
+
+    .. deprecated::
+        ``run_cascade`` carries the energy_ratio≈2 normalization bug and an
+        under-developed cascade (it undershoots the low-energy tail and cuts
+        off too sharply below the gamma-gamma horizon — see the Kalashev Fig 2
+        comparison). **Use** :func:`cascade_transfer_matrix` instead: build
+        ``T_gamma`` and apply it to the injection (a mono-energetic source is
+        the column of ``T_gamma`` at the injection energy). That path is the
+        validated, energy-conserving cascade engine. This function is kept only
+        to avoid breaking old imports and raises a warning on call.
+
+    Develop a saturated EM cascade and return the escaping (observed-at-z=0)
     photon spectrum.
 
     The cascade is linear, so a single pass handles either a mono-energetic
@@ -230,6 +374,13 @@ def run_cascade(
         [1/GeV], ``E_abs`` [GeV], ``E_inj``, energy-conservation
         ``energy_ratio`` (escaped/injected).
     """
+    import warnings
+    warnings.warn(
+        "run_cascade is DEPRECATED and buggy (energy_ratio~2 normalization; "
+        "under-developed cascade that undershoots wings / cuts off below the "
+        "gamma-gamma horizon). Use cascade_transfer_matrix instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     if eps is None:
         eps = np.logspace(-15, -9, 500)
     n_eps = np.asarray(photon_field.get_photon_density(eps, z), dtype="double")

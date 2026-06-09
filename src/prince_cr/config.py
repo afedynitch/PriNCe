@@ -61,6 +61,23 @@ fluka_db_fname = "prince_db_v0.h5"
 #: ``data_dir``.
 fluka_db_path = data_dir
 
+#: SOPHIA photo-meson database, repacked into PDG numbering by
+#: ``scripts/repack_sophia_pdg.py`` (in the UH-UHECR project repo) from the
+#: legacy ``photo_nuclear/SOPHIA`` tables. Lives in ``data_dir``. Consumed by
+#: ``cross_sections.SophiaSuperposition`` as an alternative to the FLUKA
+#: photo-meson model.
+sophia_db_fname = "prince_db_sophia_pdg.h5"
+
+#: Directory containing ``sophia_db_fname``; defaults to ``data_dir``.
+sophia_db_path = data_dir
+
+#: EM-cascade engine. True -> kinetic single-scatter cascade
+#: (``cascade.kinetic_cascade_transfer``; per-scatter IC + electron tracking,
+#: reproduces the multi-generation E_X..E_abs plateau — validated vs Kalashev
+#: Fig 2). False -> legacy cooled single-step (``cascade_transfer_matrix``),
+#: which undershoots the plateau; kept for comparison.
+em_kinetic_cascade = True
+
 #: Model file for redistribution functions (from SOPHIA or similar)
 redist_fname = "sophia_redistribution_logbins.npy"
 

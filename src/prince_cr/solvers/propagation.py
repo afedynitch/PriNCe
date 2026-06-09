@@ -418,14 +418,24 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         the non-stiff near-E_abs photons are carried by ETD2 between steps and
         pile up at the evolving z→0 horizon (see cascade_transfer_matrix)."""
         if self._em_T_cache is None:
-            from prince_cr.cascade.cascade import cascade_transfer_matrix
+            import prince_cr.config as config
+            from prince_cr.cascade.cascade import (
+                cascade_transfer_matrix, kinetic_cascade_transfer,
+            )
+            # kinetic single-scatter cascade by default (fills the E_X..E_abs
+            # plateau; matches Kalashev Fig 2). Legacy cooled path kept via flag.
+            transfer = (
+                kinetic_cascade_transfer
+                if getattr(config, "em_kinetic_cascade", True)
+                else cascade_transfer_matrix
+            )
             zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
             # coarse grid even in log(1+z); ~15 nodes
             zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), 15))
             field = self.prince_run.photon_field
             # each entry is (T_gamma, T_electron); dz → per-step stiffness split
             Ts = [
-                cascade_transfer_matrix(self._em_E, zz, field, dz=self._em_dz)
+                transfer(self._em_E, zz, field, dz=self._em_dz)
                 for zz in zc
             ]
             self._em_T_cache = (zc, Ts)

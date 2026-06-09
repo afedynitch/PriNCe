@@ -735,18 +735,30 @@ PRINCE_UNITS = convert_to_namedtuple(UNITS_AND_CONVERSIONS_DEF, "PriNCeUnits")
 
 
 class InterpolatorWrapper:
-    """Wrapper class to make RegularGridInterpolator behave like interp2d."""
+    """Wrapper class to make RegularGridInterpolator behave like interp2d.
 
-    def __init__(self, rgi):
+    When ``loglog`` is set, the first axis (photon energy) and the value are
+    interpolated in log10 space: the query energy is log10'd before lookup and
+    the result is 10**-ed. Linear interpolation of an EBL spectrum that spans
+    ~10 decades in n and several in eps over a coarse grid otherwise
+    overestimates between grid points (a ~5-20% bias on the gamma-gamma optical
+    depth). log-log is the standard, low-bias choice for spectra.
+    """
+
+    def __init__(self, rgi, loglog=False):
         self.rgi = rgi
+        self.loglog = loglog
 
     def __call__(self, x, y):
         import numpy as np
 
         x, y = np.broadcast_arrays(x, y)
-        points = np.column_stack([x.ravel(), y.ravel()])
+        xq = np.log10(np.where(np.asarray(x) > 0, x, 1e-300)) if self.loglog else x
+        points = np.column_stack([np.ravel(xq), np.ravel(y)])
         result = self.rgi(points)
-        return result.reshape(x.shape) if x.shape else result.item()
+        if self.loglog:
+            result = np.power(10.0, result)
+        return result.reshape(x.shape) if np.asarray(x).shape else float(np.ravel(result)[0])
 
 
 class PrinceDB(object):
@@ -828,10 +840,26 @@ class PrinceDB(object):
 
         return db_entry
 
-    def photo_meson_db(self, model_tag, e_range=None):
-        info(10, "Reading photo-nuclear db. tag={0}".format(model_tag))
+    def photo_meson_db(self, model_tag, e_range=None, db_fname=None):
+        """Read photo-meson redistribution tables for ``model_tag``.
+
+        Args:
+            model_tag (str): subgroup under ``photo_nuclear`` (e.g. ``"SOPHIA"``).
+            e_range (tuple or None): ``(e_min, e_max)`` GeV bounds.
+            db_fname (str or None): explicit HDF5 path to read from. When
+                ``None`` the module-default ``prince_db_fname`` is used. Pass a
+                path to load a repacked db (e.g. the PDG-numbered SOPHIA db)
+                without disturbing the standard database.
+        """
+        info(10, "Reading photo-meson db. tag={0}".format(model_tag))
+        fpath = db_fname if db_fname is not None else self.prince_db_fname
+        if not path.isfile(fpath):
+            raise FileNotFoundError(
+                "photo-meson db not found at {0}. For the PDG-numbered SOPHIA "
+                "db, generate it with scripts/repack_sophia_pdg.py.".format(fpath)
+            )
         db_entry = {}
-        with h5py.File(self.prince_db_fname, "r") as prince_db:
+        with h5py.File(fpath, "r") as prince_db:
             self._check_subgroup_exists(prince_db["photo_nuclear"], model_tag)
             grp = prince_db["photo_nuclear"][model_tag]
 
@@ -989,17 +1017,20 @@ class PrinceDB(object):
             if z_values.shape != (len(x_coords), len(y_coords)):
                 z_values = z_values.T
 
-            # Create the interpolator
-            rgi = RegularGridInterpolator(
-                (x_coords, y_coords),
-                z_values,
-                method="linear",
-                bounds_error=False,
-                fill_value=0.0,
-            )
+            # log-log interpolation (energy axis + value): low-bias for the
+            # steep EBL spectrum. Energy grid -> log10(eps); value -> log10(n);
+            # fill_value=-inf so 10**(-inf)=0 outside the tabulated band.
+            with np.errstate(divide="ignore"):
+                rgi = RegularGridInterpolator(
+                    (np.log10(x_coords), y_coords),
+                    np.log10(np.where(z_values > 0, z_values, 1e-300)),
+                    method="linear",
+                    bounds_error=False,
+                    fill_value=-np.inf,
+                )
 
             # Return wrapper that maintains interp2d interface and is picklable
-            return InterpolatorWrapper(rgi)
+            return InterpolatorWrapper(rgi, loglog=True)
 
 
 #: db_handler is the HDF file interface
