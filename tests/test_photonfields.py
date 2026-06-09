@@ -150,19 +150,30 @@ class TestCIBInoue2D:
 
 
 class TestCIBGilmore2D:
+    # CIBGilmore2D now aliases the corrected CIBGilmore2012 (paper EBL flux
+    # tables, log-log); the legacy prince_db grid is CIBGilmore2D_legacy.
     def test_fiducial_model(self):
-        cib = CIBGilmore2D(model="fiducial")
-        E = np.logspace(-12, -9, 20)
+        cib = CIBGilmore2D(model="fiducial")  # corrected class
+        E = np.logspace(-11, -8, 20)          # within the tabulated EBL band
         result = cib.get_photon_density(E, 0.0)
         assert result.shape == E.shape
+        assert np.all(np.isfinite(result)) and result.max() > 0
 
     def test_fixed_model(self):
         cib = CIBGilmore2D(model="fixed")
-        assert cib.int2d is not None
+        E = np.logspace(-11, -8, 20)
+        result = cib.get_photon_density(E, 0.5)
+        assert result.shape == E.shape
+        assert np.all(np.isfinite(result))
 
     def test_invalid_model(self):
         with pytest.raises(AssertionError):
             CIBGilmore2D(model="invalid")
+
+    def test_legacy_still_available(self):
+        from prince_cr.photonfields import CIBGilmore2D_legacy
+        cib = CIBGilmore2D_legacy(model="fixed")
+        assert cib.int2d is not None
 
 
 class TestCIBDominguez2D:

@@ -199,17 +199,20 @@ class CIBInoue2D(EBLSplined2D):
         self.simple_scaling = simple_scaling
 
 
-class CIBGilmore2D(EBLSplined2D):
-    """CIB model "3" by Gilmore et al.
+class CIBGilmore2D_legacy(EBLSplined2D):
+    """LEGACY Gilmore (2012) EBL — kept as a backup. DEPRECATED.
 
-    CIB photon distribution for z = 0...7. Requires availability of
-    an `scipy.interp2d` object file `data/CIB_gilmore_int2D.ppo`.
-
-    Note: Currently uses the fixed model from the reference as standard,
-          for the fiducial model, change the 'model' keyword
+    Reads the prince_db ``Gilmore2011`` grid via the (linear) 2D interpolator.
+    Same prince_db-grid + linear-interpolation issues as the legacy
+    Franceschini path (see :class:`CIBFranceschini2D_legacy`). Superseded by
+    :class:`CIBGilmore2012`, which loads the paper's own published EBL flux
+    tables (arXiv source bundle) with log-log interpolation and reproduces the
+    paper's opacity table ``datatab_opdep_fiducial.dat``. The default name
+    ``CIBGilmore2D`` now aliases the corrected class; use this legacy class
+    explicitly only to reproduce pre-fix results.
 
     Ref.:
-        R.C. Gilmore et al., MNRAS Soc. 422, 3189 (2012) [arXiv:1104.0671]
+        R.C. Gilmore et al., MNRAS 422, 3189 (2012) [arXiv:1104.0671]
     """
 
     def __init__(self, model="fiducial", simple_scaling=False):
@@ -219,6 +222,80 @@ class CIBGilmore2D(EBLSplined2D):
 
         self.int2d = db_handler.ebl_spline("Gilmore2011", model)
         self.simple_scaling = simple_scaling
+
+
+class CIBGilmore2012(PhotonField):
+    """Gilmore, Somerville, Primack & Dominguez (2012) EBL, loaded directly from
+    the paper's published EBL flux tables (bundled with the arXiv source) with
+    **log-log** interpolation. Proper photon density n(eps,z) for z = 0..7.
+
+    Authoritative, validated replacement for the legacy ``CIBGilmore2D`` (whose
+    prince_db grid + linear interpolation share the bias fixed for Franceschini).
+    Integrating these tables through :func:`prince_cr.cascade.opacity.tau_gg`
+    reproduces the paper's own opacity table ``datatab_opdep_fiducial.dat``.
+    Data file ``gilmore2012_ebl_tables.npz`` ships in ``config.data_dir``;
+    built by ``scripts/build_gilmore_ebl_npz.py`` from the I_lambda tables.
+
+    ``model`` selects the WMAP5 ``"fiducial"`` (evolving dust, default) or
+    ``"fixed"`` realization.
+
+    **Fallback**: if the new data file is unavailable, this transparently falls
+    back to the legacy prince_db ``Gilmore2011`` grid (same as
+    :class:`CIBGilmore2D_legacy`) with a warning, so both the old and new tables
+    are kept and the corrected one is used whenever present.
+
+    Ref.: R.C. Gilmore et al., MNRAS 422, 3189 (2012) [arXiv:1104.0671].
+    """
+
+    def __init__(self, model="fiducial", simple_scaling=False, **kwargs):
+        # simple_scaling accepted for drop-in compatibility with the legacy
+        # CIBGilmore2D signature; ignored (these are full tabulated tables).
+        from os import path
+        from scipy.interpolate import RegularGridInterpolator
+        import prince_cr.config as config
+
+        assert model in ["fixed", "fiducial"]
+        self._fallback = None
+        npz = path.join(config.data_dir, "gilmore2012_ebl_tables.npz")
+        if not path.exists(npz):
+            # graceful fallback to the legacy prince_db table (old table kept)
+            import warnings
+            warnings.warn(
+                "gilmore2012_ebl_tables.npz not found; falling back to the "
+                "legacy prince_db Gilmore2011 grid (run "
+                "scripts/build_gilmore_ebl_npz.py to enable the corrected table).",
+                RuntimeWarning,
+            )
+            from prince_cr.data import db_handler
+            self._fallback = db_handler.ebl_spline("Gilmore2011", model)
+            self.simple_scaling = simple_scaling
+            return
+        f = np.load(npz)
+        self._z = f["z"]
+        self._leps_GeV = f["log10_eps_eV"] - 9.0          # log10 eps [GeV]
+        # stored is log10(eps dn/deps)[cm^-3]; convert to log10(dn/deps)[GeV^-1 cm^-3]
+        log_eps_dnde = f["log10_eps_dndeps_cm3_" + model]
+        self._log_dnde = log_eps_dnde - self._leps_GeV[None, :]
+        self._rgi = RegularGridInterpolator(
+            (self._z, self._leps_GeV), self._log_dnde,
+            method="linear", bounds_error=False, fill_value=-np.inf,
+        )
+
+    def get_photon_density(self, E, z):
+        """Proper dn/deps [GeV^-1 cm^-3] at photon energy E [GeV], redshift z.
+        Log-log interpolation; zero outside the tabulated band / z>7."""
+        if self._fallback is not None:
+            return self._fallback(E, z)
+        E = np.atleast_1d(np.asarray(E, dtype="double"))
+        zz = np.full_like(E, float(z))
+        out = self._rgi(np.column_stack([zz, np.log10(E)]))
+        return 10.0 ** out
+
+
+#: Default Gilmore-2012 EBL name -> the corrected (paper flux tables, log-log)
+#: implementation. The pre-fix prince_db/linear version remains available as
+#: ``CIBGilmore2D_legacy``.
+CIBGilmore2D = CIBGilmore2012
 
 
 class CIBFranceschini2008(PhotonField):
