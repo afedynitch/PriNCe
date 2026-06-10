@@ -261,6 +261,10 @@ class UHECRPropagationSolver(object):
         self._em_bh = None
         self._em_bh_cache = None   # (z_nodes, [R_BH(z)]) built once per solve
         self._em_z = None          # current redshift (for dl_step in BH inject)
+        # Tier 3 cross-grid coupling regrid; stays None unless decoupled (set
+        # in the enable_em_cascade block below). Referenced unconditionally in
+        # _refresh_z_caches, so default it here for the nuclear-only path.
+        self._em_regrid_R = None
         if self.enable_em_cascade:
             sm = prince_run.spec_man
             self._em_gamma_sl = sm.pdgid2sref[22].sl
@@ -276,6 +280,16 @@ class UHECRPropagationSolver(object):
             # onto the EM grid (output e±) — see _em_bh_at / _inject_bh_pairs.
             self._em_proton_sl = sm.pdgid2sref[2212].sl if 2212 in sm.pdgid2sref else None
             self._em_proton_E = prince_run.cr_grid.grid
+            # Tier 3: cross-grid coupling regrid. The photo-nuclear response and
+            # decay Λ_off emit γ/e± daughter rows at cr-grid indices; left-
+            # multiplying the assembled coupling by R remaps those rows onto the
+            # EM grid (energy-conserving). Identity on nuclear blocks → None when
+            # not decoupled (no-op). See methods/em-grid-boost-tier3-plan.md §3.
+            self._em_regrid_R = (
+                self._build_em_regrid_operator(prince_run)
+                if getattr(prince_run, "enable_em_decoupled_grid", False)
+                else None
+            )
         self.adia_loss_rates_grid = prince_run.adia_loss_rates_grid
         self.pair_loss_rates_grid = prince_run.pair_loss_rates_grid
         self.adia_loss_rates_bins = prince_run.adia_loss_rates_bins
@@ -528,6 +542,38 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         e_src = self._em_bh @ w  # dN/dE_e per lepton sign (on the EM grid)
         for sl in self._em_lep_sl:
             state[sl] = state[sl] + e_src
+
+    def _build_em_regrid_operator(self, prince_run):
+        """Build the constant ``(dim_states, dim_states)`` daughter-row regrid R
+        for the decoupled EM grid (Tier 3 step 3).
+
+        Block-diagonal in princeidx order: identity on every nuclear block; on
+        each EM species' block the cr→em overlap matrix ``P`` (``d_em × d_cr``)
+        padded with zero columns to ``d_em × d_em``. Left-multiplying the
+        assembled coupling by R remaps γ/e± daughter rows — written by the
+        response builder / decay Λ_off at cr indices ``da.lidx() + 0..d_cr-1`` —
+        onto the EM grid, conserving daughter number.
+        """
+        from scipy.sparse import block_diag, identity, hstack, csr_matrix
+        from prince_cr.data import energy_regrid_matrix
+
+        sm = prince_run.spec_man
+        cr, em = prince_run.cr_grid, prince_run.em_grid
+        if em.d < cr.d:
+            raise ValueError(
+                "EM grid ({0} bins) is coarser than the nuclear grid ({1}); the "
+                "response builder writes d_cr daughter indices, which would "
+                "overflow the EM block. Raise config.em_grid_bins_dec.".format(
+                    em.d, cr.d
+                )
+            )
+        P = energy_regrid_matrix(cr, em)                       # (d_em, d_cr)
+        P_pad = hstack([P, csr_matrix((em.d, em.d - cr.d))], format="csr")
+        blocks = [
+            P_pad if s.grid_tag != "default" else identity(s._tr_dim, format="csr")
+            for s in sorted(sm.species_refs, key=lambda x: x.princeidx)
+        ]
+        return block_diag(blocks, format="csr")
 
     def _finalize_state(self, state):
         """Backend-specific post-solve transform (e.g. cupy → host array)."""
@@ -852,6 +898,12 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
             M = M + self.em_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
             M.sort_indices()
 
+        # Tier 3 note: the γ/e± daughter-row regrid (cr→em) is NOT applied to M
+        # here — doing so perturbs the matmul sparsity pattern and breaks the
+        # z-stable in-place index-map fast path below. Instead R is applied at
+        # the vector level in apply_F (R·(coupling·x), associativity), where it
+        # only touches the off-diagonal coupling rows. See _make_apply_F_*.
+
         first_window = self._etd2_M_raw_off is None
         if first_window:
             d_M, M_off = split_operator(M)
@@ -1093,6 +1145,9 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
                 shape=(self.dim_states, self.dim_states),
                 dtype=np.float64,
             ).tocsr()
+            # Tier 3: decay also emits γ/e± daughter rows at cr indices (e.g.
+            # β-decay e±). Like the photo-nuclear coupling, the cr→em regrid is
+            # applied at the vector level in apply_F (R·(Λ_off·x)), not here.
 
     def _operator_at(self, z):
         """Return ``(d, apply_F)`` for the ETD2 step at redshift ``z``.
@@ -1202,23 +1257,45 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
         M_off = self._etd2_M_raw_off
         D_off = self._etd2_D_off
         Lambda_off = self._etd2_Lambda_off  # CSR or None; constant for the solve.
+        R = self._em_regrid_R  # Tier 3 cr→em daughter-row regrid; None if shared.
         params = self._etd2_apply_F_params
         kx_buf = self._etd2_kx_buf
 
-        def apply_F(x, out):
-            kappa = params["kappa"]
-            np.copyto(out, M_off.dot(x))
-            if kappa is not None:
-                np.multiply(kappa, x, out=kx_buf)
-                np.add(out, D_off.dot(kx_buf), out=out)
-            if Lambda_off is not None:
-                # Λ_off rides the same dldz scalar as M_off / D_off (see
-                # methods/explicit-decay-kernel-design.md). Constant in z.
-                np.add(out, Lambda_off.dot(x), out=out)
-            np.multiply(out, params["dldz"], out=out)
-            b = params["b"]
-            if b is not None:
-                np.add(out, b, out=out)
+        if R is None:
+            def apply_F(x, out):
+                kappa = params["kappa"]
+                np.copyto(out, M_off.dot(x))
+                if kappa is not None:
+                    np.multiply(kappa, x, out=kx_buf)
+                    np.add(out, D_off.dot(kx_buf), out=out)
+                if Lambda_off is not None:
+                    # Λ_off rides the same dldz scalar as M_off / D_off (see
+                    # methods/explicit-decay-kernel-design.md). Constant in z.
+                    np.add(out, Lambda_off.dot(x), out=out)
+                np.multiply(out, params["dldz"], out=out)
+                b = params["b"]
+                if b is not None:
+                    np.add(out, b, out=out)
+        else:
+            # Tier 3 decoupled EM grid: the coupling (photo-nuclear M_off +
+            # decay Λ_off) writes γ/e± daughter rows at cr indices; regrid them
+            # onto the EM grid via R before the transport term. R·(coupling·x)
+            # = (R·coupling)·x (associativity) and R is identity on nuclear
+            # rows, so only the EM-daughter rows move. D_off (per-grid
+            # transport) is already on the correct grid — NOT regridded.
+            def apply_F(x, out):
+                kappa = params["kappa"]
+                coup = M_off.dot(x)
+                if Lambda_off is not None:
+                    coup = coup + Lambda_off.dot(x)
+                np.copyto(out, R.dot(coup))
+                if kappa is not None:
+                    np.multiply(kappa, x, out=kx_buf)
+                    np.add(out, D_off.dot(kx_buf), out=out)
+                np.multiply(out, params["dldz"], out=out)
+                b = params["b"]
+                if b is not None:
+                    np.add(out, b, out=out)
 
         return apply_F
 
@@ -1267,21 +1344,42 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
         # Λ_off MKL-handle wrap deferred to Step E; for now, fall back to a
         # scipy SpMV when explicit decay is enabled with the MKL backend.
         Lambda_off = self._etd2_Lambda_off
+        R = self._em_regrid_R  # Tier 3 cr→em daughter-row regrid; None if shared.
 
-        def apply_F(x, out):
-            x_p = get_p(x)
-            out_p = get_p(out)
-            mkl_M_op(alpha_box, x_p, beta_zero, out_p)
-            kappa = params["kappa"]
-            if kappa is not None:
-                np.multiply(kappa, x, out=kx_buf)
-                mkl_D_op(alpha_box, kx_p, beta_one, out_p)
-            if Lambda_off is not None:
-                np.add(out, Lambda_off.dot(x), out=out)
-            np.multiply(out, params["dldz"], out=out)
-            b = params["b"]
-            if b is not None:
-                np.add(out, b, out=out)
+        if R is None:
+            def apply_F(x, out):
+                x_p = get_p(x)
+                out_p = get_p(out)
+                mkl_M_op(alpha_box, x_p, beta_zero, out_p)
+                kappa = params["kappa"]
+                if kappa is not None:
+                    np.multiply(kappa, x, out=kx_buf)
+                    mkl_D_op(alpha_box, kx_p, beta_one, out_p)
+                if Lambda_off is not None:
+                    np.add(out, Lambda_off.dot(x), out=out)
+                np.multiply(out, params["dldz"], out=out)
+                b = params["b"]
+                if b is not None:
+                    np.add(out, b, out=out)
+        else:
+            # Tier 3 decoupled EM grid: regrid the coupling rows (M_off + Λ_off)
+            # cr→em via R BEFORE adding the per-grid transport D_off. Compute
+            # the coupling into out first, apply R in place, then fuse D_off.
+            def apply_F(x, out):
+                x_p = get_p(x)
+                out_p = get_p(out)
+                mkl_M_op(alpha_box, x_p, beta_zero, out_p)   # out = M_off·x
+                if Lambda_off is not None:
+                    np.add(out, Lambda_off.dot(x), out=out)  # + Λ_off·x
+                out[:] = R.dot(out)                          # regrid EM rows
+                kappa = params["kappa"]
+                if kappa is not None:
+                    np.multiply(kappa, x, out=kx_buf)
+                    mkl_D_op(alpha_box, kx_p, beta_one, out_p)  # + D_off·(κx)
+                np.multiply(out, params["dldz"], out=out)
+                b = params["b"]
+                if b is not None:
+                    np.add(out, b, out=out)
 
         return apply_F
 

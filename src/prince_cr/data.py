@@ -1062,6 +1062,34 @@ class EnergyGrid(object):
         )
 
 
+def energy_regrid_matrix(grid_from, grid_to):
+    """Sparse ``(grid_to.d, grid_from.d)`` number-conserving regrid operator.
+
+    Maps a per-energy spectrum sampled on ``grid_from`` onto ``grid_to`` by
+    linear-energy bin overlap (CIC):
+
+        ``P[m, k] = overlap(to_bin_m, from_bin_k) / width_to_m``
+
+    where ``overlap`` is the linear-energy intersection of the two bins. When
+    ``grid_to`` fully covers ``grid_from`` (Σ_m overlap(m,k) = width_from_k),
+    this conserves the integral ∫φ dE exactly — i.e. total particle number —
+    and preserves energy ∫Eφ dE to the resolution of the finer grid. Used in
+    Tier 3 to deposit nucleus-grid γ/e± production onto the (finer, lower) EM
+    grid; see methods/em-grid-boost-tier3-plan.md step 3.
+
+    Returns a ``scipy.sparse.csr_matrix``.
+    """
+    from scipy.sparse import csr_matrix
+
+    fb = grid_from.bins            # (d_from + 1,) bin edges
+    tb = grid_to.bins             # (d_to + 1,)
+    lo = np.maximum(tb[:-1, None], fb[None, :-1])     # (d_to, d_from)
+    hi = np.minimum(tb[1:, None], fb[None, 1:])
+    overlap = np.clip(hi - lo, 0.0, None)
+    P = overlap / grid_to.widths[:, None]
+    return csr_matrix(P)
+
+
 _PDG_MESONS = frozenset({211, -211, 111, 321, -321})
 _PDG_CHARGED_LEPTONS = frozenset({11, -11, 13, -13, 15, -15})
 _PDG_NEUTRINOS = frozenset({12, -12, 14, -14, 16, -16})

@@ -181,26 +181,12 @@ class PriNCeRun(object):
             for pid in (22, 11, -11):
                 if pid in self.spec_man.pdgid2sref:
                     self.spec_man.set_grid_tag(pid, "em")
-            # GUARD: the cross-grid EM-daughter coupling regrid (Tier 3 step 3)
-            # is not yet implemented. The photo-nuclear response builder
-            # (interaction_rates.py) and the decay Λ_off (solvers/propagation.py)
-            # emit daughter blocks as ``daughter.lidx() + cr_index``; for an EM
-            # daughter on the (finer, lower) EM grid those indices land in-bounds
-            # but at the WRONG energies — silently wrong physics, not a crash.
-            # Until the energy-conserving cr→em daughter regrid lands, refuse to
-            # build rather than mislead. The transport operators (loss vectors,
-            # differential operator, _em_E) and the BH cross-grid injection are
-            # already decoupled-aware; only the response/decay coupling remains.
-            if config.secondaries:
-                raise NotImplementedError(
-                    "enable_em_decoupled_grid: the cross-grid EM-daughter "
-                    "coupling regrid (Tier 3 step 3) is not yet implemented, so "
-                    "photo-nuclear γ and decay e±/γ would be mapped to the wrong "
-                    "EM-grid energies. See "
-                    "wiki/methods/em-grid-boost-tier3-plan.md step 3. Run with "
-                    "the shared-grid EM cascade (enable_em_decoupled_grid=False) "
-                    "until step 3 lands."
-                )
+            # The cross-grid EM-daughter coupling regrid (Tier 3 step 3) is
+            # applied in the solver: UHECRPropagationSolverETD2 left-multiplies
+            # the assembled photo-nuclear + decay coupling by an energy-
+            # conserving cr→em row-regrid R (_build_em_regrid_operator), so the
+            # γ/e± daughter rows the builders write at cr indices land at the
+            # correct EM-grid energies.
 
         # Total dimension of system. Read from the per-species transport
         # offset map (Tier 3 step 1) so EM species can later occupy a
