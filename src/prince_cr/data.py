@@ -1129,6 +1129,20 @@ class PrinceSpecies(object):
         # (dict) Dimension of energy grids (for idx calculations)
         self.grid_dims = {"default": d}
 
+        #: (str) Home transport grid tag. Nuclei stay on ``"default"`` (the
+        #: shared cosmic-ray grid); EM species (γ, e±) move to a dedicated
+        #: grid in Tier 3 step 2. The species' block size in the transport
+        #: state vector is ``grid_dims[self.grid_tag]``.
+        self.grid_tag = "default"
+        #: Per-species offsets into the (heterogeneous) transport state
+        #: vector, (re)computed by
+        #: :meth:`SpeciesManager.compute_transport_offsets`. Seeded with the
+        #: uniform default so a standalone species is self-consistent before
+        #: the manager lays out the full vector.
+        self._tr_dim = d                      # block size on the transport grid
+        self._tr_lidx = princeidx * d         # lower state-vector index
+        self._tr_lbin = princeidx * (d + 1)   # lower bin-edge index
+
         # Obtain values for the attributes
         self._init_species()
 
@@ -1190,16 +1204,22 @@ class PrinceSpecies(object):
         Returns:
           (slice): a slice object pointing to the species in the state vecgtor
         """
-        idx = self.princeidx
-        dim = self.grid_dims["default"]
-        return slice(idx * dim, (idx + 1) * dim)
+        return slice(self._tr_lidx, self._tr_lidx + self._tr_dim)
 
     def lidx(self, grid_tag="default"):
         """Returns lower index of particle range in state vector.
 
+        For the transport state (``grid_tag="default"``) this reads the
+        per-species offset laid out by
+        :meth:`SpeciesManager.compute_transport_offsets`, so species may
+        occupy blocks of differing size (Tier 3). For any other (vestigial,
+        uniform) tag the legacy ``princeidx * grid_dims[tag]`` formula holds.
+
         Returns:
           (int): lower index in state vector :attr:`PrinceRun.phi`
         """
+        if grid_tag == "default":
+            return self._tr_lidx
         return self.princeidx * self.grid_dims[grid_tag]
 
     def uidx(self, grid_tag="default"):
@@ -1208,6 +1228,8 @@ class PrinceSpecies(object):
         Returns:
           (int): upper index in state vector :attr:`PrinceRun.phi`
         """
+        if grid_tag == "default":
+            return self._tr_lidx + self._tr_dim
         return (self.princeidx + 1) * self.grid_dims[grid_tag]
 
     def lbin(self, grid_tag="default"):
@@ -1216,6 +1238,8 @@ class PrinceSpecies(object):
         Returns:
           (int): lower bin in state vector :attr:`PrinceRun.phi`
         """
+        if grid_tag == "default":
+            return self._tr_lbin
         return self.princeidx * (self.grid_dims[grid_tag] + 1)
 
     def ubin(self, grid_tag="default"):
@@ -1224,6 +1248,8 @@ class PrinceSpecies(object):
         Returns:
           (int): upper bin in state vector :attr:`PrinceRun.phi`
         """
+        if grid_tag == "default":
+            return self._tr_lbin + self._tr_dim + 1
         return (self.princeidx + 1) * (self.grid_dims[grid_tag] + 1)
 
 
@@ -1337,8 +1363,15 @@ class SpeciesManager(object):
         #: solver tracking hooks.
         self._tracked_by_real_da = {}
 
+        #: (int) Total transport-state length / bin-edge length. Filled by
+        #: :meth:`compute_transport_offsets`; with every species on the
+        #: shared grid these equal ``d * nspec`` / ``(d + 1) * nspec``.
+        self.dim_states = 0
+        self.dim_bins = 0
+
         self._gen_species(pdgid_list)
         self._init_species_tables()
+        self.compute_transport_offsets()
 
     def _gen_species(self, pdgid_list):
         info(4, "Generating list of species.")
@@ -1487,6 +1520,8 @@ class SpeciesManager(object):
             self.boost_conserv_species.append(synthetic)
         self.nspec = len(self.species_refs)
         self._tracked_by_real_da.setdefault(daughter_pdg, []).append(trk)
+        # New species changes the state-vector layout — relay it out.
+        self.compute_transport_offsets()
         return trk
 
     def tracked_species_for(self, da_real_pdg):
@@ -1573,13 +1608,52 @@ class SpeciesManager(object):
     def add_grid(self, grid_tag, dimension):
         """Defines additional grid dimensions under a certain tag.
 
-        Propagates changes to this variable to all known species.
+        Propagates changes to this variable to all known species. Registering
+        a grid does NOT by itself move any species onto it (the transport
+        layout is unchanged); use :meth:`set_grid_tag` to assign a species'
+        home grid.
         """
         info(2, "New grid_tag", grid_tag, "with dimension", dimension)
         self.grid_dims[grid_tag] = dimension
 
         for s in self.species_refs:
             s.grid_dims = self.grid_dims
+
+    def compute_transport_offsets(self):
+        """(Re)compute per-species offsets into the transport state vector.
+
+        Each species occupies a contiguous block of size
+        ``grid_dims[s.grid_tag]`` (its home grid), laid out in ``princeidx``
+        order. Sets every species' ``_tr_lidx`` / ``_tr_dim`` / ``_tr_lbin``
+        and this manager's :attr:`dim_states` / :attr:`dim_bins`.
+
+        With every species on the ``"default"`` grid at equal dimension the
+        offsets reduce to ``princeidx * d`` exactly, so the state-vector
+        layout is bit-identical to the pre-Tier-3 uniform scheme.
+        """
+        off = 0
+        offb = 0
+        for s in sorted(self.species_refs, key=lambda sp: sp.princeidx):
+            d = self.grid_dims[s.grid_tag]
+            s._tr_dim = d
+            s._tr_lidx = off
+            s._tr_lbin = offb
+            off += d
+            offb += d + 1
+        self.dim_states = off
+        self.dim_bins = offb
+
+    def set_grid_tag(self, pdgid, grid_tag):
+        """Move species ``pdgid`` onto the home transport grid ``grid_tag``
+        (which must already be registered via :meth:`add_grid`) and recompute
+        the transport offsets. Used in Tier 3 step 2 to put γ/e± on the EM
+        grid."""
+        if grid_tag not in self.grid_dims:
+            raise KeyError(
+                "grid_tag {0!r} not registered; call add_grid first".format(grid_tag)
+            )
+        self.pdgid2sref[int(pdgid)].grid_tag = grid_tag
+        self.compute_transport_offsets()
 
     def __repr__(self):
         str_out = ""

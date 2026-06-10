@@ -41,13 +41,27 @@ class PriNCeRun(object):
             "enable_em_cascade", getattr(config, "enable_em_cascade", False)
         )
 
+        # Tier 3: give the EM sector (γ, e±) its own decoupled energy grid
+        # instead of sharing the floor-extended nuclear grid. Only meaningful
+        # with the cascade on; default off preserves Tier-1 behaviour.
+        # See methods/em-grid-boost-tier3-plan.md.
+        self.enable_em_decoupled_grid = (
+            kwargs.pop(
+                "enable_em_decoupled_grid",
+                getattr(config, "enable_em_decoupled_grid", False),
+            )
+            and self.enable_em_cascade
+        )
+
         # Initialize energy grid
         if config.grid_scale == "E":
             info(1, "initialising Energy grid")
             cr_cfg = config.cosmic_ray_grid
             # EM cascade products (γ, e±) reach down to ~0.1 GeV; extend the
             # shared grid's low end when the co-evolved EM cascade is on.
-            if self.enable_em_cascade:
+            # Tier 3 (enable_em_decoupled_grid) instead gives the EM sector its
+            # own grid, so the nuclear grid stays native and is NOT floored.
+            if self.enable_em_cascade and not self.enable_em_decoupled_grid:
                 lo, hi, ppd = cr_cfg
                 # EM cascade products (γ, e±) reach down to ~0.1 GeV by default.
                 # The cooled-IC pile-up below the cascade break E_X (≈ the IC
@@ -77,6 +91,19 @@ class PriNCeRun(object):
                 cr_cfg = (min(lo, em_lo), hi, ppd)
             self.cr_grid = EnergyGrid(*cr_cfg)
             self.ph_grid = EnergyGrid(*config.photon_grid)
+            # Tier 3: the decoupled EM grid spans log10(m_e) → cr-grid top in
+            # energy (x = E/m_e from the floor x=1 up to the nuclear top, so
+            # photopion γ / BH e± inject without truncation), at
+            # config.em_grid_bins_dec resolution. γ/e± are moved onto it after
+            # the species manager exists (below). None when not decoupled.
+            self.em_grid = None
+            if self.enable_em_decoupled_grid:
+                from numpy import log10
+
+                m_e_log10 = float(log10(data.PRINCE_UNITS.m_electron))
+                em_hi = config.cosmic_ray_grid[1]
+                em_bpd = getattr(config, "em_grid_bins_dec", 16)
+                self.em_grid = EnergyGrid(m_e_log10, em_hi, em_bpd)
         else:
             raise Exception(
                 "Unknown energy grid scale {:}, adjust config.grid_scale".format(
@@ -138,9 +165,23 @@ class PriNCeRun(object):
             # tracking (e.g. all are decay-only).
             self.cross_sections.emit_tracking_channels(self.spec_man)
 
-        # Total dimension of system
-        self.dim_states = self.cr_grid.d * self.spec_man.nspec
-        self.dim_bins = (self.cr_grid.d + 1) * self.spec_man.nspec
+        # Tier 3: register the decoupled EM grid and move γ/e± onto it. This
+        # makes their state-vector blocks size em_grid.d while nuclei keep
+        # cr_grid.d — set_grid_tag recomputes the transport offsets. Must run
+        # before dim_states is read below.
+        if self.enable_em_decoupled_grid:
+            self.spec_man.add_grid("em", self.em_grid.d)
+            for pid in (22, 11, -11):
+                if pid in self.spec_man.pdgid2sref:
+                    self.spec_man.set_grid_tag(pid, "em")
+
+        # Total dimension of system. Read from the per-species transport
+        # offset map (Tier 3 step 1) so EM species can later occupy a
+        # different-size block; with every species on the shared cr grid this
+        # equals cr_grid.d * nspec / (cr_grid.d + 1) * nspec exactly.
+        self.spec_man.compute_transport_offsets()
+        self.dim_states = self.spec_man.dim_states
+        self.dim_bins = self.spec_man.dim_bins
 
         # Initialize continuous energy losses
         self.adia_loss_rates_grid = interaction_rates.ContinuousAdiabaticLossRate(

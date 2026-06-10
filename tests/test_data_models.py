@@ -235,6 +235,86 @@ class TestSpeciesManagerExtra:
             assert spec.uidx("ph") > spec.lidx("ph")
 
 
+class TestTransportOffsets:
+    """Tier 3 step 1: heterogeneous per-species transport offsets.
+
+    The default (all-equal) path must stay bit-identical to the pre-Tier-3
+    ``princeidx * d`` layout; a species moved onto a different-size home grid
+    must produce a contiguous, gap-free, correctly-sized state vector.
+    """
+
+    SPECIES = [PDG_GAMMA, PDG_E_MINUS, PDG_E_PLUS, PDG_NEUTRON, PDG_PROTON, PDG_HE4]
+
+    def test_default_layout_bit_identical(self):
+        """Every species on the shared grid → legacy princeidx*d offsets."""
+        d = 10
+        sm = SpeciesManager(self.SPECIES, d)
+        assert sm.dim_states == d * sm.nspec
+        assert sm.dim_bins == (d + 1) * sm.nspec
+        for s in sm.species_refs:
+            assert s.lidx() == s.princeidx * d
+            assert s.uidx() == (s.princeidx + 1) * d
+            assert s.sl == slice(s.princeidx * d, (s.princeidx + 1) * d)
+            assert s.lbin() == s.princeidx * (d + 1)
+            assert s.ubin() == (s.princeidx + 1) * (d + 1)
+
+    def test_em_grid_heterogeneous(self):
+        """γ/e± on a larger home grid → bigger blocks, nuclei unchanged."""
+        d, d_em = 10, 25
+        sm = SpeciesManager(self.SPECIES, d)
+        sm.add_grid("em", d_em)
+        for pid in (PDG_GAMMA, PDG_E_MINUS, PDG_E_PLUS):
+            sm.set_grid_tag(pid, "em")
+
+        em_pids = {PDG_GAMMA, PDG_E_MINUS, PDG_E_PLUS}
+        n_em = len(em_pids)
+        n_nuc = sm.nspec - n_em
+        assert sm.dim_states == n_em * d_em + n_nuc * d
+        assert sm.dim_bins == n_em * (d_em + 1) + n_nuc * (d + 1)
+
+        # Per-species block size matches its home grid.
+        for s in sm.species_refs:
+            expected = d_em if s.pdgid in em_pids else d
+            assert s.uidx() - s.lidx() == expected
+            assert s.sl.stop - s.sl.start == expected
+            assert s.ubin() - s.lbin() == expected + 1
+
+    def test_offsets_contiguous_and_gapfree(self):
+        """Blocks tile [0, dim_states) with no gaps or overlaps."""
+        sm = SpeciesManager(self.SPECIES, 10)
+        sm.add_grid("em", 25)
+        for pid in (PDG_GAMMA, PDG_E_MINUS, PDG_E_PLUS):
+            sm.set_grid_tag(pid, "em")
+
+        refs = sorted(sm.species_refs, key=lambda s: s.princeidx)
+        cursor = 0
+        cursor_bin = 0
+        for s in refs:
+            assert s.lidx() == cursor
+            assert s.lbin() == cursor_bin
+            cursor = s.uidx()
+            cursor_bin = s.ubin()
+        assert cursor == sm.dim_states
+        assert cursor_bin == sm.dim_bins
+
+    def test_vestigial_tag_still_uniform(self):
+        """An explicit non-default grid_tag keeps the legacy uniform formula
+        even when the transport layout is heterogeneous."""
+        sm = SpeciesManager(self.SPECIES, 10)
+        sm.add_grid("em", 25)
+        for pid in (PDG_GAMMA, PDG_E_MINUS, PDG_E_PLUS):
+            sm.set_grid_tag(pid, "em")
+        sm.add_grid("ph", 20)
+        for s in sm.species_refs:
+            assert s.lidx("ph") == s.princeidx * 20
+            assert s.uidx("ph") == (s.princeidx + 1) * 20
+
+    def test_set_grid_tag_unregistered_raises(self):
+        sm = SpeciesManager(self.SPECIES, 10)
+        with pytest.raises(KeyError):
+            sm.set_grid_tag(PDG_GAMMA, "nonexistent")
+
+
 class TestEnergyGridExtra:
     def test_different_bins_per_decade(self):
         grid4 = EnergyGrid(3, 10, 4)

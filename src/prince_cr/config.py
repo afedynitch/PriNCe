@@ -123,6 +123,22 @@ cosmic_ray_grid = (3, 14, 8)
 #: methods/em-grid-boost-tier3-plan.md; Tier 3 decouples the EM grid so this
 #: extension no longer burdens the nuclear transport grid.
 em_cascade_grid_lo = -3.3
+
+#: Tier 3: decouple the EM sector (γ, e±) onto its OWN energy grid instead of
+#: sharing (and floor-extending) the nuclear transport grid. When True AND
+#: ``enable_em_cascade`` is on, ``core.py`` keeps the nuclear grid native
+#: (``cosmic_ray_grid``, no m_e floor extension) and builds a separate EM grid
+#: (see ``em_grid_bins_dec``); γ/e± are moved onto it via
+#: ``SpeciesManager.set_grid_tag``. Default False preserves the Tier-1
+#: shared-floored-grid behaviour bit-for-bit. methods/em-grid-boost-tier3-plan.md.
+enable_em_decoupled_grid = False
+#: Resolution (bins per decade) of the decoupled EM grid. The EM grid spans
+#: log10(m_e) → ``cosmic_ray_grid[1]`` in energy (x = E/m_e from the floor x=1
+#: at m_e up to the nuclear-grid top, so photopion γ / BH e± inject without
+#: truncation). Default 16/dec resolves the rising E^-1.5 universal-cascade
+#: segment; lower it (e.g. to 8, matching the nuclear grid) after validation to
+#: cut solve cost. Only consumed when ``enable_em_decoupled_grid`` is True.
+em_grid_bins_dec = 16
 #: Photon grid of target field, only for calculation of rates
 photon_grid = (-15, -6, 8)
 
