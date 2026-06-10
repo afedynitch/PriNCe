@@ -104,6 +104,13 @@ class PriNCeRun(object):
                 em_hi = config.cosmic_ray_grid[1]
                 em_bpd = getattr(config, "em_grid_bins_dec", 16)
                 self.em_grid = EnergyGrid(m_e_log10, em_hi, em_bpd)
+            # Registry of transport grids keyed by home grid_tag, consumed by
+            # the per-grid loss-vector / differential-operator builders so each
+            # species' block uses its own energy array. Flag-off has only
+            # "default" → bit-identical to the single-grid path.
+            self.grids = {"default": self.cr_grid}
+            if self.em_grid is not None:
+                self.grids["em"] = self.em_grid
         else:
             raise Exception(
                 "Unknown energy grid scale {:}, adjust config.grid_scale".format(
@@ -174,6 +181,26 @@ class PriNCeRun(object):
             for pid in (22, 11, -11):
                 if pid in self.spec_man.pdgid2sref:
                     self.spec_man.set_grid_tag(pid, "em")
+            # GUARD: the cross-grid EM-daughter coupling regrid (Tier 3 step 3)
+            # is not yet implemented. The photo-nuclear response builder
+            # (interaction_rates.py) and the decay Λ_off (solvers/propagation.py)
+            # emit daughter blocks as ``daughter.lidx() + cr_index``; for an EM
+            # daughter on the (finer, lower) EM grid those indices land in-bounds
+            # but at the WRONG energies — silently wrong physics, not a crash.
+            # Until the energy-conserving cr→em daughter regrid lands, refuse to
+            # build rather than mislead. The transport operators (loss vectors,
+            # differential operator, _em_E) and the BH cross-grid injection are
+            # already decoupled-aware; only the response/decay coupling remains.
+            if config.secondaries:
+                raise NotImplementedError(
+                    "enable_em_decoupled_grid: the cross-grid EM-daughter "
+                    "coupling regrid (Tier 3 step 3) is not yet implemented, so "
+                    "photo-nuclear γ and decay e±/γ would be mapped to the wrong "
+                    "EM-grid energies. See "
+                    "wiki/methods/em-grid-boost-tier3-plan.md step 3. Run with "
+                    "the shared-grid EM cascade (enable_em_decoupled_grid=False) "
+                    "until step 3 lands."
+                )
 
         # Total dimension of system. Read from the per-species transport
         # offset map (Tier 3 step 1) so EM species can later occupy a

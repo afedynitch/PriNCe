@@ -793,6 +793,17 @@ class _ContinuousLossRateBase(object):
         self.e_cosmicray = prince_run.cr_grid
         self.dim_states = prince_run.dim_states
         self.dim_bins = prince_run.dim_bins
+        # Per-home-grid registry (Tier 3): each species' block uses its own
+        # energy array. Flag-off exposes only {"default": cr_grid}, so every
+        # species resolves to the cr grid — bit-identical to the old path.
+        self._grids = getattr(prince_run, "grids", {"default": prince_run.cr_grid})
+
+    def _species_earr(self, spec, energy):
+        """Return the home-grid energy array for ``spec`` (``grid`` → cell
+        centres, ``bins`` → bin edges), matching that species' transport block
+        size. Nuclei resolve to the cr grid; EM species to the EM grid."""
+        grid = self._grids.get(spec.grid_tag, self.e_cosmicray)
+        return grid.grid if energy == "grid" else grid.bins
 
     def _energy_axis(self, energy):
         """Resolve ``energy`` to ``(dim, e_array, lo_idx, hi_idx)``.
@@ -840,11 +851,17 @@ class ContinuousAdiabaticLossRate(_ContinuousLossRateBase):
             return H(z) * PRINCE_UNITS.cm2sec * energy
 
     def _init_energy_vec(self, energy):
-        """Prepare vector for scaling with units, charge and mass."""
-        dim, earr, lo, hi = self._energy_axis(energy)
+        """Prepare vector for scaling with units, charge and mass.
+
+        Adiabatic (redshift) loss applies to every species, so each block is
+        filled with that species' own home-grid energy array (Tier 3). With a
+        single grid this is bit-identical to filling every block with the cr
+        grid.
+        """
+        dim, _, lo, hi = self._energy_axis(energy)
         energy_vector = np.zeros(dim)
         for spec in self.spec_man.species_refs:
-            energy_vector[lo(spec) : hi(spec)] = earr
+            energy_vector[lo(spec) : hi(spec)] = self._species_earr(spec, energy)
         return energy_vector
 
     def single_loss_length(self, pid, z):
@@ -881,6 +898,11 @@ class ContinuousPairProductionLossRate(_ContinuousLossRateBase):
         # Scale vector containing the units and factors of Z**2 for nuclei
         self.scale_vec = self._init_scale_vec(energy)
 
+        # Capture this instance's energy mode so loss_vector() places the
+        # per-nucleus rate into the correct slice bounds and total length
+        # (grid → dim_states/lidx; bins → dim_bins/lbin).
+        self._loss_dim, _, self._loss_lo, self._loss_hi = self._energy_axis(energy)
+
         # Grid of photon energies for interpolation. `_energy_axis` already
         # validated `energy` above; reuse the same axis here.
         _, earr, _, _ = self._energy_axis(energy)
@@ -899,7 +921,16 @@ class ContinuousPairProductionLossRate(_ContinuousLossRateBase):
         rate_single = trapz(
             self.photon_vector(z, pfield=pfield) * self.phi_xi2, self.xi, axis=1
         )
-        pprod_loss_vector = self.scale_vec * np.tile(rate_single, self.spec_man.nspec)
+        # Pair production is a nuclear process: scale_vec is non-zero only on
+        # nucleus blocks (and rate_single lives on the cr grid). Place it into
+        # each nucleus' slice; EM/other blocks stay zero. With a single grid
+        # this reproduces the old ``np.tile(rate_single, nspec)`` exactly once
+        # multiplied by ``scale_vec`` (which zeroed the non-nucleus blocks).
+        rate_full = np.zeros(self._loss_dim)
+        for spec in self.spec_man.species_refs:
+            if spec.is_nucleus:
+                rate_full[self._loss_lo(spec) : self._loss_hi(spec)] = rate_single
+        pprod_loss_vector = self.scale_vec * rate_full
 
         return pprod_loss_vector
 

@@ -265,9 +265,17 @@ class UHECRPropagationSolver(object):
             sm = prince_run.spec_man
             self._em_gamma_sl = sm.pdgid2sref[22].sl
             self._em_lep_sl = [sm.pdgid2sref[p].sl for p in (11, -11) if p in sm.pdgid2sref]
-            self._em_E = prince_run.cr_grid.grid  # γ/e± have A=1 → grid == E
-            # proton slice + grid for the BH pair source (protons drive BH)
+            # γ/e± live on their own grid when decoupled (Tier 3); else they
+            # share the cr grid. A=1 so the grid array IS the energy array.
+            em_grid = getattr(prince_run, "em_grid", None)
+            self._em_E = (em_grid.grid if em_grid is not None
+                          else prince_run.cr_grid.grid)
+            # proton slice + grid for the BH pair source (protons drive BH).
+            # The proton lives on the nuclear (cr) grid even when the EM sector
+            # is decoupled, so the BH source maps proton-grid energies (input)
+            # onto the EM grid (output e±) — see _em_bh_at / _inject_bh_pairs.
             self._em_proton_sl = sm.pdgid2sref[2212].sl if 2212 in sm.pdgid2sref else None
+            self._em_proton_E = prince_run.cr_grid.grid
         self.adia_loss_rates_grid = prince_run.adia_loss_rates_grid
         self.pair_loss_rates_grid = prince_run.pair_loss_rates_grid
         self.adia_loss_rates_bins = prince_run.adia_loss_rates_bins
@@ -281,7 +289,10 @@ class UHECRPropagationSolver(object):
         self.list_of_sources = []
 
         self.diff_operator = DifferentialOperator(
-            prince_run.cr_grid, prince_run.spec_man.nspec
+            prince_run.cr_grid,
+            prince_run.spec_man.nspec,
+            spec_man=prince_run.spec_man,
+            grids=getattr(prince_run, "grids", None),
         ).operator
 
     @property
@@ -475,13 +486,17 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
             zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), 8))
             field = self.prince_run.photon_field
-            E = self._em_E
+            # Output e± energies on the EM grid; input proton energies on the
+            # nuclear grid. When the grids coincide (shared-grid path) this is
+            # the original square R_BH; when decoupled R_BH is (d_em, d_cr).
+            E_out = self._em_E
+            E_in = self._em_proton_E
             eps = np.logspace(-12.5, -7.0, 40)  # CMB+EBL band [GeV]
             Rs = []
             for zz in zc:
                 n_eps = np.asarray(field.get_photon_density(eps, zz), dtype="double")
                 n_eps = np.where(np.isfinite(n_eps) & (n_eps > 0), n_eps, 0.0)
-                Rs.append(bh_pair_shape_matrix(E, E, eps, n_eps))
+                Rs.append(bh_pair_shape_matrix(E_out, E_in, eps, n_eps))
             self._em_bh_cache = (zc, Rs)
         zc, Rs = self._em_bh_cache
         return Rs[int(np.argmin(np.abs(zc - z)))]
@@ -500,15 +515,17 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         from prince_cr.data import PRINCE_UNITS
 
         z = self._em_z
-        E = self._em_E
-        dE = np.gradient(E)
+        # The BH source integrates over the PROTON (nuclear) grid; R_BH maps it
+        # to the EM grid. E_p drives the per-proton energy-loss fraction.
+        E_p = self._em_proton_E
+        dE = np.gradient(E_p)
         n_p = np.asarray(state[self._em_proton_sl], dtype="double")
         loss = self.pair_loss_rates_grid.loss_vector(z)[self._em_proton_sl]  # GeV/cm
         dl_step = PRINCE_UNITS.c * abs(self._em_dz) / ((1.0 + z) * H(z))      # cm
         # column weight: (energy lost per proton this step) / E_p  → fraction
         with np.errstate(divide="ignore", invalid="ignore"):
-            w = np.where(E > 0, loss * dl_step / E, 0.0) * n_p * dE
-        e_src = self._em_bh @ w  # dN/dE_e per lepton sign added this step
+            w = np.where(E_p > 0, loss * dl_step / E_p, 0.0) * n_p * dE
+        e_src = self._em_bh @ w  # dN/dE_e per lepton sign (on the EM grid)
         for sl in self._em_lep_sl:
             state[sl] = state[sl] + e_src
 

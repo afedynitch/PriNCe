@@ -2,7 +2,7 @@ import numpy as np
 
 
 class DifferentialOperator(object):
-    def __init__(self, cr_grid, nspec):
+    def __init__(self, cr_grid, nspec, spec_man=None, grids=None):
         self.ebins = cr_grid.bins
         self.egrid = cr_grid.grid
         self.ewidths = cr_grid.widths
@@ -11,6 +11,12 @@ class DifferentialOperator(object):
         self.log_width = np.log(self.ebins[1] / self.ebins[0])
 
         self.nspec = nspec
+        # Tier 3: when a species manager + per-home-grid registry are supplied,
+        # each species' block is built on its OWN grid (cr for nuclei, em for
+        # γ/e±). Without them, every block uses ``cr_grid`` — the single-grid
+        # path, bit-identical to the pre-Tier-3 ``block_diag(nspec*[op])``.
+        self.spec_man = spec_man
+        self.grids = grids if grids is not None else {"default": cr_grid}
         # Keep the FD operator as scipy CSR. Backend conversion (MKL handle,
         # cupy CSR) is the solver's job — done at the ETD2 boundary in
         # `propagation.UHECRPropagationSolverETD2._ensure_D_split`. The
@@ -20,7 +26,30 @@ class DifferentialOperator(object):
         self.operator = self.construct_differential_operator()
 
     def construct_differential_operator(self):
-        from scipy.sparse import block_diag, coo_matrix
+        from scipy.sparse import block_diag
+
+        if self.spec_man is None:
+            # Single-grid path: one op repeated nspec times.
+            single_op = self._build_single_op(self.grids["default"])
+            return block_diag(self.nspec * [single_op]).tocsr()
+
+        # Heterogeneous path: one op per distinct home grid (cached), assembled
+        # in princeidx order. With every species on "default" this produces the
+        # identical block_diag as the single-grid path above.
+        op_cache = {}
+        blocks = []
+        for spec in sorted(self.spec_man.species_refs, key=lambda s: s.princeidx):
+            tag = spec.grid_tag
+            if tag not in op_cache:
+                op_cache[tag] = self._build_single_op(self.grids[tag])
+            blocks.append(op_cache[tag])
+        return block_diag(blocks).tocsr()
+
+    def _build_single_op(self, grid):
+        """Build the (d_e × d_e) finite-difference loss operator for one energy
+        grid. Numerics are identical to the original single-grid construction;
+        only the grid arrays (``bins``/``grid``/``d``) are parameterised."""
+        from scipy.sparse import coo_matrix
 
         # Bulk: 4th-order asymmetric upwind stencil on log-E (correct for losses
         # that move flux toward lower E). Rows 0..2 and dim_e-3..dim_e-1 use
@@ -50,8 +79,8 @@ class DifferentialOperator(object):
         coeffs_rightmost = [-d for d in coeffs_leftmost[::-1]]
         denom_rightmost = denom_leftmost
 
-        h = self.log_width
-        dim_e = self.dim_e
+        h = np.log(grid.bins[1] / grid.bins[0])
+        dim_e = grid.d
         last = dim_e - 1
 
         op_matrix = np.zeros((dim_e, dim_e))
@@ -77,10 +106,8 @@ class DifferentialOperator(object):
             op_matrix[row, row + np.asarray(diags)] = np.asarray(coeffs) / (denom * h)
         # Construct an operator by left multiplication of the back-substitution
         # dlnE to dE. The right energy loss has to be later multiplied in every step
-        single_op = coo_matrix(op_matrix * (1.0 / self.egrid)[:, None])
-
-        # construct the operator for the whole matrix, by repeating
-        return block_diag(self.nspec * [single_op]).tocsr()
+        single_op = coo_matrix(op_matrix * (1.0 / grid.grid)[:, None])
+        return single_op
 
     def solve_coefficients(self, stencils, degree=1):
         """Calculates the finite difference coefficients for given stencils.
