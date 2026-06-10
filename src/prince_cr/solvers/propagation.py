@@ -274,12 +274,26 @@ class UHECRPropagationSolver(object):
             em_grid = getattr(prince_run, "em_grid", None)
             self._em_E = (em_grid.grid if em_grid is not None
                           else prince_run.cr_grid.grid)
-            # proton slice + grid for the BH pair source (protons drive BH).
-            # The proton lives on the nuclear (cr) grid even when the EM sector
-            # is decoupled, so the BH source maps proton-grid energies (input)
-            # onto the EM grid (output e±) — see _em_bh_at / _inject_bh_pairs.
+            # proton slice + grid for the BH pair source. Every nucleus lives on
+            # the nuclear (cr) grid even when the EM sector is decoupled, so the
+            # BH source maps cr-grid energies (input) onto the EM grid (output
+            # e±) — see _em_bh_at / _inject_bh_pairs.
             self._em_proton_sl = sm.pdgid2sref[2212].sl if 2212 in sm.pdgid2sref else None
             self._em_proton_E = prince_run.cr_grid.grid
+            # All charged nuclei drive Bethe-Heitler, not just protons. The cr
+            # grid is per-NUCLEON energy, so γ = E_cr/m_p is identical across
+            # species → the e± SHAPE matrix R_BH (built once for the proton in
+            # _em_bh_at) is reused for every nucleus. The Z² enhancement and the
+            # 1/A per-nucleon factor already live in the pair-loss vector
+            # (interaction_rates.ContinuousPairProductionLossRate.scale_vec =
+            # units·Z²/A); _inject_bh_pairs multiplies each species' weight by A
+            # so the deposited e± energy equals the nucleus' TOTAL BH loss
+            # (∝ Z²). See lessons/em-cascade-bh-nuclei.
+            self._em_bh_species = [
+                (s.sl, float(s.A))
+                for s in sm.species_refs
+                if getattr(s, "is_nucleus", False) and abs(s.charge) >= 1
+            ]
             # Tier 3: cross-grid coupling regrid. The photo-nuclear response and
             # decay Λ_off emit γ/e± daughter rows at cr-grid indices; left-
             # multiplying the assembled coupling by R remaps those rows onto the
@@ -518,27 +532,40 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
     def _inject_bh_pairs(self, state):
         """Inject Bethe-Heitler e⁺e⁻ into the EM species for this z-step.
 
-        The proton already loses BH energy via the continuous pair-loss term;
+        Every charged nucleus loses BH energy via the continuous pair-loss term;
         here we deposit that energy as e± (per sign) with the W-kernel shape
-        ``self._em_bh`` (R_BH), scaled by the proton's BH energy-loss rate so
-        total injected pair energy = proton energy lost (energy-conserving).
-        Mutates ``state`` in place; call BEFORE ``_apply_em_cascade``."""
-        if self._em_bh is None or self._em_proton_sl is None:
+        ``self._em_bh`` (R_BH), scaled by each species' BH energy-loss rate so
+        the total injected pair energy = the nucleus energy lost
+        (energy-conserving). Mutates ``state`` in place; call BEFORE
+        ``_apply_em_cascade``.
+
+        The cr grid is per-NUCLEON energy, so γ = E_cr/m_p is identical for all
+        species and the proton-built R_BH gives the correct e± SHAPE for every
+        nucleus (the pair lab energy is set by γ, i.e. the per-nucleon scale).
+        The pair-loss vector already carries units·Z²/A per species; multiplying
+        the weight by A makes the deposited e± energy equal the nucleus' TOTAL
+        BH loss (∝ Z²) — Z² more pairs than a proton at the same γ, as expected.
+        """
+        if self._em_bh is None or not self._em_bh_species:
             return
         from prince_cr.cosmology import H
         from prince_cr.data import PRINCE_UNITS
 
         z = self._em_z
-        # The BH source integrates over the PROTON (nuclear) grid; R_BH maps it
-        # to the EM grid. E_p drives the per-proton energy-loss fraction.
+        # The BH source integrates over the (cr) per-nucleon grid; R_BH maps it
+        # to the EM grid. E_p drives the per-nucleus energy-loss fraction.
         E_p = self._em_proton_E
         dE = np.gradient(E_p)
-        n_p = np.asarray(state[self._em_proton_sl], dtype="double")
-        loss = self.pair_loss_rates_grid.loss_vector(z)[self._em_proton_sl]  # GeV/cm
-        dl_step = PRINCE_UNITS.c * abs(self._em_dz) / ((1.0 + z) * H(z))      # cm
-        # column weight: (energy lost per proton this step) / E_p  → fraction
+        loss_full = self.pair_loss_rates_grid.loss_vector(z)             # GeV/cm, dim_states
+        dl_step = PRINCE_UNITS.c * abs(self._em_dz) / ((1.0 + z) * H(z))  # cm
+        # Accumulate the per-nucleon e± source over all charged species.
+        # column weight_s = A·(energy lost per nucleon this step)/E_cr · n_s
+        w = np.zeros_like(E_p)
         with np.errstate(divide="ignore", invalid="ignore"):
-            w = np.where(E_p > 0, loss * dl_step / E_p, 0.0) * n_p * dE
+            inv_E = np.where(E_p > 0, 1.0 / E_p, 0.0)
+            for sl, A in self._em_bh_species:
+                n_s = np.asarray(state[sl], dtype="double")
+                w += A * loss_full[sl] * dl_step * inv_E * n_s * dE
         e_src = self._em_bh @ w  # dN/dE_e per lepton sign (on the EM grid)
         for sl in self._em_lep_sl:
             state[sl] = state[sl] + e_src
