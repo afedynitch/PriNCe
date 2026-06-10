@@ -58,6 +58,22 @@ class PriNCeRun(object):
                 # resolve that segment — at the cost of more bins on the shared
                 # transport grid (the perf trade-off this floor encodes).
                 em_lo = getattr(config, "em_cascade_grid_lo", -1)
+                # Hard floor at the electron mass: e± below m_e have γ<1
+                # (unphysical) and the IC/pair kernels are clamped to zero
+                # there (cascade/kernels.py). Flooring the grid at m_e prevents
+                # sub-m_e bins — the kinetic-cascade NaN + sub-grid energy leak
+                # hit when the z-resolved prototype pushed below m_e. Tier 1 of
+                # methods/em-grid-boost-tier3-plan.md.
+                import math
+                from numpy import log10
+                m_e_log10 = log10(data.PRINCE_UNITS.m_electron)
+                em_lo = max(em_lo, m_e_log10)
+                # Snap the low edge to the grid (round TOWARD hi so we never dip
+                # below m_e) so the cr grid keeps an integer bins-per-decade and
+                # stays aligned with the photon grid — interaction_rates.
+                # _assert_log_grids_compatible rejects a fractional log-step.
+                nsteps = math.floor((hi - em_lo) * ppd)
+                em_lo = hi - nsteps / ppd
                 cr_cfg = (min(lo, em_lo), hi, ppd)
             self.cr_grid = EnergyGrid(*cr_cfg)
             self.ph_grid = EnergyGrid(*config.photon_grid)

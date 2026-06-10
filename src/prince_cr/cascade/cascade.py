@@ -307,7 +307,10 @@ def cooled_ic_photon_matrix(E_gamma, E_e_grid, eps, n_eps):
     for j in range(ne):
         # integrate emission(E_gamma, E') / loss(E') over E' from E_gamma up to E_e[j]
         for i in range(ng):
-            sel = (E_e_grid >= E_gamma[i]) & (E_e_grid <= E_e_grid[j])
+            # γ=1 clamp: electrons at/below m_e have loss<=0 (ic_energy_loss_rate
+            # returns 0 there); mask them out of the cooling integral so the
+            # 1/loss division stays finite (no NaN when the grid reaches m_e).
+            sel = (E_e_grid >= E_gamma[i]) & (E_e_grid <= E_e_grid[j]) & (loss > 0)
             if np.count_nonzero(sel) >= 2:
                 integrand = emis[i, sel] / loss[sel]
                 M[i, j] = trapz(integrand, E_e_grid[sel])

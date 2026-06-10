@@ -110,6 +110,19 @@ E_CMB = 2.34823e-13
 #: efficiency for 256 bit AVX or similar
 #: Format (log10(E_min), log10(E_max), nbins/decade of energy)
 cosmic_ray_grid = (3, 14, 8)
+
+#: Low-end extension of the SHARED transport grid (log10 E/GeV) when the
+#: co-evolved EM cascade is enabled (``enable_em_cascade``). The cascade's
+#: universal rising segment lives below the break E_X (≈0.1 GeV), so the grid
+#: must reach down to resolve it (otherwise the energy-conserving transfer
+#: crams that energy onto the lowest bin — the "xcut" leak). ``core.py`` HARD-
+#: FLOORS this at the electron mass log10(m_e)≈-3.29: e± below m_e have γ<1
+#: (unphysical) and the IC kernels are clamped to zero there
+#: (``cascade/kernels.py``). The default sits at m_e to resolve as much of the
+#: universal segment as is physically valid. Tier 1 of
+#: methods/em-grid-boost-tier3-plan.md; Tier 3 decouples the EM grid so this
+#: extension no longer burdens the nuclear transport grid.
+em_cascade_grid_lo = -3.3
 #: Photon grid of target field, only for calculation of rates
 photon_grid = (-15, -6, 8)
 

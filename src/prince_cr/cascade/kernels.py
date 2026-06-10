@@ -51,6 +51,14 @@ def ic_emission_spectrum(E1, E_e, eps, n_eps):
     E1 = np.atleast_1d(np.asarray(E1, dtype="double"))
     out = np.zeros_like(E1)
 
+    # γ=1 clamp: an electron at (or below) rest mass (γ ≤ 1) does not
+    # up-scatter. Below m_e the BG70 spectral function is unphysical (the
+    # 1/(4γ²) lower-q bound exceeds 1, and pref ∝ 1/γ² blows up), which is the
+    # source of the kinetic-cascade NaN when the EM grid is pushed below m_e.
+    # Return zero emission instead. See methods/em-grid-boost-tier3-plan.md.
+    if gamma <= 1.0:
+        return out
+
     pref = 0.75 * SIGMA_THOMSON * C_CM / gamma**2  # [cm^2 cm/s] = cm^3/s
     for i, e1 in enumerate(E1):
         if e1 >= E_e:
@@ -71,6 +79,11 @@ def ic_energy_loss_rate(E_e, eps, n_eps, n_E1=400):
     """Total IC energy-loss rate -dE/dt [GeV/s] by integrating the emission
     spectrum: int (E1 - eps_mean) dN/dt ~ int E1 dN/dt for upscattering."""
     gamma = E_e / M_E
+    # γ=1 clamp (mirrors ic_emission_spectrum): no IC loss at/below the
+    # electron rest mass. Returning 0 keeps cooled_ic_photon_matrix's
+    # division by the loss rate finite (it masks loss<=0 columns).
+    if gamma <= 1.0:
+        return 0.0
     # scattered photons span up to ~ E_e; sample below it
     E1 = np.logspace(np.log10(eps.min()), np.log10(0.9999 * E_e), n_E1)
     dN = ic_emission_spectrum(E1, E_e, eps, n_eps)
