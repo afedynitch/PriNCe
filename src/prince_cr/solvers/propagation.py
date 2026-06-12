@@ -265,6 +265,8 @@ class UHECRPropagationSolver(object):
         # in the enable_em_cascade block below). Referenced unconditionally in
         # _refresh_z_caches, so default it here for the nuclear-only path.
         self._em_regrid_R = None
+        self._em_native = False
+        self._em_grid_obj = None
         if self.enable_em_cascade:
             sm = prince_run.spec_man
             self._em_gamma_sl = sm.pdgid2sref[22].sl
@@ -274,6 +276,13 @@ class UHECRPropagationSolver(object):
             em_grid = getattr(prince_run, "em_grid", None)
             self._em_E = (em_grid.grid if em_grid is not None
                           else prince_run.cr_grid.grid)
+            # Native cross-grid coupling: builders write γ/e± daughter rows
+            # directly on the EM grid → no runtime regrid R. The Λ_off decay
+            # builder needs the EM bin edges for its rectangular EM blocks.
+            self._em_native = bool(
+                getattr(prince_run, "enable_em_native_coupling", False)
+            )
+            self._em_grid_obj = em_grid
             # proton slice + grid for the BH pair source. Every nucleus lives on
             # the nuclear (cr) grid even when the EM sector is decoupled, so the
             # BH source maps cr-grid energies (input) onto the EM grid (output
@@ -301,7 +310,10 @@ class UHECRPropagationSolver(object):
             # not decoupled (no-op). See methods/em-grid-boost-tier3-plan.md §3.
             self._em_regrid_R = (
                 self._build_em_regrid_operator(prince_run)
-                if getattr(prince_run, "enable_em_decoupled_grid", False)
+                if (
+                    getattr(prince_run, "enable_em_decoupled_grid", False)
+                    and not self._em_native
+                )
                 else None
             )
         self.adia_loss_rates_grid = prince_run.adia_loss_rates_grid
@@ -1059,6 +1071,35 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
         dec_bins_lower = dec_bins[:-1]
         dec_bins_upper = dec_bins[1:]
 
+        # Native EM coupling: decay daughters homed on the decoupled EM grid
+        # get a rectangular (d_em × n_E) block evaluated at EM-grid daughter
+        # energies. x[i, j] = em_bins[i]/e_centers[j] depends only on
+        # (i − r·j) when the EM log-step divides the cr one (r = δ_cr/δ_em,
+        # integer — guaranteed by the core.py grid snap), so the kernel is
+        # evaluated once on a 1D x-supercolumn at δ_em steps and scattered
+        # with row-stride r. Bypasses get_decay_matrix_bin_average's square
+        # fill_diagonal path, which assumes equal steps on both axes.
+        em_native_tags = ()
+        if self._em_native and self._em_grid_obj is not None:
+            em_native_tags = ("em",)
+            _emg = self._em_grid_obj
+            _em_bins = _emg.bins
+            _d_em = _emg.d
+            _step_cr = np.log10(e_centers[1] / e_centers[0])
+            _step_em = np.log10(_emg.grid[1] / _emg.grid[0])
+            _r = int(round(_step_cr / _step_em))
+            _k0 = _r * (n_E - 1)
+            _x00 = _em_bins[0] / e_centers[0]
+            _x_lo_1d = _x00 * 10 ** (
+                (np.arange(_d_em + _k0) - _k0) * _step_em
+            )
+            _x_up_1d = _x_lo_1d * 10 ** _step_em
+            # K[i, j] = i − r·j + k0 → index into the supercolumn result.
+            _K_em = (
+                np.arange(_d_em)[:, None] - _r * np.arange(n_E)[None, :] + _k0
+            )
+            _int_scale_em = np.tile(e_widths / e_centers, (_d_em, 1))
+
         Lambda_diag = np.zeros(self.dim_states, dtype=np.float64)
         # COO accumulator for Λ_off; CSR-converted at the end.
         off_rows: list = []
@@ -1128,9 +1169,17 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
                     key = (s.pdgid, da_pdg)
                     dec_dist = decay_cache.get(key)
                     if dec_dist is None:
-                        dec_dist = int_scale * get_decay_matrix_bin_average(
-                            s.pdgid, da_pdg, dec_bins_lower, dec_bins_upper
-                        )
+                        if getattr(da_ref, "grid_tag", "default") in em_native_tags:
+                            # Rectangular EM block: 1D supercolumn at δ_em
+                            # steps, scattered with row-stride r.
+                            res_1d = get_decay_matrix_bin_average(
+                                s.pdgid, da_pdg, _x_lo_1d, _x_up_1d
+                            )
+                            dec_dist = _int_scale_em * res_1d[_K_em]
+                        else:
+                            dec_dist = int_scale * get_decay_matrix_bin_average(
+                                s.pdgid, da_pdg, dec_bins_lower, dec_bins_upper
+                            )
                         decay_cache[key] = dec_dist
                     if not np.any(dec_dist):
                         continue
@@ -1172,9 +1221,10 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
                 shape=(self.dim_states, self.dim_states),
                 dtype=np.float64,
             ).tocsr()
-            # Tier 3: decay also emits γ/e± daughter rows at cr indices (e.g.
-            # β-decay e±). Like the photo-nuclear coupling, the cr→em regrid is
-            # applied at the vector level in apply_F (R·(Λ_off·x)), not here.
+            # Tier 3: decay also emits γ/e± daughter rows. Native coupling
+            # (_em_native) writes them at EM-grid indices above; the legacy R
+            # path writes cr indices and regrids at the vector level in
+            # apply_F (R·(Λ_off·x)), not here.
 
     def _operator_at(self, z):
         """Return ``(d, apply_F)`` for the ETD2 step at redshift ``z``.

@@ -53,6 +53,17 @@ class PriNCeRun(object):
             and self.enable_em_cascade
         )
 
+        # Native cross-grid coupling (no runtime regrid R): the response
+        # builder and the decay operator write γ/e± daughter rows directly on
+        # the EM grid. Only meaningful on the decoupled grid.
+        self.enable_em_native_coupling = (
+            kwargs.pop(
+                "enable_em_native_coupling",
+                getattr(config, "em_native_coupling", False),
+            )
+            and self.enable_em_decoupled_grid
+        )
+
         # Initialize energy grid
         if config.grid_scale == "E":
             info(1, "initialising Energy grid")
@@ -98,12 +109,32 @@ class PriNCeRun(object):
             # the species manager exists (below). None when not decoupled.
             self.em_grid = None
             if self.enable_em_decoupled_grid:
+                import math
                 from numpy import log10
 
                 m_e_log10 = float(log10(data.PRINCE_UNITS.m_electron))
                 em_hi = config.cosmic_ray_grid[1]
                 em_bpd = getattr(config, "em_grid_bins_dec", 16)
-                self.em_grid = EnergyGrid(m_e_log10, em_hi, em_bpd)
+                # Snap the low edge to the grid step so the log-step is
+                # EXACTLY 1/em_bpd (EnergyGrid fixes both endpoints, so an
+                # unsnapped m_e anchor silently stretches the step — the old
+                # grid ran at ~15.96/dec instead of 16). Round TOWARD em_hi
+                # (floor the step count) so the lowest bin edge never dips
+                # below m_e — same convention as the Tier-1 shared-grid floor.
+                # The exact step is also a hard requirement of the native
+                # cross-grid Toeplitz kernel construction
+                # (config.em_native_coupling).
+                nsteps = math.floor((em_hi - m_e_log10) * em_bpd)
+                em_lo = em_hi - nsteps / em_bpd
+                self.em_grid = EnergyGrid(em_lo, em_hi, em_bpd)
+                if self.enable_em_native_coupling:
+                    cr_bpd = config.cosmic_ray_grid[2]
+                    if em_bpd % cr_bpd != 0:
+                        raise ValueError(
+                            "Native EM coupling requires em_grid_bins_dec "
+                            "({0}) to be an integer multiple of the nuclear "
+                            "grid's bins/decade ({1}).".format(em_bpd, cr_bpd)
+                        )
             # Registry of transport grids keyed by home grid_tag, consumed by
             # the per-grid loss-vector / differential-operator builders so each
             # species' block uses its own energy array. Flag-off has only
@@ -181,12 +212,14 @@ class PriNCeRun(object):
             for pid in (22, 11, -11):
                 if pid in self.spec_man.pdgid2sref:
                     self.spec_man.set_grid_tag(pid, "em")
-            # The cross-grid EM-daughter coupling regrid (Tier 3 step 3) is
-            # applied in the solver: UHECRPropagationSolverETD2 left-multiplies
-            # the assembled photo-nuclear + decay coupling by an energy-
-            # conserving cr→em row-regrid R (_build_em_regrid_operator), so the
-            # γ/e± daughter rows the builders write at cr indices land at the
-            # correct EM-grid energies.
+            # Cross-grid EM-daughter coupling, two modes:
+            # (a) enable_em_native_coupling: the response builder and the
+            #     decay operator interpolate γ/e± daughter rows DIRECTLY onto
+            #     the EM grid at kernel-construction time — no runtime regrid.
+            # (b) legacy R path: builders write daughter rows at cr indices;
+            #     UHECRPropagationSolverETD2 left-multiplies the assembled
+            #     coupling by an energy-conserving cr→em row-regrid R
+            #     (_build_em_regrid_operator) each step.
 
         # Total dimension of system. Read from the per-species transport
         # offset map (Tier 3 step 1) so EM species can later occupy a

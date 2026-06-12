@@ -139,6 +139,17 @@ enable_em_decoupled_grid = False
 #: segment; lower it (e.g. to 8, matching the nuclear grid) after validation to
 #: cut solve cost. Only consumed when ``enable_em_decoupled_grid`` is True.
 em_grid_bins_dec = 16
+#: Native cross-grid coupling for the decoupled EM grid. When True (and
+#: ``enable_em_decoupled_grid`` is on), the photo-nuclear response builder and
+#: the explicit-decay operator interpolate γ/e± daughter distributions DIRECTLY
+#: onto the EM grid at kernel-construction time (rectangular cr-mother ×
+#: em-daughter blocks), instead of writing cr-grid daughter rows that the
+#: solver remaps per step with the energy-conserving regrid R. Removes the
+#: per-step R SpMV and the intermediate cr-grid (8/dec) resolution loss on the
+#: EM injection spectra. Requires ``em_grid_bins_dec`` to be an integer
+#: multiple of the nuclear grid's bins/decade (Toeplitz log-shift kernel
+#: construction). Default False until validated against the R path.
+em_native_coupling = False
 #: Photon grid of target field, only for calculation of rates
 photon_grid = (-15, -6, 8)
 

@@ -90,6 +90,22 @@ class PhotoNuclearInteractionRate(object):
         pf = pfield if pfield is not None else self.photon_field
         return pf.get_photon_density(self.e_photon.grid, z)
 
+    def _native_em_enabled(self):
+        """True when γ/e± daughter rows are built natively on the decoupled
+        EM grid (``config.em_native_coupling``) instead of at cr indices +
+        runtime regrid R."""
+        return bool(
+            getattr(self.prince_run, "enable_em_native_coupling", False)
+        ) and getattr(self.prince_run, "em_grid", None) is not None
+
+    def _em_native_pdgs(self):
+        """PDG ids of state-vector species homed on the EM grid."""
+        return frozenset(
+            s.pdgid
+            for s in self.spec_man.species_refs
+            if getattr(s, "grid_tag", "default") == "em"
+        )
+
     def _estimate_batch_matrix(self):
         """estimate dimension of the batch matrix"""
         dcr = self.e_cosmicray.d
@@ -100,6 +116,21 @@ class PhotoNuclearInteractionRate(object):
         # touch them. See `wiki/results/prof-init-heavy-mass.md` Rec #2.
         bc_set = self.cross_sections.known_bc_channels_set
         diff_set = self.cross_sections.known_diff_channels_set
+
+        # Native EM-grid coupling: diff channels with a γ/e± daughter write
+        # their rows on the (finer) EM grid; the exact post-x-cut row count
+        # is cheap to precompute from the two grids, so use it instead of
+        # the dcr²/2 bound (the EM block would otherwise be over-allocated
+        # by the bins/dec ratio).
+        n_em_rows = None
+        em_pdgs = ()
+        if self._native_em_enabled():
+            em_grid = self.prince_run.em_grid
+            xl_em = em_grid.bins[:-1][None, :] / self.e_cosmicray.grid[:, None]
+            n_em_rows = int(
+                np.count_nonzero((xl_em >= config.x_cut) & (xl_em <= 1))
+            )
+            em_pdgs = self._em_native_pdgs()
 
         batch_dim = 0
         for specid in self.spec_man.known_species:
@@ -112,8 +143,11 @@ class PhotoNuclearInteractionRate(object):
                 if rtup in bc_set:
                     batch_dim += dcr
                 elif rtup in diff_set:
-                    # Only half of the elements can be non-zero (energy conservation)
-                    batch_dim += int(dcr**2 / 2) + 1
+                    if n_em_rows is not None and rtup[1] in em_pdgs:
+                        batch_dim += n_em_rows
+                    else:
+                        # Only half of the elements can be non-zero (energy conservation)
+                        batch_dim += int(dcr**2 / 2) + 1
 
         info(2, "Batch matrix dimensions are {0}x{1}".format(batch_dim, dph))
         self._batch_matrix = np.zeros((batch_dim, dph))
@@ -279,6 +313,57 @@ class PhotoNuclearInteractionRate(object):
         # precompute a (dcr, dcr) array once.
         xl_2d = bcr[:-1][None, :] / ecr[:, None]  # shape (dcr, dcr)
 
+        # ----- native EM-grid daughter construction -----
+        # Channels whose daughter is homed on the decoupled EM grid get their
+        # rows built directly at EM-grid energies. The Toeplitz log-shift
+        # generalizes to two grids when the EM log-step divides the cr one:
+        # with r = δ_cr/δ_em (integer), x_l(i_mo, i_da) = bem[i_da]/ecr[i_mo]
+        # = x0_em · 10^(δ_em·(i_da − r·i_mo)), so the ΔΔR̂ x-axis is sampled
+        # once at δ_em steps and indexed by (i_da − r·i_mo). The y/photon axis
+        # is mother-side and unchanged. See methods/em-grid-boost-tier3-plan.
+        native_em = self._native_em_enabled()
+        em_native_pdgs = self._em_native_pdgs() if native_em else frozenset()
+        if native_em:
+            em_grid = self.prince_run.em_grid
+            bem = em_grid.bins
+            dem = em_grid.d
+            delta_em = em_grid.widths
+            log_step_em = np.log10(em_grid.grid[1] / em_grid.grid[0])
+            r_ratio = int(round(log_step / log_step_em))
+            if not np.isclose(log_step, r_ratio * log_step_em, rtol=1e-12):
+                raise RuntimeError(
+                    "Native EM coupling requires the cr log-step to be an "
+                    "integer multiple of the EM log-step (got cr={0:.8g}, "
+                    "em={1:.8g}). Snap the EM grid (core.py) / align "
+                    "em_grid_bins_dec.".format(log_step, log_step_em)
+                )
+            k0_em = r_ratio * (dcr - 1)
+            # x edges at δ_em steps covering i_da − r·i_mo ∈ [−k0_em, dem−1],
+            # +1 trailing edge for the upper bin bound.
+            x0_em = bem[0] / ecr[0]
+            x_grid_em = x0_em * 10 ** (
+                (np.arange(dem + k0_em + 1) - k0_em) * log_step_em
+            )
+            factor_diff_em = factor_mo[:, None] * (
+                delta_ec[:, None] / delta_em[None, :]
+            )
+            i_em_idx = np.arange(dem)
+            B_idx_em = (i_em_idx[None, :] - r_ratio * i_idx[:, None]) + k0_em
+            xl_2d_em = bem[:-1][None, :] / ecr[:, None]  # (dcr, dem)
+            cuts2d_em = np.logical_and(
+                xl_2d_em >= config.x_cut, xl_2d_em <= 1
+            )
+            imo_grid_em, ida_grid_em = np.meshgrid(
+                np.arange(dcr), i_em_idx, indexing="ij"
+            )
+            rows_em_cut = ida_grid_em[cuts2d_em]
+            cols_em_cut = imo_grid_em[cuts2d_em]
+            # Sample points for the per-channel 2D antiderivative on the EM
+            # x-grid (same y/mother grid as the shared path).
+            Y2d_em, X2d_em = np.meshgrid(y_grid, x_grid_em, indexing="ij")
+            Yflat_em, Xflat_em = Y2d_em.ravel(), X2d_em.ravel()
+            shape2d_em = Y2d_em.shape
+
         ibatch = 0
         emo_idcs = np.arange(dcr)
         eda_idcs = np.arange(dcr)
@@ -352,6 +437,45 @@ class PhotoNuclearInteractionRate(object):
                 ibatch += dcr
                 self._batch_rows.append(sp_id_ref[daid].lidx() + eda_idcs)
                 self._batch_cols.append(sp_id_ref[moid].lidx() + emo_idcs)
+
+            elif in_diff and daid in em_native_pdgs:
+                # ---- diff channel, EM-grid daughter (native coupling) ----
+                # Same construction as the cr-grid diff branch below, with the
+                # daughter axis on the EM grid: per-channel ΔΔR̂ sampled on the
+                # δ_em x-grid, Toeplitz index (i_da − r·i_mo), and the bin-width
+                # ratio against the EM daughter bins. No nonel diagonal here —
+                # mothers are nuclei, the daughter is γ/e±.
+                intp2d = resp.incl_diff_intp_integral.get((moid, daid))
+                if intp2d is None:
+                    raise Exception(
+                        "incl_diff_intp_integral missing for", (moid, daid)
+                    )
+                R_em = intp2d.ev(Xflat_em, Yflat_em).reshape(shape2d_em)
+                ddR_em = (
+                    R_em[1:, 1:] - R_em[1:, :-1] - R_em[:-1, 1:] + R_em[:-1, :-1]
+                )
+                res = factor_diff_em[:, :, None] * ddR_em[
+                    A_2d[:, None, :],      # (dcr, 1, dph) — i_mo + j
+                    B_idx_em[:, :, None],  # (dcr, dem, 1) — i_da − r·i_mo + k0
+                ]
+                np.clip(res, 0.0, None, out=res)
+
+                _msk = _tracked_pdg_mask.get(daid) if _tracked_pdg_mask else None
+                if _msk is not None:
+                    res[..., ~_msk] = 0.0
+
+                kept = res[cuts2d_em]  # (n_kept, dph)
+                n_kept = kept.shape[0]
+                if n_kept == 0:
+                    continue
+
+                rows = sp_id_ref[daid].lidx() + rows_em_cut
+                cols = sp_id_ref[moid].lidx() + cols_em_cut
+
+                self._batch_matrix[ibatch:ibatch + n_kept, :] = kept
+                ibatch += n_kept
+                self._batch_rows.append(rows)
+                self._batch_cols.append(cols)
 
             elif in_diff:
                 # ---- diff channel branch ----
