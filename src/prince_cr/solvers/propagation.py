@@ -618,6 +618,11 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         """Backend-specific post-solve transform (e.g. cupy → host array)."""
         return state
 
+    def _coerce_state(self, state):
+        """Backend-specific coercion of the initial state (identity on the
+        host backends; the cupy backend uploads host arrays to device)."""
+        return state
+
     def close(self):
         """Release backend resources. Idempotent. Safe to skip."""
         pass
@@ -757,7 +762,7 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self._ensure_D_split()
         self._ensure_Lambda_split()
 
-        state = self._init_state()
+        state = self._coerce_state(self._init_state())
         self.pre_step_hook(self.initial_z)
 
         nsteps = len(z_grid) - 1
@@ -1507,6 +1512,11 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
         self._etd2_graph_stream = None
         self._etd2_graph_state_buf = None
         self._etd2_graph_needs_capture = True
+        # Device mirrors of the co-evolved EM cascade pieces (see
+        # _em_upload_device_caches); refreshed per cache window.
+        self._em_T_dev = None
+        self._em_bh_dev = None
+        self._em_bh_coeff_dev = None
 
     # ------------------------------------------------------------------
     # Outer-driver hooks
@@ -1515,6 +1525,14 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
         import cupy as cp
         dt = np.dtype(self.backend.cupy_dtype)
         return cp.zeros(self.dim_states, dtype=dt)
+
+    def _coerce_state(self, state):
+        """Device-coerce an externally supplied initial state (tests and
+        diagnostics commonly monkey-patch ``_init_state`` with a host
+        ndarray, which the device SpMV cannot consume)."""
+        import cupy as cp
+        dt = np.dtype(self.backend.cupy_dtype)
+        return cp.asarray(state, dtype=dt)
 
     def _finalize_state(self, state):
         # D2H + upcast back to fp64 host so downstream consumers
@@ -1616,8 +1634,76 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
             self._em_T = self._em_transfer_at(z)
             self._em_bh = self._em_bh_at(z)
             self._em_z = float(z)
+            self._em_upload_device_caches()
 
         self.current_z_rates = z
+
+    # ------------------------------------------------------------------
+    # Co-evolved EM cascade on device. The host base-class step methods
+    # (`_apply_em_cascade` / `_inject_bh_pairs`) mix numpy matrices with
+    # the cupy state — that was the long-standing host-array crash in
+    # test_em_absorption_in_transport. Mirror the window-constant pieces
+    # (T(z), R_BH(z), BH weight coefficients) to device at each cache
+    # refresh and run the per-step EM ops fully on device.
+    # ------------------------------------------------------------------
+    def _em_upload_device_caches(self):
+        import cupy as cp
+
+        dt = np.dtype(self.backend.cupy_dtype)
+        T_gamma, T_electron = self._em_T
+        self._em_T_dev = (
+            cp.asarray(np.asarray(T_gamma), dtype=dt),
+            cp.asarray(np.asarray(T_electron), dtype=dt),
+        )
+        self._em_bh_dev = None
+        self._em_bh_coeff_dev = None
+        if self._em_bh is not None and self._em_bh_species:
+            from prince_cr.cosmology import H
+            from prince_cr.data import PRINCE_UNITS
+
+            self._em_bh_dev = cp.asarray(np.asarray(self._em_bh), dtype=dt)
+            # Window-constant per-species weight coefficients (host math,
+            # no state dependence): w_s(E) = A·loss_s(E)·dl_step/E·dE.
+            z = self._em_z
+            E_p = self._em_proton_E
+            dE = np.gradient(E_p)
+            loss_full = self.pair_loss_rates_grid.loss_vector(z)
+            dl_step = PRINCE_UNITS.c * abs(self._em_dz) / ((1.0 + z) * H(z))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                inv_E = np.where(E_p > 0, 1.0 / E_p, 0.0)
+            self._em_bh_coeff_dev = [
+                (sl, cp.asarray(A * loss_full[sl] * dl_step * inv_E * dE, dtype=dt))
+                for sl, A in self._em_bh_species
+            ]
+        # Host-sync so the mirrors are complete before any other stream
+        # (in particular the non-blocking CUDA-graphs capture stream, which
+        # does not implicitly order against the default stream) reads them.
+        # Once per cache window — negligible.
+        cp.cuda.get_current_stream().synchronize()
+
+    def _apply_em_cascade(self, state):
+        if self._em_T is None:
+            return
+        import cupy as cp
+
+        T_gamma, T_electron = self._em_T_dev
+        ph = state[self._em_gamma_sl].copy()
+        lep = cp.zeros_like(ph)
+        for sl in self._em_lep_sl:
+            lep += state[sl]
+            state[sl] = 0.0
+        state[self._em_gamma_sl] = T_gamma @ ph + T_electron @ lep
+
+    def _inject_bh_pairs(self, state):
+        if self._em_bh_dev is None or not self._em_bh_coeff_dev:
+            return
+        w = None
+        for sl, coeff in self._em_bh_coeff_dev:
+            term = coeff * state[sl]
+            w = term if w is None else w + term
+        e_src = self._em_bh_dev @ w
+        for sl in self._em_lep_sl:
+            state[sl] = state[sl] + e_src
 
     def _ensure_D_split(self):
         """Compute the FD operator split and upload to GPU once per solve."""
@@ -2013,8 +2099,14 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
                     # Replay — single graph.launch per step.
                     self._etd2_graph_exec.launch(stream)
 
-            if step_hook is not None:
-                step_hook()
+                if step_hook is not None:
+                    # Issue the hook INSIDE the stream context: the
+                    # co-evolved EM step launches device kernels, and the
+                    # capture stream is non-blocking — hook ops on the
+                    # default stream would race the async graph launch.
+                    # On-stream they are ordered after this step's kernels
+                    # and before the next step's uploads.
+                    step_hook()
 
         stream.synchronize()
         return state

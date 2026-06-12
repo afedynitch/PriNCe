@@ -50,11 +50,19 @@ def test_em_off_is_default():
 
 
 def test_em_jacobian_gamma_sink(em_run):
-    """EM Jacobian γ-block diagonal equals -dτ/dl from the validated kernel."""
+    """EM Jacobian γ-block diagonal equals -dτ/dl from the validated kernel.
+
+    The co-evolved architecture applies the cascade via the per-z transfer
+    (``core.py`` leaves ``em_int_rates=None``), so construct the rate class
+    directly — its kernel is still the M1 γ sink and must match the
+    gammapy-validated opacity.
+    """
     from prince_cr.cascade.opacity import _kernel_per_length
+    from prince_cr.cascade.transport_rates import EMInteractionRate
 
     z = 0.1
-    jac = em_run.em_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
+    em_rates = EMInteractionRate(prince_run=em_run)
+    jac = em_rates.get_hadr_jacobian(z, 1.0, force_update=True)
     g = em_run.spec_man.pdgid2sref[22]
     diag = jac.toarray().diagonal()[g.sl]
     eps = np.logspace(-15, -7, 256)
@@ -67,7 +75,16 @@ def test_em_jacobian_gamma_sink(em_run):
 
 
 def test_em_absorption_in_transport(em_run):
-    """Injected γ absorbed as exp(-∫sink dl) inside the ETD2 solver."""
+    """Injected γ absorbed as exp(-∫sink dl) inside the ETD2 solver.
+
+    The co-evolved transfer reprocesses absorbed energy downward, so the
+    pure-absorption closure is recovered by replacing T(z) with its
+    escape-only diagonal (exp(-Δτ_step), no cascade re-injection, no e±
+    channel). This validates the per-step stiffness-split absorption
+    bookkeeping against the gammapy-validated opacity, end-to-end through
+    whichever backend ``config.linear_algebra_backend`` selects (the cupy
+    path runs the EM step on device — the historical host-array crash).
+    """
     from scipy.integrate import trapezoid as trapz
 
     from prince_cr.cascade.opacity import _kernel_per_length
@@ -83,12 +100,10 @@ def test_em_absorption_in_transport(em_run):
     mu = np.linspace(-1, 1, 128)
     zz = np.linspace(0, z_s, 600)
     c = PRINCE_UNITS.c
+    kern = lambda Ei, z: _kernel_per_length(Ei, z, run.photon_field, eps, mu)
     tau = np.array(
         [
-            trapz(
-                [_kernel_per_length(Ei, z, run.photon_field, eps, mu) * c / ((1 + z) * H(z)) for z in zz],
-                zz,
-            )
+            trapz([kern(Ei, z) * c / ((1 + z) * H(z)) for z in zz], zz)
             for Ei in E
         ]
     )
@@ -103,6 +118,16 @@ def test_em_absorption_in_transport(em_run):
         enable_injection_jacobian=False,
     )
     solver.recomp_z_threshold = 1e-5
+
+    def escape_only_transfer(z):
+        dl = c * solver._em_dz / ((1 + z) * H(z))  # cm per step
+        dtau = np.array([kern(Ei, z) for Ei in E]) * dl
+        T_gamma = np.diag(np.exp(-dtau))
+        return T_gamma, np.zeros_like(T_gamma)
+
+    solver._em_transfer_at = escape_only_transfer
+    # no nuclei in the initial state → skip the (expensive) BH shape build
+    solver._em_bh_at = lambda z: None
     init = np.zeros(run.dim_states)
     init[g.sl] = 1.0
     solver._init_state = lambda: init.copy()
