@@ -305,13 +305,16 @@ def test_nuebar_from_neutron_via_lambda_off(pf):
     f_trk = state_tracked[trk.sl]
     f_real = _flux(state_tracked, run_t.spec_man, -12)
     assert np.any(f_trk > 0.0), "tracked ν̄_e flux from neutron must be non-zero"
-    # ν̄_e is produced exclusively from free n β-decay in this setup;
-    # tracked-ν̄_e from neutron should match real ν̄_e at the dominant
-    # production bins. Restrict the comparison to bins carrying ≥1 % of
-    # the peak flux — at lower magnitudes ETD2 propagates the tracked /
-    # real rows against different sparse-matrix layouts, so the FP
-    # cancellations in the decay tail oscillate at the rounding floor.
+    # ν̄_e is produced overwhelmingly (not exclusively) from free n β-decay
+    # in this setup: π⁻→μ⁻→ν̄_e chains contribute at the ~0.5% level since
+    # the tabulated-decay bin-average fix (the old point-eval missed the
+    # two-body π→μ rest-frame delta almost entirely, artificially silencing
+    # the muon chain — see wiki lessons/decay-tabulated-point-eval).
+    # Tracked-ν̄_e (parent = n only) must match real ν̄_e at the dominant
+    # production bins up to that contamination. Restrict to bins carrying
+    # ≥10 % of the peak flux — lower bins mix the muon-chain contribution
+    # and ETD2's rounding-floor oscillation in the decay tail.
     peak = np.max(np.abs(f_real))
-    sig = np.abs(f_real) > 1e-2 * peak
+    sig = np.abs(f_real) > 1e-1 * peak
     assert sig.any(), "no significant bins to compare"
-    assert_allclose(f_trk[sig], f_real[sig], atol=0.0, rtol=1e-3)
+    assert_allclose(f_trk[sig], f_real[sig], atol=0.0, rtol=1e-2)

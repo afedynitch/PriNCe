@@ -1486,6 +1486,17 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The Tier-3 runtime regrid R was only ever wired into the scipy/MKL
+        # apply_F closures — the device step body would silently skip it
+        # (γ/e± daughter rows left at cr indices = wrong energies). Refuse
+        # the combination instead; the native coupling (default) needs no R.
+        if self._em_regrid_R is not None:
+            raise NotImplementedError(
+                "The decoupled-grid runtime regrid R is not implemented on "
+                "the cupy backend. Use enable_em_native_coupling=True (the "
+                "default) or a host backend (scipy/MKL) for the legacy R "
+                "path."
+            )
         # cupy persistent device buffers. Allocated once per solve (in
         # :meth:`_ensure_apply_F`) and held for the whole integration so
         # the per-step body is alloc-free — required for kernel fusion

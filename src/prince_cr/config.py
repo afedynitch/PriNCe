@@ -148,8 +148,12 @@ em_grid_bins_dec = 16
 #: per-step R SpMV and the intermediate cr-grid (8/dec) resolution loss on the
 #: EM injection spectra. Requires ``em_grid_bins_dec`` to be an integer
 #: multiple of the nuclear grid's bins/decade (Toeplitz log-shift kernel
-#: construction). Default False until validated against the R path.
-em_native_coupling = False
+#: construction). Default True since the 2026-06-13 validation (0.06% vs the
+#: R path end-to-end, residuals understood — bin-phasing of R's 8/dec smear;
+#: see wiki results/em-native-coupling). The legacy R path remains available
+#: by setting this False, on host backends only (the cupy step body never
+#: implemented R; ETD2SolverCUPY refuses that combination).
+em_native_coupling = True
 #: Photon grid of target field, only for calculation of rates
 photon_grid = (-15, -6, 8)
 
