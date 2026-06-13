@@ -251,11 +251,24 @@ def bh_kernel_cache_clear():
 
 
 def _bh_kernel_cached(E_e, E_p, eps):
+    from prince_cr.cascade.kernels import (
+        kernel_cache_path, kernel_disk_load, kernel_disk_save,
+    )
+
     key = (_grid_key(E_e), _grid_key(E_p), _grid_key(eps))
     K = _BH_KERNEL_CACHE.get(key)
-    if K is None:
-        K = bh_kernel_tensor(E_e, E_p, eps)
-        _BH_KERNEL_CACHE[key] = K
+    if K is not None:
+        return K
+    # Disk cache: the BH kernel is the decisive one to persist (~37 s build,
+    # ~8 MB file). Field-free → reusable across runs/redshifts.
+    path = kernel_cache_path("bh", key)
+    disk = kernel_disk_load(path)
+    if disk is not None:
+        _BH_KERNEL_CACHE[key] = disk[0]
+        return disk[0]
+    K = bh_kernel_tensor(E_e, E_p, eps)
+    kernel_disk_save(path, (K,))
+    _BH_KERNEL_CACHE[key] = K
     return K
 
 

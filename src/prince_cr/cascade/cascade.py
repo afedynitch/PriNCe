@@ -34,6 +34,9 @@ from prince_cr.cascade.kernels import (
     _ic_f,
     ic_emission_spectrum,
     ic_energy_loss_rate,
+    kernel_cache_path,
+    kernel_disk_load,
+    kernel_disk_save,
     pair_injection_spectrum,
 )
 from prince_cr.cascade.opacity import tau_gg
@@ -80,6 +83,11 @@ def _ic_emis_kernel(E_out, E_e, eps):
     cached = _IC_KERNEL_CACHE.get(key)
     if cached is not None:
         return cached
+    path = kernel_cache_path("ic_emis", key)
+    disk = kernel_disk_load(path)
+    if disk is not None:
+        _IC_KERNEL_CACHE[key] = disk
+        return disk
     g = (E_e / M_E)[None, :, None]
     Eo = E_out[:, None, None]
     Ee = E_e[None, :, None]
@@ -91,6 +99,7 @@ def _ic_emis_kernel(E_out, E_e, eps):
         ok = (q >= 1.0 / (4.0 * g**2)) & (q <= 1.0) & (Eo < Ee) & (ep > 0) & (g > 1.0)
         A = np.where(ok, _ic_f(q, Gam) / ep, 0.0) * wln
     pref = np.where((E_e / M_E) > 1.0, _PREF_IC / (E_e / M_E) ** 2, 0.0)
+    kernel_disk_save(path, (A, pref))
     _IC_KERNEL_CACHE[key] = (A, pref)
     return A, pref
 
@@ -103,6 +112,11 @@ def _ic_loss_kernel(E_e, eps, n_E1=400):
     cached = _IC_KERNEL_CACHE.get(key)
     if cached is not None:
         return cached
+    path = kernel_cache_path("ic_loss", key)
+    disk = kernel_disk_load(path)
+    if disk is not None:
+        _IC_KERNEL_CACHE[key] = disk
+        return disk
     n = E_e.size
     lo = np.log10(eps.min())
     E1 = np.empty((n, n_E1))
@@ -119,6 +133,7 @@ def _ic_loss_kernel(E_e, eps, n_E1=400):
         ok = (q >= 1.0 / (4.0 * g**2)) & (q <= 1.0) & (Eo < Ee) & (ep > 0) & (g > 1.0)
         B = np.where(ok, _ic_f(q, Gam) / ep, 0.0) * wln
     pref = np.where((E_e / M_E) > 1.0, _PREF_IC / (E_e / M_E) ** 2, 0.0)
+    kernel_disk_save(path, (B, E1, pref))
     _IC_KERNEL_CACHE[key] = (B, E1, pref)
     return B, E1, pref
 
@@ -130,6 +145,11 @@ def _pair_kernel(E_e, E0, eps):
     cached = _IC_KERNEL_CACHE.get(key)
     if cached is not None:
         return cached
+    path = kernel_cache_path("pair", key)
+    disk = kernel_disk_load(path)
+    if disk is not None:
+        _IC_KERNEL_CACHE[key] = disk
+        return disk
     ge = (E_e / M_E)[:, None, None]
     eg = (E0 / M_E)[None, :, None]
     w = (eps / M_E)[None, None, :]
@@ -146,6 +166,7 @@ def _pair_kernel(E_e, E0, eps):
         ok = valid & (w > wmin) & (r < 1.0)
         A = np.where(ok, F / (w**2) / M_E, 0.0) * wln
     pref = _PREF_IC / (E0 / M_E) ** 3
+    kernel_disk_save(path, (A, pref))
     _IC_KERNEL_CACHE[key] = (A, pref)
     return A, pref
 
@@ -290,25 +311,20 @@ def _ic_single_scatter_matrices(E, eps, n_eps):
     # the two bracketing bins (conserves both electron NUMBER and ENERGY; a
     # plain interpolation leaks ~8% per scatter near E_e'~E[j] where the log
     # grid is coarse).
+    # Vectorized CIC scatter (was an O(n²) Python double loop): weight
+    # W[k,j]=Sg[k,j]·dE_k recoils to E_e'=E[j]-E[k], split between the two
+    # bracketing bins. searchsorted + np.add.at reproduce the loop deposit.
     De = np.zeros((n, n))
-    logE = np.log(E)
-    for j in range(n):
-        if R[j] <= 0:
-            continue
-        for k in range(n):
-            w = Sg[k, j] * dE[k]
-            if w <= 0:
-                continue
-            Eep = E[j] - E[k]                     # degraded electron energy
-            if Eep <= E[0]:
-                continue
-            b = int(np.searchsorted(E, Eep) - 1)
-            b = min(max(b, 0), n - 2)
-            # linear CIC: f*E[b] + (1-f)*E[b+1] = Eep  -> conserves number AND energy
-            f = (E[b + 1] - Eep) / (E[b + 1] - E[b])
-            f = min(max(f, 0.0), 1.0)
-            De[b, j] += w * f / dE[b]
-            De[b + 1, j] += w * (1.0 - f) / dE[b + 1]
+    W = Sg * dE[:, None]                          # W[k,j]
+    Eep = E[None, :] - E[:, None]                 # Eep[k,j] = E[j] - E[k]
+    valid = (R[None, :] > 0.0) & (W > 0.0) & (Eep > E[0])
+    if valid.any():
+        b = np.clip(np.searchsorted(E, Eep.ravel()) - 1, 0, n - 2).reshape(n, n)
+        f = np.clip((E[b + 1] - Eep) / (E[b + 1] - E[b]), 0.0, 1.0)
+        cols = np.broadcast_to(np.arange(n)[None, :], (n, n))
+        vb, vc, vf, vw = b[valid], cols[valid], f[valid], W[valid]
+        np.add.at(De, (vb, vc), vw * vf / dE[vb])
+        np.add.at(De, (vb + 1, vc), vw * (1.0 - vf) / dE[vb + 1])
     return Sg, De, R
 
 
@@ -430,17 +446,29 @@ def cooled_ic_photon_matrix(E_gamma, E_e_grid, eps, n_eps):
     # contracted with n_eps); bit-exact vs the per-column scalar builders.
     loss = _ic_loss_vector(E_e_grid, eps, n_eps)
     emis = _ic_emission_matrix(E_gamma, E_e_grid, eps, n_eps)   # (ng, ne)
+    # Cooling integral M[i,j] = ∫_{E_gamma_i}^{E_e_j} emis(E_gamma_i, E')/loss(E') dE'.
+    # When the photon grid IS the electron/cooling grid (the only call pattern),
+    # this is a cumulative trapezoid of g[i,:]=emis[i,:]/loss along the cooling
+    # axis: M[i,j] = Cum[i,j] − Cum[i,i] for j≥i, 0 otherwise — replacing the
+    # O(n²) Python double loop. γ=1 clamp: loss≤0 (electrons at/below m_e) →
+    # g=0 there (keeps 1/loss finite), matching the scalar mask except at the
+    # m_e floor bin where the cooling integrand is negligible.
+    if ng == ne and np.array_equal(E_gamma, E_e_grid):
+        from scipy.integrate import cumulative_trapezoid
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g = np.where(loss[None, :] > 0.0,
+                         emis / np.where(loss > 0.0, loss, 1.0)[None, :], 0.0)
+        Cum = cumulative_trapezoid(g, E_e_grid, axis=1, initial=0.0)
+        M = Cum - Cum[np.arange(ng), np.arange(ng)][:, None]
+        upper = np.arange(ne)[None, :] >= np.arange(ng)[:, None]
+        return np.where(upper, M, 0.0)
+    # General-grid fallback (not used by the cascade; kept for completeness).
     M = np.zeros((ng, ne))
     for j in range(ne):
-        # integrate emission(E_gamma, E') / loss(E') over E' from E_gamma up to E_e[j]
         for i in range(ng):
-            # γ=1 clamp: electrons at/below m_e have loss<=0 (ic_energy_loss_rate
-            # returns 0 there); mask them out of the cooling integral so the
-            # 1/loss division stays finite (no NaN when the grid reaches m_e).
             sel = (E_e_grid >= E_gamma[i]) & (E_e_grid <= E_e_grid[j]) & (loss > 0)
             if np.count_nonzero(sel) >= 2:
-                integrand = emis[i, sel] / loss[sel]
-                M[i, j] = trapz(integrand, E_e_grid[sel])
+                M[i, j] = trapz(emis[i, sel] / loss[sel], E_e_grid[sel])
     return M
 
 

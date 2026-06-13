@@ -154,6 +154,15 @@ em_grid_bins_dec = 16
 #: by setting this False, on host backends only (the cupy step body never
 #: implemented R; ETD2SolverCUPY refuses that combination).
 em_native_coupling = True
+#: Disk cache directory for the field-free EM-cascade kernels (IC emission /
+#: energy-loss / γγ pair / Bethe-Heitler). These cross-section kernels depend
+#: only on the energy grids (NOT the photon field or redshift), so they can be
+#: built once and reused across runs. When set to a path, the cascade kernel
+#: builders save/load ``<name>_<grid-hash>.npz`` there; ``None`` (default)
+#: keeps the in-memory cache only (kernels rebuilt each process). The
+#: Bethe-Heitler kernel is the decisive one to cache (~37 s build, ~8 MB
+#: file). See methods/em-cascade and runs/2026-06-13_em-cupy-figure-refresh.
+cascade_kernel_cache_dir = None
 #: Photon grid of target field, only for calculation of rates
 photon_grid = (-15, -6, 8)
 

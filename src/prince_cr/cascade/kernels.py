@@ -13,6 +13,9 @@ Each kernel is validated against an analytic limit and/or AM3's `ampy`
 (see runs/2026-06-06_em-cascade-cascade/inputs/validate_kernels.py).
 """
 
+import hashlib
+import os
+
 import numpy as np
 from scipy.integrate import trapezoid as trapz
 
@@ -21,6 +24,42 @@ from prince_cr.data import PRINCE_UNITS
 SIGMA_THOMSON = 8.0 / 3.0 * np.pi * PRINCE_UNITS.r_electron**2  # cm^2
 M_E = PRINCE_UNITS.m_electron  # GeV
 C_CM = PRINCE_UNITS.c  # cm/s
+
+
+# ---------------------------------------------------------------------------
+# Disk cache for the field-free cascade kernels (IC / γγ / Bethe-Heitler).
+# These depend only on the energy grids, so they are reusable across runs;
+# enabled by setting config.cascade_kernel_cache_dir. Stored as an .npz of the
+# kernel's tuple-of-arrays, keyed by a (name, grid-signature) hash.
+# ---------------------------------------------------------------------------
+def kernel_cache_path(name, key):
+    from prince_cr import config
+
+    cdir = getattr(config, "cascade_kernel_cache_dir", None)
+    if not cdir:
+        return None
+    os.makedirs(cdir, exist_ok=True)
+    h = hashlib.md5(repr((name,) + tuple(key)).encode()).hexdigest()[:16]
+    return os.path.join(cdir, "{0}_{1}.npz".format(name, h))
+
+
+def kernel_disk_load(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with np.load(path) as d:
+            return tuple(d["a{0}".format(i)] for i in range(len(d.files)))
+    except Exception:
+        return None
+
+
+def kernel_disk_save(path, arrs):
+    if not path:
+        return
+    try:
+        np.savez(path, **{"a{0}".format(i): np.asarray(a) for i, a in enumerate(arrs)})
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
