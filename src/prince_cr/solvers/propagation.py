@@ -459,39 +459,51 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         raise NotImplementedError
 
     def _em_transfer_at(self, z):
-        """Nearest precomputed cascade transfer T(z). T varies slowly with z,
-        so build it once on a coarse z-grid spanning the solve (decoupling the
-        expensive opacity + IC/pair kernel builds from the per-step cadence) and
-        select the nearest. ~15 builds total instead of one per z-step.
+        """Cascade transfer T(z) (the per-z-step stiffness-split operator,
+        passed ``dz=self._em_dz`` so only the stiff EM part cascades within a
+        step; near-E_abs photons are carried by ETD2 between steps).
 
-        The transfer is the *per-z-step* (stiffness-split) operator: it is
-        passed ``dz=self._em_dz`` so only the stiff EM cascades within a step;
-        the non-stiff near-E_abs photons are carried by ETD2 between steps and
-        pile up at the evolving z→0 horizon (see cascade_transfer_matrix)."""
-        if self._em_T_cache is None:
-            import prince_cr.config as config
-            from prince_cr.cascade.cascade import (
-                cascade_transfer_matrix, kinetic_cascade_transfer,
-            )
-            # kinetic single-scatter cascade by default (fills the E_X..E_abs
-            # plateau; matches Kalashev Fig 2). Legacy cooled path kept via flag.
-            transfer = (
-                kinetic_cascade_transfer
-                if getattr(config, "em_kinetic_cascade", True)
-                else cascade_transfer_matrix
-            )
-            zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
-            # coarse grid even in log(1+z); ~15 nodes
-            zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), 15))
-            field = self.prince_run.photon_field
-            # each entry is (T_gamma, T_electron); dz → per-step stiffness split
-            Ts = [
-                transfer(self._em_E, zz, field, dz=self._em_dz)
-                for zz in zc
-            ]
-            self._em_T_cache = (zc, Ts)
-        zc, Ts = self._em_T_cache
-        return Ts[int(np.argmin(np.abs(zc - z)))]
+        Now that the IC/γγ cross-section kernels are field-free and cached
+        (built once, in-memory + optional disk), building T at the EXACT
+        requested z is just a contraction + vectorized assembly + the cascade
+        iteration. So the default is exact per-z (``config.em_transfer_z_nodes
+        == 0``): T is built at each solver refresh and memoised by z — no
+        coarse-grid interpolation. Set ``em_transfer_z_nodes = N > 0`` to
+        restore the legacy N-node log(1+z) grid + nearest-neighbour select
+        (cheaper, slightly approximate in z)."""
+        import prince_cr.config as config
+        from prince_cr.cascade.cascade import (
+            cascade_transfer_matrix, kinetic_cascade_transfer,
+        )
+        # kinetic single-scatter cascade by default (fills the E_X..E_abs
+        # plateau; matches Kalashev Fig 2). Legacy cooled path kept via flag.
+        transfer = (
+            kinetic_cascade_transfer
+            if getattr(config, "em_kinetic_cascade", True)
+            else cascade_transfer_matrix
+        )
+        field = self.prince_run.photon_field
+        n_nodes = int(getattr(config, "em_transfer_z_nodes", 0))
+
+        if n_nodes > 0:
+            # Legacy coarse-grid interpolation (nearest of N nodes).
+            if not isinstance(self._em_T_cache, tuple):
+                zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
+                zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), n_nodes))
+                Ts = [transfer(self._em_E, zz, field, dz=self._em_dz) for zz in zc]
+                self._em_T_cache = (zc, Ts)
+            zc, Ts = self._em_T_cache
+            return Ts[int(np.argmin(np.abs(zc - z)))]
+
+        # Exact per-z (default): memoise by z so a window's repeated z reuses.
+        if not isinstance(self._em_T_cache, dict):
+            self._em_T_cache = {}
+        key = round(float(z), 7)
+        T = self._em_T_cache.get(key)
+        if T is None:
+            T = transfer(self._em_E, float(z), field, dz=self._em_dz)
+            self._em_T_cache[key] = T
+        return T
 
     def _apply_em_cascade(self, state):
         """Operator-split EM step (co-evolved cascade): reprocess the EM
@@ -520,26 +532,43 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         per-step injection (``_inject_bh_pairs``) rescales each column by the
         proton's actual BH energy-loss rate, so the deposited pair energy equals
         the energy the proton sink removes — exact conservation. Built once on a
-        coarse z-grid (R_BH shape varies slowly; energy is pinned per-z)."""
-        if self._em_bh_cache is None:
-            from prince_cr.cascade.bethe_heitler import bh_pair_shape_matrix
-            zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
-            zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), 8))
-            field = self.prince_run.photon_field
-            # Output e± energies on the EM grid; input proton energies on the
-            # nuclear grid. When the grids coincide (shared-grid path) this is
-            # the original square R_BH; when decoupled R_BH is (d_em, d_cr).
-            E_out = self._em_E
-            E_in = self._em_proton_E
-            eps = np.logspace(-12.5, -7.0, 40)  # CMB+EBL band [GeV]
-            Rs = []
-            for zz in zc:
-                n_eps = np.asarray(field.get_photon_density(eps, zz), dtype="double")
-                n_eps = np.where(np.isfinite(n_eps) & (n_eps > 0), n_eps, 0.0)
-                Rs.append(bh_pair_shape_matrix(E_out, E_in, eps, n_eps))
-            self._em_bh_cache = (zc, Rs)
-        zc, Rs = self._em_bh_cache
-        return Rs[int(np.argmin(np.abs(zc - z)))]
+        the BH cross-section kernel is field-free and cached (built once), the
+        per-z R_BH is just a contraction + the energy-pinning normalization —
+        so the default is exact per-z (``config.em_transfer_z_nodes == 0``),
+        memoised by z. Set ``> 0`` for the legacy N-node nearest select."""
+        import prince_cr.config as config
+        from prince_cr.cascade.bethe_heitler import bh_pair_shape_matrix
+
+        field = self.prince_run.photon_field
+        # Output e± energies on the EM grid; input proton energies on the
+        # nuclear grid. When the grids coincide (shared-grid path) this is the
+        # original square R_BH; when decoupled R_BH is (d_em, d_cr).
+        E_out = self._em_E
+        E_in = self._em_proton_E
+        eps = np.logspace(-12.5, -7.0, 40)  # CMB+EBL band [GeV]
+
+        def _build(zz):
+            n_eps = np.asarray(field.get_photon_density(eps, zz), dtype="double")
+            n_eps = np.where(np.isfinite(n_eps) & (n_eps > 0), n_eps, 0.0)
+            return bh_pair_shape_matrix(E_out, E_in, eps, n_eps)
+
+        n_nodes = int(getattr(config, "em_transfer_z_nodes", 0))
+        if n_nodes > 0:
+            if not isinstance(self._em_bh_cache, tuple):
+                zlo, zhi = sorted((float(self.final_z), float(self.initial_z)))
+                zc = np.expm1(np.linspace(np.log1p(zlo), np.log1p(zhi), n_nodes))
+                self._em_bh_cache = (zc, [_build(zz) for zz in zc])
+            zc, Rs = self._em_bh_cache
+            return Rs[int(np.argmin(np.abs(zc - z)))]
+
+        if not isinstance(self._em_bh_cache, dict):
+            self._em_bh_cache = {}
+        key = round(float(z), 7)
+        R = self._em_bh_cache.get(key)
+        if R is None:
+            R = _build(float(z))
+            self._em_bh_cache[key] = R
+        return R
 
     def _inject_bh_pairs(self, state):
         """Inject Bethe-Heitler e⁺e⁻ into the EM species for this z-step.

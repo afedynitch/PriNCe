@@ -163,6 +163,17 @@ em_native_coupling = True
 #: Bethe-Heitler kernel is the decisive one to cache (~37 s build, ~8 MB
 #: file). See methods/em-cascade and runs/2026-06-13_em-cupy-figure-refresh.
 cascade_kernel_cache_dir = None
+#: Number of redshift nodes for the co-evolved EM-cascade transfer T(z) and the
+#: BH pair-shape R_BH(z). 0 (default) = EXACT per-z: T/R_BH are rebuilt at each
+#: solver refresh (recomp_z_threshold cadence) and memoised by z — no
+#: interpolation in z. This is affordable because the IC/γγ/BH cross-section
+#: kernels are field-free and cached (the per-z cost is a contraction + the
+#: vectorized assembly). Set N > 0 to restore the legacy coarse log(1+z)-grid
+#: nearest-neighbour interpolation with N nodes (cheaper, slightly approximate;
+#: the prior defaults were 15 for T and 8 for R_BH). The exact and 15-node γ
+#: spectra agree to <~1% (T varies slowly with z); use N>0 if the per-refresh
+#: rebuild cost matters more than the residual z-interpolation error.
+em_transfer_z_nodes = 0
 #: Photon grid of target field, only for calculation of rates
 photon_grid = (-15, -6, 8)
 
