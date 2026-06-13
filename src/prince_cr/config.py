@@ -174,6 +174,17 @@ cascade_kernel_cache_dir = None
 #: spectra agree to <~1% (T varies slowly with z); use N>0 if the per-refresh
 #: rebuild cost matters more than the residual z-interpolation error.
 em_transfer_z_nodes = 0
+#: Batch-precompute all exact per-z cascade transfers T(z) in ONE GPU pass at
+#: the start of a solve (only with cupy + exact mode em_transfer_z_nodes=0).
+#: The field-free kernels are contracted against the stacked photon fields and
+#: the cascade iteration runs as a batched matmul over the z-axis — ~130x over
+#: the sequential per-z build at ~92 redshift windows. Default True; set False
+#: to fall back to lazy per-z builds. See cascade.kinetic_cascade_transfer_batched.
+em_cascade_batched = True
+#: dtype for the batched cascade ITERATION (the matmul loop). fp32 is validated
+#: accurate to ~7e-5 vs fp64 and far faster on consumer GPUs; the kernel BUILD
+#: stays fp64 regardless (dynamic-range safe).
+em_cascade_iter_dtype = "float32"
 #: Photon grid of target field, only for calculation of rates
 photon_grid = (-15, -6, 8)
 

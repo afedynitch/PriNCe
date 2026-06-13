@@ -496,6 +496,8 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             return Ts[int(np.argmin(np.abs(zc - z)))]
 
         # Exact per-z (default): memoise by z so a window's repeated z reuses.
+        # A prior _em_batch_precompute may have filled the cache for all the
+        # solve's refresh-z's in one batched GPU pass; otherwise build lazily.
         if not isinstance(self._em_T_cache, dict):
             self._em_T_cache = {}
         key = round(float(z), 7)
@@ -504,6 +506,37 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
             T = transfer(self._em_E, float(z), field, dz=self._em_dz)
             self._em_T_cache[key] = T
         return T
+
+    def _em_refresh_zs(self, z_grid):
+        """The redshifts at which the solver will rebuild the rate caches —
+        z_grid[0], then each z that has moved more than recomp_z_threshold from
+        the last refresh. Mirrors the gating in _operator_at / the graphs loop."""
+        rec = self.recomp_z_threshold
+        zs = []
+        last = None
+        for zz in z_grid:
+            fz = float(zz)
+            if last is None or abs(fz - last) > rec:
+                zs.append(fz)
+                last = fz
+        return zs
+
+    def _em_batch_precompute(self, z_grid):
+        """Batch-build the exact per-z cascade transfers T(z) for every refresh
+        window in one pass (GPU + fp32 iteration) and fill the by-z cache, so
+        the per-window _em_transfer_at calls are lookups. ~130x over the
+        sequential per-z build. Only used on the cupy backend in exact mode."""
+        import prince_cr.config as config
+        from prince_cr.cascade.cascade import kinetic_cascade_transfer_batched
+
+        zs = self._em_refresh_zs(z_grid)
+        if not zs:
+            return
+        Ts = kinetic_cascade_transfer_batched(
+            self._em_E, zs, self.prince_run.photon_field, dz=self._em_dz,
+            iter_dtype=getattr(config, "em_cascade_iter_dtype", "float32"),
+        )
+        self._em_T_cache = {round(z, 7): T for z, T in zip(zs, Ts)}
 
     def _apply_em_cascade(self, state):
         """Operator-split EM step (co-evolved cascade): reprocess the EM
@@ -787,6 +820,19 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         self._em_bh_cache = None
         # Step size for the per-step (stiffness-split) EM cascade transfer.
         self._em_dz = float(abs(dz))
+        # Batch-precompute all exact per-z transfers in one GPU pass (cupy +
+        # exact mode): turns ~N_window sequential cascade builds into one
+        # batched build + matmul. Falls back to lazy per-z if disabled/no GPU.
+        if (self.enable_em_cascade
+                and getattr(config, "em_cascade_batched", True)
+                and getattr(config, "has_cupy", False)
+                and int(getattr(config, "em_transfer_z_nodes", 0)) == 0):
+            try:
+                self._em_batch_precompute(z_grid)
+            except Exception as exc:
+                info(1, "EM batched precompute failed (%s); falling back to "
+                        "lazy per-z." % exc)
+                self._em_T_cache = None
         self._reset_for_solve()
         self._ensure_D_split()
         self._ensure_Lambda_split()
