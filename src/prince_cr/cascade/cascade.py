@@ -30,11 +30,140 @@ from scipy.integrate import trapezoid as trapz
 from prince_cr.cascade.kernels import (
     C_CM,
     M_E,
+    SIGMA_THOMSON,
+    _ic_f,
     ic_emission_spectrum,
     ic_energy_loss_rate,
     pair_injection_spectrum,
 )
 from prince_cr.cascade.opacity import tau_gg
+
+# ---------------------------------------------------------------------------
+# AM3-style photon-field factorization of the IC / γγ kernels.
+#
+# The IC emission, IC energy-loss, and γγ pair cross-section kernels are all
+# field-FREE functions of (energies). The scalar builders above rebuild them
+# per z via Python loops; these cached builders compute the field-free tensor
+# ONCE (vectorized) and the per-z matrices are then a contraction with n(eps)
+# (a matvec) — the same factorization PriNCe uses for the nuclear rates and
+# AM3 for its cascade kernels. Validated bit-exact (≤1.6e-14) against the
+# scalar builders. Cache keyed by the (E_out, E_in, eps) log-grid signature;
+# _em_transfer_at calls these once per z-node with identical grids, so the
+# tensors build once and every z reuses them.
+# ---------------------------------------------------------------------------
+_PREF_IC = 0.75 * SIGMA_THOMSON * C_CM
+_IC_KERNEL_CACHE = {}
+
+
+def cascade_kernel_cache_clear():
+    _IC_KERNEL_CACHE.clear()
+
+
+def _trapz_weights(x):
+    """Per-point weights w with sum(w*y) == trapz(y, x) (exact)."""
+    w = np.empty_like(x)
+    w[1:-1] = (x[2:] - x[:-2]) / 2.0
+    w[0] = (x[1] - x[0]) / 2.0
+    w[-1] = (x[-1] - x[-2]) / 2.0
+    return w
+
+
+def _grid_key(*arrs):
+    return tuple((a.size, float(a[0]), float(a[-1])) for a in arrs)
+
+
+def _ic_emis_kernel(E_out, E_e, eps):
+    """Field-free IC emission kernel A[i,j,k] with emis = pref[j]·(A @ n_eps);
+    A folds the eps trapz weights so the contraction equals the scalar
+    ic_emission_spectrum trapz exactly. Plus the per-column prefactor."""
+    key = ("emis",) + _grid_key(E_out, E_e, eps)
+    cached = _IC_KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    g = (E_e / M_E)[None, :, None]
+    Eo = E_out[:, None, None]
+    Ee = E_e[None, :, None]
+    ep = eps[None, None, :]
+    wln = _trapz_weights(eps)[None, None, :]
+    with np.errstate(all="ignore"):
+        Gam = 4.0 * ep * g / M_E
+        q = Eo / (Gam * (Ee - Eo))
+        ok = (q >= 1.0 / (4.0 * g**2)) & (q <= 1.0) & (Eo < Ee) & (ep > 0) & (g > 1.0)
+        A = np.where(ok, _ic_f(q, Gam) / ep, 0.0) * wln
+    pref = np.where((E_e / M_E) > 1.0, _PREF_IC / (E_e / M_E) ** 2, 0.0)
+    _IC_KERNEL_CACHE[key] = (A, pref)
+    return A, pref
+
+
+def _ic_loss_kernel(E_e, eps, n_E1=400):
+    """Field-free IC emission kernel on the per-E_e loss grid E1_j (logspace to
+    0.9999·E_e[j], n_E1 pts) used by the energy-loss rate. Returns (B[j,m,k],
+    E1[j,m], pref[j]); loss = power_out − rate·eps_mean, both from B @ n_eps."""
+    key = ("loss",) + _grid_key(E_e, eps) + (n_E1,)
+    cached = _IC_KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    n = E_e.size
+    lo = np.log10(eps.min())
+    E1 = np.empty((n, n_E1))
+    for j in range(n):
+        E1[j] = np.logspace(lo, np.log10(0.9999 * E_e[j]), n_E1)
+    g = (E_e / M_E)[:, None, None]
+    Eo = E1[:, :, None]
+    Ee = E_e[:, None, None]
+    ep = eps[None, None, :]
+    wln = _trapz_weights(eps)[None, None, :]
+    with np.errstate(all="ignore"):
+        Gam = 4.0 * ep * g / M_E
+        q = Eo / (Gam * (Ee - Eo))
+        ok = (q >= 1.0 / (4.0 * g**2)) & (q <= 1.0) & (Eo < Ee) & (ep > 0) & (g > 1.0)
+        B = np.where(ok, _ic_f(q, Gam) / ep, 0.0) * wln
+    pref = np.where((E_e / M_E) > 1.0, _PREF_IC / (E_e / M_E) ** 2, 0.0)
+    _IC_KERNEL_CACHE[key] = (B, E1, pref)
+    return B, E1, pref
+
+
+def _pair_kernel(E_e, E0, eps):
+    """Field-free γγ pair-injection kernel A[i,j,k] with P = pref[j]·(A @ n_eps)
+    (eps trapz weights folded in). Replicates pair_injection_spectrum."""
+    key = ("pair",) + _grid_key(E_e, E0, eps)
+    cached = _IC_KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ge = (E_e / M_E)[:, None, None]
+    eg = (E0 / M_E)[None, :, None]
+    w = (eps / M_E)[None, None, :]
+    wln = _trapz_weights(eps)[None, None, :]
+    denom = ge * (eg - ge)
+    valid = (ge > 1.0) & (ge < eg - 1.0) & (denom > 0)
+    with np.errstate(all="ignore"):
+        wmin = eg / (4.0 * denom)
+        r = wmin / w
+        F = (4.0 * eg**2 / denom * np.log(4.0 * w * denom / eg)
+             - 8.0 * eg * w
+             + 2.0 * (2.0 * eg * w - 1.0) * eg**2 / denom
+             - (1.0 - 1.0 / (eg * w)) * eg**4 / denom**2)
+        ok = valid & (w > wmin) & (r < 1.0)
+        A = np.where(ok, F / (w**2) / M_E, 0.0) * wln
+    pref = _PREF_IC / (E0 / M_E) ** 3
+    _IC_KERNEL_CACHE[key] = (A, pref)
+    return A, pref
+
+
+def _ic_emission_matrix(E_out, E_e, eps, n_eps):
+    """emis[i,j] via the cached field-free kernel contracted with n_eps."""
+    A, pref = _ic_emis_kernel(E_out, E_e, eps)
+    return pref[None, :] * np.tensordot(A, n_eps, axes=([2], [0]))
+
+
+def _ic_loss_vector(E_e, eps, n_eps, n_E1=400):
+    """IC energy-loss rate [GeV/s] per E_e via the cached loss kernel."""
+    B, E1, pref = _ic_loss_kernel(E_e, eps, n_E1)
+    dN = pref[:, None] * np.tensordot(B, n_eps, axes=([2], [0]))   # (j, n_E1)
+    power_out = trapz(E1 * dN, E1, axis=1)
+    rate = trapz(dN, E1, axis=1)
+    eps_mean = trapz(eps * n_eps, eps) / trapz(n_eps, eps)
+    return power_out - rate * eps_mean
 
 
 def cascade_transfer_matrix(E, z, photon_field, eps=None, max_generations=40,
@@ -151,9 +280,8 @@ def _ic_single_scatter_matrices(E, eps, n_eps):
     """
     dE = np.gradient(E)
     n = E.size
-    emis = np.zeros((n, n))                       # emis[i,j] = dN/(dt dE_i) for e at E[j]
-    for j, Ej in enumerate(E):
-        emis[:, j] = ic_emission_spectrum(E, Ej, eps, n_eps)
+    # emis[i,j] = dN/(dt dE_i) for e at E[j] — field-factored cached kernel.
+    emis = _ic_emission_matrix(E, E, eps, n_eps)
     R = (emis * dE[:, None]).sum(axis=0)          # scatters/s per electron
     Sg = np.where(R[None, :] > 0, emis / np.where(R > 0, R, 1.0)[None, :], 0.0)
     # Degraded electron: each emitted photon E_gamma=E[k] (number weight
@@ -298,11 +426,10 @@ def cooled_ic_photon_matrix(E_gamma, E_e_grid, eps, n_eps):
     Returns matrix M[i, j] = dN_gamma(E_gamma_i) per electron at E_e_grid[j].
     """
     ne, ng = len(E_e_grid), len(E_gamma)
-    loss = np.array([ic_energy_loss_rate(Ee, eps, n_eps) for Ee in E_e_grid])
-    # emission[i, j] = dN/(dt dE_gamma_i) for electron E_e_grid[j]
-    emis = np.zeros((ng, ne))
-    for j, Ee in enumerate(E_e_grid):
-        emis[:, j] = ic_emission_spectrum(E_gamma, Ee, eps, n_eps)
+    # Field-factored emission matrix + loss vector (cached field-free kernels
+    # contracted with n_eps); bit-exact vs the per-column scalar builders.
+    loss = _ic_loss_vector(E_e_grid, eps, n_eps)
+    emis = _ic_emission_matrix(E_gamma, E_e_grid, eps, n_eps)   # (ng, ne)
     M = np.zeros((ng, ne))
     for j in range(ne):
         # integrate emission(E_gamma, E') / loss(E') over E' from E_gamma up to E_e[j]
@@ -318,11 +445,12 @@ def cooled_ic_photon_matrix(E_gamma, E_e_grid, eps, n_eps):
 
 
 def pair_matrix(E_e, E_gamma_grid, eps, n_eps):
-    """Matrix P[i, j] = dN_e(E_e_i) per photon at E_gamma_grid[j] (e+ + e-)."""
-    P = np.zeros((len(E_e), len(E_gamma_grid)))
-    for j, Eg in enumerate(E_gamma_grid):
-        P[:, j] = pair_injection_spectrum(E_e, Eg, eps, n_eps)
-    return P
+    """Matrix P[i, j] = dN_e(E_e_i) per photon at E_gamma_grid[j] (e+ + e-).
+
+    Field-factored: contracts the cached field-free pair kernel with n_eps
+    (matches the per-column pair_injection_spectrum to ~1.6e-14)."""
+    A, pref = _pair_kernel(E_e, E_gamma_grid, eps)
+    return pref[None, :] * np.tensordot(A, n_eps, axes=([2], [0]))
 
 
 def run_cascade(
