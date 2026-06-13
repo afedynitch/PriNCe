@@ -134,6 +134,131 @@ def kernel_BH_elec(gamma_e, gamma_p, eps_pho, n_bins=5):
     return y * gamma_e / (2.0 * gamma_p ** 3 * eps_pho ** 2)
 
 
+# ---------------------------------------------------------------------------
+# Vectorized kernel (field-free) — AM3-style factorization.
+#
+# kernel_BH_elec(gamma_e, gamma_p, eps) carries NO photon field, so the
+# (gamma_e, gamma_p, eps) kernel tensor is z-INDEPENDENT. The scalar path
+# above rebuilds it inside every per-z bh_pair_shape_matrix call; these
+# vectorized builders compute the whole grid in one numpy pass and a module
+# cache keeps it across z-nodes (the field enters only in the contraction).
+# Validated element-wise against the scalar functions to ~1e-15
+# (runs/2026-06-13_em-cupy-figure-refresh). The scalar functions are kept as
+# the reference implementation.
+# ---------------------------------------------------------------------------
+def _dsigma_BH_vec(k, g, u):
+    """Vectorized :func:`dsigma_BH`. k=eps_pho (ω), g=gamma_e, u=xi — arrays."""
+    REG = 1e-30
+    with np.errstate(all="ignore"):
+        p = np.sqrt(np.maximum(g * g - 1.0, 0.0) + REG)
+        g1 = k - g
+        p1 = np.sqrt(np.maximum(g1 * g1 - 1.0, 0.0) + REG)
+        D = g - u * p
+        T = np.sqrt(np.maximum(k * k + p * p - 2.0 * k * p * u, 0.0))
+        d1T = np.log((T + p1) / np.maximum(T - p1, REG))
+        y1 = np.log(np.maximum((g1 + p1) / np.maximum(g1 - p1, REG), REG)) / np.maximum(p1, REG)
+        Y = 2.0 * np.log(np.maximum((g * g1 + p * p1 + 1.0) / k, REG)) / np.maximum(p * p, REG)
+        A0 = p * p1 / (k * k * k)
+        A1 = -4.0 * (1.0 - u * u) * (2.0 * g * g + 1.0) / np.maximum(p * p * D**4, REG)
+        A2 = (5.0 * g * g - 2.0 * g * g1 + 3.0) / np.maximum(p * p * D * D, REG)
+        A3 = (p * p - k * k) / np.maximum(T * T * D * D, REG)
+        A4 = 2.0 * g1 / np.maximum(p * p * D, REG)
+        A50 = Y / np.maximum(p * p1, REG)
+        A51 = 2.0 * g * (1.0 - u * u) * (3.0 * k + p * p * g1) / np.maximum(D**4, REG)
+        A52 = (2.0 * g * g * (g * g + g1 * g1) - 7.0 * g * g - 3.0 * g * g1
+               - g1 * g1 + 1.0) / np.maximum(D * D, REG)
+        A53 = k * (g * g - g * g1 - 1.0) / np.maximum(D, REG)
+        A6 = -(d1T / np.maximum(p1 * T, REG)) * (2.0 / np.maximum(D * D, REG)
+                                                 - 3.0 * k / np.maximum(D, REG)
+                                                 - k * (p * p - k * k) / np.maximum(T * T * D, REG))
+        A7 = -2.0 * y1 / np.maximum(D, REG)
+        res = A0 * (A1 + A2 + A3 + A4 + A50 * (A51 + A52 + A53) + A6 + A7)
+    ok = (k >= 2.0001) & (k <= 600.0) & (T >= 1e-30)
+    return np.where(ok, res, 0.0)
+
+
+def _bh_inner_vec(gp, ge, omega, eps_e):
+    """Vectorized :func:`_bh_inner`."""
+    REG = 1e-20
+    with np.errstate(all="ignore"):
+        p_ = np.sqrt(np.maximum(eps_e * eps_e - 1.0, 0.0) + REG)
+        xi = (gp * eps_e - ge) / (gp * p_)
+        val = omega * _dsigma_BH_vec(omega, eps_e, xi) / p_
+    ok = (p_ >= REG) & (xi >= -1.0) & (xi <= 1.0) & (eps_e >= 1.0) & (eps_e <= omega - 1.0)
+    return np.where(ok, val, 0.0)
+
+
+def _rk4_vec(node_fn, lo, hi, n_bins=5):
+    """Vectorized RK4 (Simpson-weighted, n_bins) over per-element [lo, hi];
+    replicates the scalar :func:`_rk4_3`/:func:`_rk4_4` accumulation. Zero where
+    hi <= lo."""
+    valid = hi > lo
+    dx = np.where(valid, (hi - lo) / n_bins, 0.0)
+    y = np.zeros_like(lo)
+    x = lo.copy()
+    for _ in range(n_bins):
+        k1 = dx * node_fn(x)
+        k2 = dx * node_fn(x + 0.5 * dx)
+        k4 = dx * node_fn(x + dx)
+        y = y + (k1 + k4) / 6.0 + 2.0 * k2 / 3.0
+        x = x + dx
+    return np.where(valid, y, 0.0)
+
+
+def _bh_outer_vec(gp, ge, omega):
+    """Vectorized :func:`_bh_outer` (inner RK4 over eps_e in [eps_lo, ω-1])."""
+    REG = 1e-5
+    lo = (gp * gp + ge * ge) / (2.0 * gp * ge) + REG
+    hi = omega - 1.0 - REG
+    ok = ((hi - lo) >= -1e-4 * lo) & ((hi - lo) / lo >= 1e-4)
+    lo_e = np.where(ok, lo, 1.0)
+    hi_e = np.where(ok, hi, 0.0)
+    res = _rk4_vec(lambda ee: _bh_inner_vec(gp, ge, omega, ee), lo_e, hi_e)
+    return np.where(ok, res, 0.0)
+
+
+def bh_kernel_tensor(E_e, E_p, eps):
+    """Field-free BH kernel tensor ``K[i, j, k] = kernel_BH_elec(E_e_i, E_p_j,
+    eps_k)`` built in one vectorized pass over the full grid. z-INDEPENDENT."""
+    ge = (E_e / M_E)[:, None, None]
+    gp = (E_p / M_P)[None, :, None]
+    ke = (eps / M_E)[None, None, :]
+    GE, GP, KE = np.broadcast_arrays(ge, gp, ke)
+    upper = 2.0 * GP * KE
+    lower = (GP + GE) ** 2 / (2.0 * GP * GE)
+    ok = (upper - lower) / np.maximum(lower, 1e-30) >= 1e-8
+    lo = np.where(ok, lower, 1.0)
+    hi = np.where(ok, upper, 0.0)
+    y = _rk4_vec(lambda om: _bh_outer_vec(GP, GE, om), lo, hi)
+    K = y * GE / (2.0 * GP**3 * KE**2)
+    return np.where(ok, K, 0.0)
+
+
+# Module cache for the field-free kernel tensor, keyed by the log-grid
+# signature (shape + endpoints). _em_bh_at calls bh_pair_shape_matrix once per
+# z-node with the same E_e/E_p/eps grids, so the kernel builds once and every
+# subsequent z reuses it. Clear with bh_kernel_cache_clear().
+_BH_KERNEL_CACHE = {}
+
+
+def _grid_key(a):
+    a = np.asarray(a)
+    return (a.size, float(a[0]), float(a[-1]))
+
+
+def bh_kernel_cache_clear():
+    _BH_KERNEL_CACHE.clear()
+
+
+def _bh_kernel_cached(E_e, E_p, eps):
+    key = (_grid_key(E_e), _grid_key(E_p), _grid_key(eps))
+    K = _BH_KERNEL_CACHE.get(key)
+    if K is None:
+        K = bh_kernel_tensor(E_e, E_p, eps)
+        _BH_KERNEL_CACHE[key] = K
+    return K
+
+
 def bh_pair_shape_matrix(E_e, E_p, eps, n_eps, e_p_min=1e5):
     """Energy-normalized BH e± injection shape ``R[i, j]`` [1/GeV] per proton.
 
@@ -154,35 +279,25 @@ def bh_pair_shape_matrix(E_e, E_p, eps, n_eps, e_p_min=1e5):
         ndarray (len(E_e), len(E_p)): R[i, j] [1/GeV], energy-normalized columns
         (all-zero columns where BH is kinematically inactive).
     """
-    ge = E_e / M_E              # lepton γ grid  (γ_e = E_e/m_e)
-    gp = E_p / M_P              # proton γ grid  (γ_p = E_p/m_p — NOT m_e!)
-    ke = eps / M_E             # LAB photon energy in m_e units (≪1 for CMB/EBL)
     ln_eps = np.log(eps)
-    # kernel_BH_elec takes the LAB photon energy and boosts internally; the
-    # rest-frame threshold ω=2γ_pε>2 (and the Born cap ω<600) are enforced
-    # inside dsigma_BH. So include every populated photon bin; per-(γ_p) the
-    # threshold ε>1/γ_p makes the kernel return 0 below it.
+    # Field-free kernel tensor K[i, j, k] = kernel_BH_elec(E_e_i, E_p_j, eps_k),
+    # built once (vectorized) and cached across z-nodes — the photon field is
+    # NOT in K (AM3-style factorization). The rest-frame threshold ω=2γ_pε>2
+    # and the Born cap ω<600 are enforced inside the kernel; per-(γ_p) the
+    # ε>1/γ_p threshold makes K vanish below it.
     ok_eps = (n_eps > 0) & (eps > 0)
     R = np.zeros((E_e.size, E_p.size))
-    eidx = np.nonzero(ok_eps)[0]
-    if not eidx.size:
+    if not np.any(ok_eps):
         return R
-    n_eps_ok = n_eps[eidx]
-    eps_ok = eps[eidx]
-    ke_ok = ke[eidx]
-    ln_eps_ok = ln_eps[eidx]
-    for j, gpj in enumerate(gp):
-        if E_p[j] < e_p_min:
-            continue
-        # e± kinematically capped at the proton energy; the kernel is zero for
-        # E_e ≳ E_p and far below the γ_e~γ_p peak. Restrict the E_e band.
-        ei = np.nonzero((E_e <= E_p[j]) & (E_e > 1e-6 * E_p[j]))[0]
-        col = np.zeros(E_e.size)
-        for i in ei:
-            gei = ge[i]
-            integ = np.array([kernel_BH_elec(gei, gpj, kk) for kk in ke_ok])
-            col[i] = trapz(integ * n_eps_ok * eps_ok, ln_eps_ok)
-        e_carried = 2.0 * trapz(E_e * col, E_e)  # pair energy (both signs)
-        if e_carried > 0:
-            R[:, j] = col * (E_p[j] / e_carried)
+    K = _bh_kernel_cached(E_e, E_p, eps)        # (n_Ee, n_Ep, n_eps), z-independent
+    # col[i, j] = ∫ K[i,j,·] n(ε) ε d(ln ε)  — the only z-dependent step (matvec).
+    wln = (n_eps * eps)[None, None, :]
+    col = trapz((K * wln)[:, :, ok_eps], ln_eps[ok_eps], axis=2)   # (n_Ee, n_Ep)
+    # E_e band (e± capped at E_p; kernel ~0 far below the γ_e~γ_p peak) + e_p_min
+    band = (E_e[:, None] <= E_p[None, :]) & (E_e[:, None] > 1e-6 * E_p[None, :])
+    col = np.where(band & (E_p[None, :] >= e_p_min), col, 0.0)
+    # per-column energy normalization: 2·∫E_e col dE_e = E_p (pair, both signs)
+    e_carried = 2.0 * trapz(E_e[:, None] * col, E_e, axis=0)       # (n_Ep,)
+    good = e_carried > 0
+    R[:, good] = col[:, good] * (E_p[good] / e_carried[good])[None, :]
     return R
