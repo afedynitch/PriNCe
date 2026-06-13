@@ -314,3 +314,38 @@ def bh_pair_shape_matrix(E_e, E_p, eps, n_eps, e_p_min=1e5):
     good = e_carried > 0
     R[:, good] = col[:, good] * (E_p[good] / e_carried[good])[None, :]
     return R
+
+
+def bh_pair_shape_matrix_batched(E_e, E_p, eps, n_eps_stack, e_p_min=1e5, xp=None):
+    """Batched :func:`bh_pair_shape_matrix` over a stack of photon fields.
+
+    ``n_eps_stack`` is ``(n_eps, Nz)``. Returns ``R`` of shape ``(Nz, n_Ee,
+    n_Ep)`` — the energy-normalized BH e± shape at each redshift, built in one
+    pass: the cached field-free kernel is contracted against the stacked fields
+    (one einsum) and the per-(column, z) energy normalization is vectorized.
+    Reproduces the per-z function to fp. ``xp`` = numpy (default) or cupy."""
+    if xp is None:
+        xp = np
+    K = _bh_kernel_cached(E_e, E_p, eps)            # (i, j, k) field-free
+    # ln-eps trapezoid weights (sum w*y == trapz(y, ln eps)); fold in eps so the
+    # contraction equals trapz(K n(eps) eps, ln eps).
+    ln_eps = np.log(eps)
+    w = np.empty_like(ln_eps)
+    w[1:-1] = (ln_eps[2:] - ln_eps[:-2]) / 2.0
+    w[0] = (ln_eps[1] - ln_eps[0]) / 2.0
+    w[-1] = (ln_eps[-1] - ln_eps[-2]) / 2.0
+    Kw = xp.asarray(K * (eps * w)[None, None, :])
+    N = xp.asarray(n_eps_stack)
+    Ee = xp.asarray(E_e); Ep = xp.asarray(E_p)
+    col = xp.einsum('ijk,kz->zij', Kw, N)           # (Nz, i, j)
+    band = (Ee[:, None] <= Ep[None, :]) & (Ee[:, None] > 1e-6 * Ep[None, :]) \
+        & (Ep[None, :] >= e_p_min)
+    col = xp.where(band[None], col, 0.0)
+    # e_carried[z,j] = 2 ∫ E_e col dE_e  (trapz over the i / E_e axis)
+    y = Ee[None, :, None] * col
+    e_carried = 2.0 * xp.sum((y[:, 1:, :] + y[:, :-1, :])
+                             * (Ee[1:] - Ee[:-1])[None, :, None] / 2.0, axis=1)
+    R = xp.where(e_carried[:, None, :] > 0,
+                 col * (Ep[None, None, :] / xp.where(e_carried > 0, e_carried, 1.0)[:, None, :]),
+                 0.0)
+    return R

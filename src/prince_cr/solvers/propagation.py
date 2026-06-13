@@ -532,11 +532,25 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         zs = self._em_refresh_zs(z_grid)
         if not zs:
             return
+        field = self.prince_run.photon_field
         Ts = kinetic_cascade_transfer_batched(
-            self._em_E, zs, self.prince_run.photon_field, dz=self._em_dz,
+            self._em_E, zs, field, dz=self._em_dz,
             iter_dtype=getattr(config, "em_cascade_iter_dtype", "float32"),
         )
         self._em_T_cache = {round(z, 7): T for z, T in zip(zs, Ts)}
+
+        # Batch R_BH(z) the same way (contraction of the cached field-free BH
+        # kernel against the stacked fields), so _em_bh_at is a lookup too.
+        if self._em_bh_species:
+            from prince_cr.cascade.bethe_heitler import bh_pair_shape_matrix_batched
+            eps_bh = np.logspace(-12.5, -7.0, 40)
+            Nbh = np.empty((eps_bh.size, len(zs)))
+            for zi, zz in enumerate(zs):
+                ne = np.asarray(field.get_photon_density(eps_bh, zz), dtype="double")
+                Nbh[:, zi] = np.where(np.isfinite(ne) & (ne > 0), ne, 0.0)
+            Rs = bh_pair_shape_matrix_batched(self._em_E, self._em_proton_E, eps_bh, Nbh)
+            Rs = np.asarray(Rs)
+            self._em_bh_cache = {round(z, 7): Rs[zi] for zi, z in enumerate(zs)}
 
     def _apply_em_cascade(self, state):
         """Operator-split EM step (co-evolved cascade): reprocess the EM
