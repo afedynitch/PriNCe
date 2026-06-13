@@ -647,13 +647,19 @@ class UHECRPropagationSolverETD2(UHECRPropagationSolver):
         loss_full = self.pair_loss_rates_grid.loss_vector(z)             # GeV/cm, dim_states
         dl_step = PRINCE_UNITS.c * abs(self._em_dz) / ((1.0 + z) * H(z))  # cm
         # Accumulate the per-nucleon e± source over all charged species.
-        # column weight_s = A·(energy lost per nucleon this step)/E_cr · n_s
-        w = np.zeros_like(E_p)
+        # column weight_s = A·(energy lost per nucleon this step)/E_cr · n_s.
+        # ``state[sl]`` is (n_cr,) for a single RHS or (n_cr, K) for multi-RHS;
+        # the per-energy coefficient broadcasts along axis 0 in both cases.
+        w = None
         with np.errstate(divide="ignore", invalid="ignore"):
             inv_E = np.where(E_p > 0, 1.0 / E_p, 0.0)
             for sl, A in self._em_bh_species:
                 n_s = np.asarray(state[sl], dtype="double")
-                w += A * loss_full[sl] * dl_step * inv_E * n_s * dE
+                cw = A * loss_full[sl] * dl_step * inv_E * dE      # (n_cr,)
+                if n_s.ndim == 2:
+                    cw = cw[:, None]
+                term = cw * n_s
+                w = term if w is None else w + term
         e_src = self._em_bh @ w  # dN/dE_e per lepton sign (on the EM grid)
         for sl in self._em_lep_sl:
             state[sl] = state[sl] + e_src
@@ -1799,9 +1805,11 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
             return
         w = None
         for sl, coeff in self._em_bh_coeff_dev:
-            term = coeff * state[sl]
+            n_s = state[sl]                         # (n_cr,) or (n_cr, K) multi-RHS
+            c = coeff[:, None] if n_s.ndim == 2 else coeff
+            term = c * n_s
             w = term if w is None else w + term
-        e_src = self._em_bh_dev @ w
+        e_src = self._em_bh_dev @ w                 # (n_em,) or (n_em, K)
         for sl in self._em_lep_sl:
             state[sl] = state[sl] + e_src
 
