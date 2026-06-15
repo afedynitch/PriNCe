@@ -175,6 +175,50 @@ class SingleZoneSolver:
         j = P0 * (Fx * (n_e * self.dg)[None, :]).sum(axis=1)      # (Nnu,)
         return nu, j
 
+    # --- inverse-Compton emission SED (it4c: the Compton hump, with KN) ---
+    def ic_sed(self, n_e, eps_t, n_ph_t, eps_out):
+        """Isotropic inverse-Compton photon production spectrum
+        Q_IC(ε1) [photons cm^-3 s^-1 erg^-1] from electrons ``n_e`` (per γ, on
+        self.g) up-scattering a target photon field (``eps_t`` [erg],
+        ``n_ph_t`` [cm^-3 erg^-1]) onto output energies ``eps_out`` [erg].
+
+        Full Jones(1968)/Blumenthal-Gould(1970) kernel (includes Klein-Nishina):
+            dN/dt/dε1 = (3 σ_T c)/(4 γ²) (n_ph(ε)/ε) G(q,Γ),
+            Γ = 4 ε γ / (m_e c²),  q = ε1 / (Γ (γ m_e c² − ε1)),
+            G = 2q ln q + (1+2q)(1−q) + ½(Γq)²(1−q)/(1+Γq),  1/(4γ²) ≤ q ≤ 1.
+        """
+        g = self.g
+        gm = g * _ME_C2_ERG                                   # electron energy [erg]
+        # broadcast (out, γ, target): keep grids modest for the triple loop
+        e1 = np.asarray(eps_out)[:, None, None]
+        gg = g[None, :, None]
+        gmc = gm[None, :, None]
+        et = np.asarray(eps_t)[None, None, :]
+        nph = np.asarray(n_ph_t)[None, None, :]
+        Gam = 4.0 * et * gg / _ME_C2_ERG
+        denom = Gam * (gmc - e1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            q = e1 / denom
+            G = (2.0 * q * np.log(np.clip(q, 1e-300, None)) + (1.0 + 2.0 * q) * (1.0 - q)
+                 + 0.5 * (Gam * q) ** 2 * (1.0 - q) / (1.0 + Gam * q))
+            kern = (3.0 * _SIGMA_T * _C) / (4.0 * gg ** 2) * (nph / et) * G
+        valid = (q > 1.0 / (4.0 * gg ** 2)) & (q <= 1.0) & (e1 < gmc) & np.isfinite(kern)
+        kern = np.where(valid, kern, 0.0)
+        # integrate over target ε (axis 2) then over γ (axis 1)
+        de_t = np.gradient(np.asarray(eps_t))
+        dg = self.dg
+        per_gamma = np.sum(kern * de_t[None, None, :], axis=2)        # (out, γ)
+        Q = np.sum(per_gamma * (n_e * dg)[None, :], axis=1)           # (out,)
+        return Q
+
+    def synchrotron_photon_density(self, n_e, R_cm, nu=None):
+        """Synchrotron photon NUMBER density n_ph(ε) [cm^-3 erg^-1] and ε [erg]
+        in the zone (residence ~R/c): n_ph(ε) = (R/c) j(ν)/(hν) / h."""
+        nu, j = self.synchrotron_sed(n_e, nu)
+        eps = _H_ERG_S * nu                                  # erg
+        n_ph = (R_cm / _C) * j / (_H_ERG_S * nu) / _H_ERG_S  # cm^-3 erg^-1
+        return eps, n_ph
+
     def synchrotron_energy_density(self, n_e, R_cm):
         """Synchrotron photon energy density in the zone [erg/cm^3].
 

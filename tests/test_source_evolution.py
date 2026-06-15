@@ -89,6 +89,40 @@ def test_ssc_fixed_point_self_consistent():
     assert np.sum((n_ssc * sz.dg)[hi]) < np.sum((n_ref * sz.dg)[hi])  # IC drains
 
 
+def test_ic_thomson_slope_and_kn_suppression():
+    """IC photon-number spectrum: Thomson slope -(q+1)/2; KN steepens it."""
+    _EV = 1.602176634e-12
+    q = 2.5
+    sz = SingleZoneSolver(gamma_lo=1.0, gamma_hi=1e5, n_bins=256, B_Gauss=1.0)
+    n_e = np.where((sz.g >= 1e2) & (sz.g <= 1e4), sz.g ** (-q), 0.0)
+
+    def target(eps0):
+        eps = np.logspace(np.log10(eps0) - 0.6, np.log10(eps0) + 0.6, 81)
+        nph = np.exp(-0.5 * ((np.log(eps) - np.log(eps0)) / (0.05 * np.log(10))) ** 2)
+        return eps, nph
+
+    def sed_slope(eps_out, Q, lo, hi):
+        m = (eps_out > lo) & (eps_out < hi) & (Q > 0)
+        return np.polyfit(np.log(eps_out[m]), np.log(Q[m]), 1)[0]
+
+    # Thomson: 1 eV target
+    e0 = 1.0 * _EV
+    et, nph = target(e0)
+    eo = np.logspace(np.log10(e0 * 3), np.log10(e0 * 1e4 ** 2 * 3), 90)
+    Q = sz.ic_sed(n_e, et, nph, eo)
+    assert np.all(Q >= 0)
+    sl = sed_slope(eo, Q, e0 * 1e2 ** 2 * 5, e0 * 1e4 ** 2 / 5)
+    assert abs(sl - (-(q + 1) / 2)) < 0.1                 # -(q+1)/2 = -1.75
+
+    # KN: 10 keV target -> Γ(γ_max)~780 -> steeper
+    e0k = e0 * 1e4
+    etk, nphk = target(e0k)
+    eok = np.logspace(np.log10(e0k * 3), np.log10(e0k * 1e4 ** 2 * 3), 90)
+    Qk = sz.ic_sed(n_e, etk, nphk, eok)
+    slk = sed_slope(eok, Qk, e0k * 1e2 ** 2 * 2, e0k * 1e4 ** 2 / 5)
+    assert slk < sl                                       # KN suppresses high-E
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
