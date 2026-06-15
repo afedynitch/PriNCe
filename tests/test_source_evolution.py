@@ -51,6 +51,44 @@ def test_escape_steepens_below_cooling_break():
     assert np.all(np.isfinite(n))
 
 
+def test_synchrotron_function_peak():
+    """The synchrotron function F(x) peaks at ≈0.918 near x≈0.29 (textbook)."""
+    from prince_cr.source.evolution import synchrotron_F
+    x = np.logspace(-4, 1, 4000)
+    F = synchrotron_F(x)
+    assert abs(np.max(F) - 0.9180) < 0.01
+    assert abs(x[np.argmax(F)] - 0.29) < 0.03
+
+
+def test_synchrotron_sed_slope():
+    """Power-law electrons γ^-q ⇒ synchrotron j(ν) ∝ ν^-(q-1)/2 in the band."""
+    q = 2.5
+    sz = SingleZoneSolver(gamma_lo=1.0, gamma_hi=1e8, n_bins=512, B_Gauss=1.0)
+    n_e = np.where((sz.g >= 1e2) & (sz.g <= 1e6), sz.g ** (-q), 0.0)
+    nu, j = sz.synchrotron_sed(n_e)
+    nu_c1, nu_c2 = float(sz.nu_c(1e2)), float(sz.nu_c(1e6))
+    m = (nu > nu_c1 * 30) & (nu < nu_c2 / 30) & (j > 0)
+    sl = np.polyfit(np.log(nu[m]), np.log(j[m]), 1)[0]
+    assert abs(sl - (-(q - 1) / 2)) < 0.05
+
+
+def test_ssc_fixed_point_self_consistent():
+    """SSC fixed point converges, is self-consistent, and IC feedback drains
+    the high-γ electrons (extra cooling)."""
+    R = 1e16
+    sz = SingleZoneSolver(gamma_lo=1.0, gamma_hi=1e7, n_bins=512, B_Gauss=1.0,
+                          t_esc_s=R / 2.99792458e10)
+    Q = sz.injection_powerlaw(Q0=1e-2, p=2.2, gamma_min=1e3, gamma_max=1e6)
+    sz.set_ic_target(0.0)
+    n_ref = sz.steady_state(Q)
+    n_ssc, info = sz.solve_ssc(Q, R_cm=R, tol=1e-5)
+    assert info["converged"]
+    u_check = sz.synchrotron_energy_density(n_ssc, R)
+    assert abs(u_check - info["u_syn"]) / info["u_syn"] < 1e-4
+    hi = sz.g > 1e5
+    assert np.sum((n_ssc * sz.dg)[hi]) < np.sum((n_ref * sz.dg)[hi])  # IC drains
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

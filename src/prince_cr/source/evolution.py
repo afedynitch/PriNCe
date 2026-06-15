@@ -27,12 +27,39 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import expm_multiply, spsolve
+from scipy.special import kv
 
 # --- physical constants (CGS) ---
 _SIGMA_T = 6.6524587321e-25      # cm^2
 _C = 2.99792458e10               # cm/s
 _ME_C2_ERG = 8.1871057769e-7     # m_e c^2 in erg
 _ME_G = 9.1093837015e-28         # g
+_E_ESU = 4.80320471e-10          # elementary charge (esu)
+_H_ERG_S = 6.62607015e-27        # Planck (erg s)
+_NU_B_PER_G = _E_ESU / (2.0 * np.pi * _ME_G * _C)   # ν_B / B  [Hz/Gauss]
+
+
+def _build_fsync_table(n_t=4000, x_lo=1e-5, x_hi=60.0):
+    """Tabulate the synchrotron function F(x) = x ∫_x^∞ K_{5/3}(t) dt."""
+    t = np.logspace(np.log10(x_lo), np.log10(x_hi), n_t)
+    k = kv(5.0 / 3.0, t)
+    dI = 0.5 * (k[1:] + k[:-1]) * np.diff(t)          # trapz per interval
+    tail = np.concatenate([np.cumsum(dI[::-1])[::-1], [0.0]])  # ∫_{t_i}^∞ K dt
+    return t, np.maximum(t * tail, 1e-300)            # x grid, F(x) (floored >0)
+
+
+_FSYNC_X, _FSYNC_F = _build_fsync_table()
+
+
+def synchrotron_F(x):
+    """F(x) via log-interp of the K_{5/3} table; F≈2.149 x^{1/3} (x≪1), 0 (x≫1)."""
+    x = np.asarray(x, dtype=float)
+    out = np.zeros_like(x)
+    m = (x > _FSYNC_X[0]) & (x < _FSYNC_X[-1])
+    out[m] = np.exp(np.interp(np.log(x[m]), np.log(_FSYNC_X), np.log(_FSYNC_F)))
+    lo = x <= _FSYNC_X[0]
+    out[lo] = 2.1495282 * x[lo] ** (1.0 / 3.0)        # small-x asymptote
+    return out
 
 
 def _trapz_grid(n_bins, lo, hi):
@@ -119,6 +146,76 @@ class SingleZoneSolver:
         Q = np.where((self.g >= gamma_min) & (self.g <= gamma_max),
                      Q0 * self.g ** (-p), 0.0)
         return Q
+
+    # --- synchrotron emission (it4: gap item 1) ---
+    def nu_c(self, gamma):
+        """Synchrotron critical frequency ν_c(γ) = (3/2) γ² ν_B  [Hz] (sinα=1)."""
+        return 1.5 * np.asarray(gamma) ** 2 * (_NU_B_PER_G * self.B)
+
+    def synchrotron_sed(self, n_e, nu=None):
+        """Volume synchrotron emissivity j(ν) [erg s^-1 cm^-3 Hz^-1] from the
+        electron spectrum ``n_e`` (per unit γ, cm^-3, on self.g).
+
+            j(ν) = ∫ dγ n(γ) P(ν,γ),
+            P(ν,γ) = (√3 e³ B / m_e c²) F(ν/ν_c(γ)).
+
+        Returns (nu, j). If ``nu`` is None a log grid spanning the band is used.
+        """
+        n_e = np.asarray(n_e, dtype=float)
+        if nu is None:
+            nu_lo = float(self.nu_c(self.g[0])) * 1e-3
+            nu_hi = float(self.nu_c(self.g[-1])) * 10.0
+            nu = np.logspace(np.log10(nu_lo), np.log10(nu_hi), 256)
+        nu = np.asarray(nu, dtype=float)
+        P0 = np.sqrt(3.0) * _E_ESU ** 3 * self.B / _ME_C2_ERG     # erg/s/Hz prefactor
+        nuc = self.nu_c(self.g)                                   # (Ng,)
+        x = nu[:, None] / nuc[None, :]                            # (Nnu, Ng)
+        Fx = synchrotron_F(x)
+        # ∫ dγ  ->  sum over cells with width dg
+        j = P0 * (Fx * (n_e * self.dg)[None, :]).sum(axis=1)      # (Nnu,)
+        return nu, j
+
+    def synchrotron_energy_density(self, n_e, R_cm):
+        """Synchrotron photon energy density in the zone [erg/cm^3].
+
+        U_syn ≈ (R/c) ∫ j(ν) dν  (photon residence time ~ R/c for a zone of
+        size R; the standard one-zone estimate)."""
+        nu, j = self.synchrotron_sed(n_e)
+        L_vol = float(np.trapezoid(j, nu))           # erg s^-1 cm^-3
+        return (R_cm / _C) * L_vol
+
+    def set_ic_target(self, u_rad_erg_cm3):
+        """Set/replace the (Thomson) IC target radiation energy density."""
+        self.u_rad = u_rad_erg_cm3
+        self._beta_ic = (4.0 / 3.0) * _SIGMA_T * _C * u_rad_erg_cm3 / _ME_C2_ERG
+
+    @property
+    def u_B(self):
+        return self.B ** 2 / (8.0 * np.pi)
+
+    def solve_ssc(self, Q, R_cm, tol=1e-4, max_iter=60, relax=0.5):
+        """Self-consistent synchrotron-self-Compton fixed point.
+
+        Iterate: electrons (steady state under syn+IC cooling) → synchrotron
+        U_syn → IC cooling → … until U_syn converges. IC is Thomson here
+        (KN refinement is it4c). Returns (n_e, info)."""
+        u = 0.0
+        hist = []
+        for it in range(max_iter):
+            self.set_ic_target(u)
+            n_e = self.steady_state(Q)
+            u_new = self.synchrotron_energy_density(n_e, R_cm)
+            hist.append(u_new)
+            denom = max(u_new, 1e-300)
+            if abs(u_new - u) < tol * denom:
+                u = u_new
+                self.set_ic_target(u)
+                n_e = self.steady_state(Q)
+                return n_e, {"u_syn": u, "iters": it + 1, "converged": True,
+                             "compton_Y": u / self.u_B, "hist": hist}
+            u = (1.0 - relax) * u + relax * u_new
+        return n_e, {"u_syn": u, "iters": max_iter, "converged": False,
+                     "compton_Y": u / self.u_B, "hist": hist}
 
     # --- solvers ---
     def steady_state(self, Q, M=None):
