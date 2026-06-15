@@ -148,6 +148,35 @@ def test_energy_dependent_escape_callable():
     assert np.allclose(rate, n / (1e4 * (sz.g / 1e3) ** (-0.5)))
 
 
+def test_proton_synchrotron_matches_rate_primitive_Z1():
+    """Generic charged-particle generalisation: proton synchrotron cooling
+    matches rates.synchrotron_cool_inv (Z=1), and the e/p scalings are exact."""
+    from prince_cr.source import rates
+    _MP_G = 1.67262192369e-24
+    mp_c2_GeV = _MP_G * (2.99792458e10) ** 2 / 1.602176634e-3
+    B = 10.0
+    szp = SingleZoneSolver(gamma_lo=1e2, gamma_hi=1e9, n_bins=200, B_Gauss=B,
+                           mass_g=_MP_G, charge=1.0)
+    for g in (1e4, 1e6, 1e8):
+        mine = szp._beta_syn * g
+        ref = rates.synchrotron_cool_inv(g * mp_c2_GeV, mp_c2_GeV, 1, B)
+        assert abs(mine / ref - 1.0) < 1e-4   # residual = PRINCE_UNITS vs our constants
+    sze = SingleZoneSolver(gamma_lo=1e2, gamma_hi=1e9, n_bins=200, B_Gauss=B)
+    me_mp = 9.1093837015e-28 / _MP_G
+    assert abs(szp._beta_syn / sze._beta_syn / me_mp ** 3 - 1.0) < 1e-6   # (m_e/m_p)^3
+    assert abs(szp._nu_B / sze._nu_B / me_mp - 1.0) < 1e-6                 # m_e/m_p
+
+
+def test_charge_scaling_is_Z4_for_synchrotron():
+    """Synchrotron cooling ∝ charge⁴ (Larmor q⁴), the physically-correct power.
+    NB rates.synchrotron_cool_inv uses Z² (Guo Eq.8) — agrees only at Z=1; for
+    Z>1 our solver (Z⁴) and that primitive diverge by Z². See open-questions."""
+    _MP_G = 1.67262192369e-24
+    sz1 = SingleZoneSolver(n_bins=50, B_Gauss=10.0, mass_g=_MP_G, charge=1.0)
+    sz2 = SingleZoneSolver(n_bins=50, B_Gauss=10.0, mass_g=_MP_G, charge=2.0)
+    assert abs(sz2._beta_syn / sz1._beta_syn - 2.0 ** 4) < 1e-6           # Z⁴
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

@@ -111,16 +111,26 @@ class SingleZoneSolver:
     """
 
     def __init__(self, gamma_lo=1.0, gamma_hi=1e8, n_bins=256,
-                 B_Gauss=1.0, u_rad_erg_cm3=0.0, t_esc_s=None):
+                 B_Gauss=1.0, u_rad_erg_cm3=0.0, t_esc_s=None,
+                 mass_g=_ME_G, charge=1.0):
         self.g, self.g_if, self.dg = _trapz_grid(n_bins, gamma_lo, gamma_hi)
         self.n_bins = n_bins
         self.B = B_Gauss
         self.u_rad = u_rad_erg_cm3
         self.t_esc = t_esc_s          # scalar, callable(γ)->t_esc, array, or None
-        # cooling normalisation β:  γ̇ = -β γ²   [1/s],  β = (4/3) σ_T c U / (m_e c²)
+        # generic charged particle (default electron); leptonic work unchanged.
+        self.mass = mass_g
+        self.charge = charge
+        self._mc2 = mass_g * _C ** 2                            # rest energy [erg]
+        # Thomson xsec ∝ (q²/m)²  ⇒  σ_T,p = σ_T q⁴ (m_e/m)²
+        self._sigma_T = _SIGMA_T * charge ** 4 * (_ME_G / mass_g) ** 2
+        # synchrotron/IC cooling  γ̇=-βγ²  [1/s], β=(4/3)σ_T,p c U/(m c²)
+        # ⇒ β ∝ q⁴ (m_e/m)³ relative to the electron.
         u_B = B_Gauss ** 2 / (8.0 * np.pi)                      # erg/cm^3
-        self._beta_syn = (4.0 / 3.0) * _SIGMA_T * _C * u_B / _ME_C2_ERG
-        self._beta_ic = (4.0 / 3.0) * _SIGMA_T * _C * u_rad_erg_cm3 / _ME_C2_ERG
+        self._beta_syn = (4.0 / 3.0) * self._sigma_T * _C * u_B / self._mc2
+        self._beta_ic = (4.0 / 3.0) * self._sigma_T * _C * u_rad_erg_cm3 / self._mc2
+        # gyro/critical-frequency scale ν_B = q e B/(2π m c)  ∝ q/m
+        self._nu_B = charge * _E_ESU * B_Gauss / (2.0 * np.pi * mass_g * _C)
 
     # --- cooling rate at interfaces (Thomson; KN suppression added in it4) ---
     def gdot_if(self):
@@ -203,8 +213,9 @@ class SingleZoneSolver:
 
     # --- synchrotron emission (it4: gap item 1) ---
     def nu_c(self, gamma):
-        """Synchrotron critical frequency ν_c(γ) = (3/2) γ² ν_B  [Hz] (sinα=1)."""
-        return 1.5 * np.asarray(gamma) ** 2 * (_NU_B_PER_G * self.B)
+        """Synchrotron critical frequency ν_c(γ) = (3/2) γ² ν_B  [Hz] (sinα=1).
+        ν_B ∝ q/m, so protons radiate at much lower ν than electrons."""
+        return 1.5 * np.asarray(gamma) ** 2 * self._nu_B
 
     def synchrotron_sed(self, n_e, nu=None, pitch_avg=True):
         """Volume synchrotron emissivity j(ν) [erg s^-1 cm^-3 Hz^-1] from the
@@ -223,7 +234,7 @@ class SingleZoneSolver:
             nu_hi = float(self.nu_c(self.g[-1])) * 10.0
             nu = np.logspace(np.log10(nu_lo), np.log10(nu_hi), 256)
         nu = np.asarray(nu, dtype=float)
-        P0 = np.sqrt(3.0) * _E_ESU ** 3 * self.B / _ME_C2_ERG     # erg/s/Hz prefactor
+        P0 = np.sqrt(3.0) * self.charge ** 3 * _E_ESU ** 3 * self.B / self._mc2  # erg/s/Hz
         nuc = self.nu_c(self.g)                                   # ν_c0 (sinα=1)
         x = nu[:, None] / nuc[None, :]                            # (Nnu, Ng)
         K = synchrotron_Favg(x) if pitch_avg else synchrotron_F(x)
@@ -275,14 +286,14 @@ class SingleZoneSolver:
         power. Drives the I_ν∝ν^{5/2} optically-thick turnover."""
         n_e = np.asarray(n_e, dtype=float)
         g = self.g
-        P0 = np.sqrt(3.0) * _E_ESU ** 3 * self.B / _ME_C2_ERG
+        P0 = np.sqrt(3.0) * self.charge ** 3 * _E_ESU ** 3 * self.B / self._mc2
         nuc = self.nu_c(g)
         K = synchrotron_Favg(np.asarray(nu)[:, None] / nuc[None, :])      # (Nnu,Ng)
         # ∂_γ(n/γ²) on the log grid
         ratio = n_e / g ** 2
         dratio = np.gradient(ratio, g)
         integ = K * (g ** 2 * dratio)[None, :]
-        alpha = -(1.0 / (8.0 * np.pi * _ME_G * np.asarray(nu) ** 2)) * P0 * \
+        alpha = -(1.0 / (8.0 * np.pi * self.mass * np.asarray(nu) ** 2)) * P0 * \
             (integ * self.dg[None, :]).sum(axis=1)
         return np.clip(alpha, 0.0, None)               # absorption ≥ 0
 
