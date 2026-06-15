@@ -62,6 +62,32 @@ def synchrotron_F(x):
     return out
 
 
+def _build_gavg_table(n_y=400, y_lo=1e-4, y_hi=20.0, n_alpha=128):
+    """Pitch-angle-averaged synchrotron kernel for an ISOTROPIC electron
+    distribution:  G(y) = ∫_0^{π/2} sin²α F(y/sinα) dα,  y = ν/ν_c0,
+    ν_c0 = (3/2)γ²ν_B (the sinα=1 critical frequency).  The extra sinα (from
+    B_perp = B sinα) and the (½ sinα)dα solid-angle weight combine to sin²α."""
+    y = np.logspace(np.log10(y_lo), np.log10(y_hi), n_y)
+    a = np.linspace(1e-3, np.pi / 2, n_alpha)
+    sa = np.sin(a)
+    G = np.trapezoid(sa[None, :] ** 2 * synchrotron_F(y[:, None] / sa[None, :]), a, axis=1)
+    return y, np.maximum(G, 1e-300)
+
+
+_GAVG_Y, _GAVG_G = _build_gavg_table()
+
+
+def synchrotron_Favg(y):
+    """Pitch-angle-averaged synchrotron kernel G(y), y=ν/ν_c0 (isotropic e±)."""
+    y = np.asarray(y, dtype=float)
+    out = np.zeros_like(y)
+    m = (y > _GAVG_Y[0]) & (y < _GAVG_Y[-1])
+    out[m] = np.exp(np.interp(np.log(y[m]), np.log(_GAVG_Y), np.log(_GAVG_G)))
+    lo = y <= _GAVG_Y[0]
+    out[lo] = _GAVG_G[0] * (y[lo] / _GAVG_Y[0]) ** (1.0 / 3.0)   # x^{1/3} tail
+    return out
+
+
 def _trapz_grid(n_bins, lo, hi):
     """Log-spaced cell centres + interfaces + widths for a 1-D FV grid."""
     edges_ln = np.linspace(np.log(lo), np.log(hi), n_bins + 1)
@@ -152,14 +178,16 @@ class SingleZoneSolver:
         """Synchrotron critical frequency ν_c(γ) = (3/2) γ² ν_B  [Hz] (sinα=1)."""
         return 1.5 * np.asarray(gamma) ** 2 * (_NU_B_PER_G * self.B)
 
-    def synchrotron_sed(self, n_e, nu=None):
+    def synchrotron_sed(self, n_e, nu=None, pitch_avg=True):
         """Volume synchrotron emissivity j(ν) [erg s^-1 cm^-3 Hz^-1] from the
         electron spectrum ``n_e`` (per unit γ, cm^-3, on self.g).
 
             j(ν) = ∫ dγ n(γ) P(ν,γ),
-            P(ν,γ) = (√3 e³ B / m_e c²) F(ν/ν_c(γ)).
+            P(ν,γ) = (√3 e³ B / m_e c²) K(ν/ν_c0(γ)),  ν_c0=(3/2)γ²ν_B.
 
-        Returns (nu, j). If ``nu`` is None a log grid spanning the band is used.
+        ``pitch_avg`` (default): K = the isotropic pitch-angle-averaged kernel
+        ⟨sin²α F(x/sinα)⟩ (correct for isotropic e±, lowers the effective peak);
+        else K = F(x) (single sinα=1 electron). Returns (nu, j).
         """
         n_e = np.asarray(n_e, dtype=float)
         if nu is None:
@@ -168,11 +196,10 @@ class SingleZoneSolver:
             nu = np.logspace(np.log10(nu_lo), np.log10(nu_hi), 256)
         nu = np.asarray(nu, dtype=float)
         P0 = np.sqrt(3.0) * _E_ESU ** 3 * self.B / _ME_C2_ERG     # erg/s/Hz prefactor
-        nuc = self.nu_c(self.g)                                   # (Ng,)
+        nuc = self.nu_c(self.g)                                   # ν_c0 (sinα=1)
         x = nu[:, None] / nuc[None, :]                            # (Nnu, Ng)
-        Fx = synchrotron_F(x)
-        # ∫ dγ  ->  sum over cells with width dg
-        j = P0 * (Fx * (n_e * self.dg)[None, :]).sum(axis=1)      # (Nnu,)
+        K = synchrotron_Favg(x) if pitch_avg else synchrotron_F(x)
+        j = P0 * (K * (n_e * self.dg)[None, :]).sum(axis=1)       # (Nnu,)
         return nu, j
 
     # --- inverse-Compton emission SED (it4c: the Compton hump, with KN) ---
@@ -211,7 +238,40 @@ class SingleZoneSolver:
         Q = np.sum(per_gamma * (n_e * dg)[None, :], axis=1)           # (out,)
         return Q
 
-    def synchrotron_photon_density(self, n_e, R_cm, nu=None):
+    def synchrotron_absorption(self, n_e, nu):
+        """Synchrotron self-absorption coefficient α_ν [cm^-1] (isotropic e±):
+
+            α_ν = -(1/(8π m_e ν²)) ∫ dγ P(ν,γ) γ² ∂_γ[n(γ)/γ²],
+
+        with P(ν,γ)=√3 e³ B/(m_e c²)·K(ν/ν_c0) the angle-averaged single-electron
+        power. Drives the I_ν∝ν^{5/2} optically-thick turnover."""
+        n_e = np.asarray(n_e, dtype=float)
+        g = self.g
+        P0 = np.sqrt(3.0) * _E_ESU ** 3 * self.B / _ME_C2_ERG
+        nuc = self.nu_c(g)
+        K = synchrotron_Favg(np.asarray(nu)[:, None] / nuc[None, :])      # (Nnu,Ng)
+        # ∂_γ(n/γ²) on the log grid
+        ratio = n_e / g ** 2
+        dratio = np.gradient(ratio, g)
+        integ = K * (g ** 2 * dratio)[None, :]
+        alpha = -(1.0 / (8.0 * np.pi * _ME_G * np.asarray(nu) ** 2)) * P0 * \
+            (integ * self.dg[None, :]).sum(axis=1)
+        return np.clip(alpha, 0.0, None)               # absorption ≥ 0
+
+    def synchrotron_photon_density(self, n_e, R_cm, nu=None, ssa=True):
+        if ssa:
+            nu_, j = self.synchrotron_sed(n_e, nu)
+            alpha = self.synchrotron_absorption(n_e, nu_)
+            tau = alpha * R_cm
+            # uniform-sphere escape probability: (1-e^{-τ})/τ  (→1 thin, →1/τ thick)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                esc = np.where(tau > 1e-6, (1.0 - np.exp(-tau)) / tau, 1.0)
+            eps = _H_ERG_S * nu_
+            n_ph = (R_cm / _C) * (j * esc) / (_H_ERG_S * nu_) / _H_ERG_S
+            return eps, n_ph
+        return self._syn_photon_density_thin(n_e, R_cm, nu)
+
+    def _syn_photon_density_thin(self, n_e, R_cm, nu=None):
         """Synchrotron photon NUMBER density n_ph(ε) [cm^-3 erg^-1] and ε [erg]
         in the zone (residence ~R/c): n_ph(ε) = (R/c) j(ν)/(hν) / h."""
         nu, j = self.synchrotron_sed(n_e, nu)
