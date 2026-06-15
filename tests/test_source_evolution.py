@@ -123,6 +123,31 @@ def test_ic_thomson_slope_and_kn_suppression():
     assert slk < sl                                       # KN suppresses high-E
 
 
+def test_escape_spectrum_recovers_injection_when_escape_dominated():
+    """Escape-dominated (t_esc ≪ t_cool over the injected range): steady state
+    n ≈ Q·t_esc, so the escape spectrum n/t_esc ≈ Q."""
+    sz = SingleZoneSolver(gamma_lo=1.0, gamma_hi=1e6, n_bins=400, B_Gauss=1.0,
+                          t_esc_s=1e3)
+    Q = sz.injection_powerlaw(Q0=1.0, p=2.0, gamma_min=1e3, gamma_max=1e5)
+    n = sz.steady_state(Q)
+    g_e, rate = sz.escape_spectrum(n)
+    win = (sz.g > 2e3) & (sz.g < 5e4)
+    assert np.allclose(rate[win], Q[win], rtol=0.1)
+    assert np.min(n) >= 0
+
+
+def test_energy_dependent_escape_callable():
+    """t_esc(γ) callable (diffusive ∝ γ^-0.5): stable, positive, and
+    escape_spectrum == n / t_esc(γ)."""
+    sz = SingleZoneSolver(gamma_lo=1.0, gamma_hi=1e6, n_bins=400, B_Gauss=1.0)
+    sz.set_escape(lambda g: 1e4 * (g / 1e3) ** (-0.5))
+    Q = sz.injection_powerlaw(Q0=1.0, p=2.0, gamma_min=1e3, gamma_max=1e5)
+    n = sz.steady_state(Q)
+    assert np.min(n) >= 0 and np.all(np.isfinite(n))
+    g_e, rate = sz.escape_spectrum(n)
+    assert np.allclose(rate, n / (1e4 * (sz.g / 1e3) ** (-0.5)))
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

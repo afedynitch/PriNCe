@@ -116,7 +116,7 @@ class SingleZoneSolver:
         self.n_bins = n_bins
         self.B = B_Gauss
         self.u_rad = u_rad_erg_cm3
-        self.t_esc = t_esc_s
+        self.t_esc = t_esc_s          # scalar, callable(γ)->t_esc, array, or None
         # cooling normalisation β:  γ̇ = -β γ²   [1/s],  β = (4/3) σ_T c U / (m_e c²)
         u_B = B_Gauss ** 2 / (8.0 * np.pi)                      # erg/cm^3
         self._beta_syn = (4.0 / 3.0) * _SIGMA_T * _C * u_B / _ME_C2_ERG
@@ -131,6 +131,27 @@ class SingleZoneSolver:
     def t_cool(self, gamma):
         beta = self._beta_syn + self._beta_ic
         return 1.0 / (beta * np.asarray(gamma))
+
+    # --- escape (it5): energy-dependent t_esc(γ) + the escape spectrum ---
+    def set_escape(self, t_esc):
+        """Set the escape time: scalar (energy-independent), callable γ→t_esc(γ)
+        (e.g. diffusive t_esc∝γ^-δ), an array on self.g, or None (no escape)."""
+        self.t_esc = t_esc
+
+    def t_esc_arr(self):
+        """Per-γ escape time [s] on self.g (inf where no escape)."""
+        te = self.t_esc
+        if te is None:
+            return np.full_like(self.g, np.inf)
+        if callable(te):
+            return np.asarray(te(self.g), dtype=float)
+        return np.broadcast_to(np.asarray(te, dtype=float), self.g.shape).copy()
+
+    def escape_spectrum(self, n_e):
+        """Escaping-particle rate spectrum dṄ_esc/dγ/dV = n(γ)/t_esc(γ)
+        [cm^-3 s^-1 (unit γ)^-1] — the source 'EscapeSpectrum' that the PRINCE
+        propagation solver consumes as injection. Returns (γ, rate)."""
+        return self.g, np.asarray(n_e, dtype=float) / self.t_esc_arr()
 
     # --- operator assembly: conservative upwind advection (cooling) + escape ---
     def cooling_operator(self):
@@ -163,7 +184,7 @@ class SingleZoneSolver:
         add(0, 0, gdot[0] / dg[0])
         M = sp.csr_matrix((vals, (rows, cols)), shape=(N, N))
         if self.t_esc is not None:
-            M = M - sp.identity(N, format="csr") / self.t_esc
+            M = M - sp.diags(1.0 / self.t_esc_arr())     # energy-dependent escape
         return M
 
     # --- injection vector from a (broken) power law ---
