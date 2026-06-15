@@ -167,11 +167,18 @@ class SingleZoneSolver:
         return M
 
     # --- injection vector from a (broken) power law ---
-    def injection_powerlaw(self, Q0, p, gamma_min, gamma_max):
-        """Q(γ) = Q0 γ^-p for γ_min<γ<γ_max, else 0  [particles / cm^3 / s / (unit γ)]."""
-        Q = np.where((self.g >= gamma_min) & (self.g <= gamma_max),
-                     Q0 * self.g ** (-p), 0.0)
-        return Q
+    def injection_powerlaw(self, Q0, p, gamma_min, gamma_max, cutoff_steepness=None):
+        """Q(γ) = Q0 γ^-p  with a low edge at γ_min and a high-energy cutoff at
+        γ_max  [particles cm^-3 s^-1 (unit γ)^-1].
+
+        ``cutoff_steepness`` None → sharp top-hat (hard γ_max). A float ``s``
+        → smooth exponential cutoff Q ∝ γ^-p exp(−(γ/γ_max)^s) above γ_min
+        (matches AM3's `set_powerlaw_injection_parameters` cut-off, s=1)."""
+        g = self.g
+        if cutoff_steepness is None:
+            return np.where((g >= gamma_min) & (g <= gamma_max), Q0 * g ** (-p), 0.0)
+        Q = Q0 * g ** (-p) * np.exp(-(g / gamma_max) ** cutoff_steepness)
+        return np.where(g >= gamma_min, Q, 0.0)
 
     # --- synchrotron emission (it4: gap item 1) ---
     def nu_c(self, gamma):
