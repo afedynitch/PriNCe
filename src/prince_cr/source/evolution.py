@@ -131,12 +131,29 @@ class SingleZoneSolver:
         self._beta_ic = (4.0 / 3.0) * self._sigma_T * _C * u_rad_erg_cm3 / self._mc2
         # gyro/critical-frequency scale ν_B = q e B/(2π m c)  ∝ q/m
         self._nu_B = charge * _E_ESU * B_Gauss / (2.0 * np.pi * mass_g * _C)
+        # extra (non-∝γ²) energy-loss terms at interfaces, e.g. pγ / BH (it6b)
+        self._gdot_extra_if = np.zeros_like(self.g_if)
 
-    # --- cooling rate at interfaces (Thomson; KN suppression added in it4) ---
+    # --- cooling rate at interfaces (Thomson syn+IC ∝γ² + extra terms) ---
     def gdot_if(self):
-        """γ̇ at cell interfaces [1/s], negative (energy loss)."""
+        """γ̇ at cell interfaces [1/s], negative (energy loss).
+        = -(β_syn+β_ic)γ²  +  Σ extra γ̇ terms (pγ, BH, ...)."""
         beta = self._beta_syn + self._beta_ic
-        return -beta * self.g_if ** 2
+        return -beta * self.g_if ** 2 + self._gdot_extra_if
+
+    def add_pgamma_cooling(self, photon_field, sigma_eps_GeV, A_mass_GeV=None):
+        """Add proton/nucleus pγ photo-meson continuous cooling to the operator,
+        computed from the validated `rates.photonuclear_cool_inv` on a source
+        ``photon_field`` (any object with get_photon_density(eps,z)) and a
+        cross-section callable ``sigma_eps_GeV``. γ̇_pγ(γ) = -γ · t_cool⁻¹(E_A)."""
+        from prince_cr.source.rates import photonuclear_cool_inv
+        if A_mass_GeV is None:
+            A_mass_GeV = self._mc2 / (1.602176634e-3)        # erg -> GeV
+        E_if = self.g_if * A_mass_GeV                        # E_A at interfaces [GeV]
+        rate = np.array([photonuclear_cool_inv(E, A_mass_GeV, sigma_eps_GeV,
+                                               photon_field) for E in E_if])
+        self._gdot_extra_if = self._gdot_extra_if - self.g_if * rate   # dγ/dt = -γ/t
+        return self
 
     def t_cool(self, gamma):
         beta = self._beta_syn + self._beta_ic
