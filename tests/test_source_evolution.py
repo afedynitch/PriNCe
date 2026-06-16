@@ -184,6 +184,38 @@ def test_charge_scaling_is_Z4_for_synchrotron():
     assert abs(sz_he._beta_syn * g / ref - 1.0) < 1e-4
 
 
+def test_composite_photon_field_feedback_toggle():
+    """The common field: feedback=False -> external only (recovers the classical
+    fixed target); feedback=True -> external + evolved internal."""
+    from prince_cr.source.evolution import CompositePhotonField
+
+    class _Ext:                                   # toy fixed external field
+        E_min_GeV, E_max_GeV = 1e-9, 1e3
+        def get_photon_density(self, E, z=0.0):
+            E = np.atleast_1d(np.asarray(E, float))
+            return np.where((E >= self.E_min_GeV) & (E <= self.E_max_GeV), 1.0, 0.0)
+
+    ext = _Ext()
+    eps = np.logspace(-6, 6, 200); n_int = 10.0 * np.ones_like(eps)  # GeV^-1 cm^-3
+
+    off = CompositePhotonField(external=ext, feedback=False)
+    off.set_internal(eps, n_int)
+    # feedback off: internal ignored, only external (=1 in range)
+    assert np.isclose(off.get_photon_density(1.0)[0], 1.0)
+    assert np.isclose(off.get_photon_density(1e5)[0], 0.0)   # outside external, no internal
+
+    on = CompositePhotonField(external=ext, feedback=True)
+    on.set_internal(eps, n_int)
+    assert np.isclose(on.get_photon_density(1.0)[0], 1.0 + 10.0)   # external + internal
+    assert np.isclose(on.get_photon_density(1e5)[0], 10.0)        # internal only (beyond ext)
+    assert on.E_max_GeV >= 1e5                                    # bounds span the union
+
+    # no external (pure self-consistent) also works
+    pure = CompositePhotonField(external=None, feedback=True)
+    pure.set_internal(eps, n_int)
+    assert np.isclose(pure.get_photon_density(1.0)[0], 10.0)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

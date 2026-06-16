@@ -97,6 +97,60 @@ def _trapz_grid(n_bins, lo, hi):
     return g, g_if, dg
 
 
+class CompositePhotonField:
+    """The ONE common in-zone photon field = external (fixed) + internal
+    (self-consistently evolved), and the single target for every process
+    (IC, pγ, γγ, SSA). Unifies the in-source and propagation cases:
+
+    - ``feedback=False`` → only the external/fixed component is returned →
+      recovers the classical fixed-target behaviour (e.g. CMB+EBL propagation,
+      where the source's own photons are negligible). One mechanism, feedback
+      switched off.
+    - ``feedback=True``  → external + the evolved internal photons (synchrotron
+      + IC + cascade + π⁰→γγ), updated each iteration via :meth:`set_internal`
+      → the self-consistent in-source case (the source photons dominate).
+
+    Exposes ``get_photon_density(E_GeV, z)`` [GeV⁻¹ cm⁻³] + ``E_min_GeV`` /
+    ``E_max_GeV`` (the union span), so it is a drop-in for the cascade kernels
+    and the source-rate primitives.
+    """
+
+    def __init__(self, external=None, feedback=True):
+        self.external = external
+        self.feedback = bool(feedback)
+        self._lgE = self._lgn = None
+        self._imin = self._imax = None
+        ext_lo = getattr(external, "E_min_GeV", None)
+        ext_hi = getattr(external, "E_max_GeV", None)
+        self._ext_lo, self._ext_hi = ext_lo, ext_hi
+        self._refresh_bounds()
+
+    def _refresh_bounds(self):
+        los = [b for b in (self._ext_lo, self._imin if self.feedback else None) if b]
+        his = [b for b in (self._ext_hi, self._imax if self.feedback else None) if b]
+        self.E_min_GeV = min(los) if los else 1e-20
+        self.E_max_GeV = max(his) if his else 1e14
+
+    def set_internal(self, eps_GeV, n_GeV):
+        """Set/replace the evolved internal photon density n(E) [GeV⁻¹ cm⁻³]."""
+        eps_GeV = np.asarray(eps_GeV, float); n_GeV = np.asarray(n_GeV, float)
+        m = (n_GeV > 0) & np.isfinite(n_GeV) & (eps_GeV > 0)
+        if m.sum() >= 2:
+            o = np.argsort(eps_GeV[m])
+            self._lgE = np.log(eps_GeV[m][o]); self._lgn = np.log(n_GeV[m][o])
+            self._imin, self._imax = float(eps_GeV[m].min()), float(eps_GeV[m].max())
+        self._refresh_bounds()
+
+    def get_photon_density(self, E, z=0.0):
+        E = np.atleast_1d(np.asarray(E, float)); out = np.zeros_like(E)
+        if self.external is not None:
+            out = out + np.asarray(self.external.get_photon_density(E, z), float)
+        if self.feedback and self._lgE is not None:
+            w = (E >= self._imin) & (E <= self._imax)
+            out[w] = out[w] + np.exp(np.interp(np.log(E[w]), self._lgE, self._lgn))
+        return out
+
+
 class SingleZoneSolver:
     """Single-zone electron (γ) evolution under continuous cooling + injection
     + escape.  γ = E/m_e c² (dimensionless Lorentz factor).
