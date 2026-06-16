@@ -420,17 +420,21 @@ def synchrotron_cool_inv(E_A_GeV, A_mass_GeV, Z, B_Gauss):
     .. math::
 
        t_{\\rm syn}^{-1}(E_A) =
-         \\frac{Z^2 \\sigma_T (m_e c^2)^2 E_A B^2 c}{6 \\pi (m_A c^2)^4}
+         \\frac{Z^4 \\sigma_T (m_e c^2)^2 E_A B^2 c}{6 \\pi (m_A c^2)^4}
 
     All masses passed as rest-mass energies in GeV; B in Gauss; result
     in s\\ :math:`^{-1}`. Equivalent to ``E_A / (m_A c^2 t_{\\rm syn})``
     when comparing against Eq. 8's energy-loss-timescale form.
+
+    NB the charge enters as **Z⁴** (synchrotron is Larmor, P∝q⁴ ⇒ t⁻¹=P/E∝q⁴),
+    not Z². The transcribed Guo Eq. 8 had Z² — corrected 2026-06-16 (invisible
+    for protons Z=1; ×Z² error for nuclei, e.g. Fe ×676). See open-questions.
     """
     E_A_erg = E_A_GeV * PRINCE_UNITS.GeV2erg
     m_A_c2_erg = A_mass_GeV * PRINCE_UNITS.GeV2erg
     m_e_c2_erg = PRINCE_UNITS.m_electron * PRINCE_UNITS.GeV2erg
     return (
-        Z**2
+        Z**4
         * SIGMA_THOMSON_CM2
         * m_e_c2_erg**2
         * E_A_erg

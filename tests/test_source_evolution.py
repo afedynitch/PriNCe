@@ -169,12 +169,19 @@ def test_proton_synchrotron_matches_rate_primitive_Z1():
 
 def test_charge_scaling_is_Z4_for_synchrotron():
     """Synchrotron cooling ∝ charge⁴ (Larmor q⁴), the physically-correct power.
-    NB rates.synchrotron_cool_inv uses Z² (Guo Eq.8) — agrees only at Z=1; for
-    Z>1 our solver (Z⁴) and that primitive diverge by Z². See open-questions."""
+    rates.synchrotron_cool_inv was corrected Z²→Z⁴ (2026-06-16), so our solver
+    and that primitive now agree at ALL Z (cross-checked at Z=2 below)."""
+    from prince_cr.source import rates
     _MP_G = 1.67262192369e-24
     sz1 = SingleZoneSolver(n_bins=50, B_Gauss=10.0, mass_g=_MP_G, charge=1.0)
     sz2 = SingleZoneSolver(n_bins=50, B_Gauss=10.0, mass_g=_MP_G, charge=2.0)
     assert abs(sz2._beta_syn / sz1._beta_syn - 2.0 ** 4) < 1e-6           # Z⁴
+    # cross-check the corrected rate primitive at Z=2 with a MATCHING mass (2 m_p)
+    sz_he = SingleZoneSolver(n_bins=50, B_Gauss=10.0, mass_g=2 * _MP_G, charge=2.0)
+    m2_GeV = 2 * _MP_G * (2.99792458e10) ** 2 / 1.602176634e-3
+    g = 1e6
+    ref = rates.synchrotron_cool_inv(g * m2_GeV, m2_GeV, 2, 10.0)
+    assert abs(sz_he._beta_syn * g / ref - 1.0) < 1e-4
 
 
 if __name__ == "__main__":
