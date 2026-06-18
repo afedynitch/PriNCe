@@ -178,3 +178,63 @@ class SourceBrokenPowerLaw(PhotonField):
             f"alpha={self.alpha}, beta={self.beta}, "
             f"Gamma={self.Gamma}, R={self.R_cm:.2e} cm)"
         )
+
+
+class SourceBlackBody(PhotonField):
+    """(Diluted) thermal/blackbody external photon field in a source zone.
+
+    An isotropic Planck spectrum normalised to a target photon ENERGY density
+    ``U_gamma`` (so a "dilution factor" is absorbed into ``U_gamma`` — a true
+    blackbody at temperature ``kT`` has U = aT⁴, a diluted/external field has the
+    same shape but lower U). This is the in-source analogue of AM3's external
+    blackbody target (``ExtPH.BlackBodySpec ∝ E³/(e^{E/kT}-1)``, their
+    ``set_external_G_spec``), suitable as the ``external=`` component of a
+    :class:`~prince_cr.source.evolution.CompositePhotonField` for external-Compton
+    / external-pγ on a disk / BLR / dust torus field.
+
+        n(E) = C · E² / (exp(E/kT) − 1),   C = 15 U_γ / (π⁴ (kT)⁴),
+
+    which gives ∫ E n(E) dE = U_γ exactly (∫ x³/(eˣ−1) dx = π⁴/15).
+
+    Parameters
+    ----------
+    kT_eV : float
+        Characteristic temperature kT (eV), fluid rest frame.
+    U_gamma_erg_cm3 : float, optional
+        Target photon energy density (erg/cm³). Provide this OR
+        (``L_erg_s`` + ``R_cm``), from which U = L/(4π R² c).
+    L_erg_s, R_cm : float, optional
+        Luminosity (erg/s) and radius (cm) → U_γ = L/(4π R² c) if
+        ``U_gamma_erg_cm3`` is not given.
+    n_kT_lo, n_kT_hi : float
+        Energy band as multiples of kT (default 1e-3 … 50 — covers the
+        Rayleigh-Jeans tail to deep Wien).
+    """
+
+    frame = "fluid-rest"
+
+    def __init__(self, kT_eV, U_gamma_erg_cm3=None, L_erg_s=None, R_cm=None,
+                 n_kT_lo=1.0e-3, n_kT_hi=50.0):
+        self.kT_GeV = float(kT_eV) * 1.0e-9
+        if U_gamma_erg_cm3 is None:
+            if L_erg_s is None or R_cm is None:
+                raise ValueError("give U_gamma_erg_cm3 or both L_erg_s and R_cm")
+            U_gamma_erg_cm3 = float(L_erg_s) / (4.0 * np.pi * float(R_cm) ** 2 * PRINCE_UNITS.c)
+        self.U_gamma_GeV_cm3 = float(U_gamma_erg_cm3) * PRINCE_UNITS.erg2GeV
+        self.E_min_GeV = n_kT_lo * self.kT_GeV
+        self.E_max_GeV = n_kT_hi * self.kT_GeV
+        # C = 15 U / (pi^4 (kT)^4)  ⇒  ∫ E n dE = U over [0, ∞)
+        self.C = 15.0 * self.U_gamma_GeV_cm3 / (np.pi ** 4 * self.kT_GeV ** 4)
+
+    def get_photon_density(self, E, z=0.0):
+        """Fluid-frame photon number density n(E) [GeV^-1 cm^-3]."""
+        E = np.atleast_1d(np.asarray(E, dtype=float))
+        out = np.zeros_like(E)
+        m = (E >= self.E_min_GeV) & (E <= self.E_max_GeV)
+        x = np.clip(E[m] / self.kT_GeV, 1e-12, 700.0)
+        out[m] = self.C * E[m] ** 2 / np.expm1(x)
+        return out
+
+    def __repr__(self):
+        return (f"SourceBlackBody(kT={self.kT_GeV*1e9:.3e} eV, "
+                f"U_gamma={self.U_gamma_GeV_cm3:.3e} GeV/cm^3)")

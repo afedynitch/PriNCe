@@ -219,3 +219,27 @@ def test_composite_photon_field_feedback_toggle():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_source_blackbody_energy_density_and_peak():
+    """SourceBlackBody normalises to the target energy density and peaks (in
+    E^2 n per ln E) at the Wien value x=E/kT≈3.92; plugs into CompositePhotonField."""
+    from prince_cr.source.photonfields import SourceBlackBody
+    from prince_cr.source.evolution import CompositePhotonField
+    from prince_cr.data import PRINCE_UNITS
+
+    kT_eV, U_erg = 10.0, 1.0e-2
+    bb = SourceBlackBody(kT_eV, U_gamma_erg_cm3=U_erg)
+    E = np.logspace(np.log10(bb.E_min_GeV), np.log10(bb.E_max_GeV), 4000)
+    n = bb.get_photon_density(E)
+    U_num = np.trapezoid(E * n, E)
+    assert abs(U_num / (U_erg * PRINCE_UNITS.erg2GeV) - 1.0) < 1e-3
+    x_peak = E[np.argmax(E * (E * n))] / bb.kT_GeV          # peak of E^2 n in ln E
+    assert 3.5 < x_peak < 4.3
+    # usable as an external field
+    f = CompositePhotonField(external=bb, feedback=False)
+    assert f.get_photon_density(np.array([bb.kT_GeV]))[0] > 0
+    # (L, R) constructor: U = L/(4 pi R^2 c)
+    bb2 = SourceBlackBody(kT_eV, L_erg_s=1e45, R_cm=1e16)
+    U_expect = 1e45 / (4 * np.pi * 1e16 ** 2 * PRINCE_UNITS.c) * PRINCE_UNITS.erg2GeV
+    assert abs(bb2.U_gamma_GeV_cm3 / U_expect - 1.0) < 1e-6
