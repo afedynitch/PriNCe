@@ -233,3 +233,106 @@ class CoupledCascadeSolver:
         return {"field": self.field, "n_e": n_e, "gamma_e": self.sze.g,
                 "E_ph": self.E_ph, "n_gamma": n_gamma,
                 "components": comps, "tgg_inv": tgg_inv, "history": hist}
+
+    # --- coupled NONLINEAR ETD2 march (no Picard) -------------------------
+    def solve_etd2(self, lepton_injection, photon_injection=None, dt=None,
+                   n_steps=4000, rtol=1e-6, check_every=10, n0=None,
+                   verbose=True):
+        """Solve the coupled e±↔γ in-source cascade by marching the joint state
+        ``[n_e(γ_e), n_γ(E_ph)]`` to steady state with PriNCe's production ETD2
+        stepper (``solvers.etd2.etd2_step``), with the **nonlinear photon-field
+        feedback handled inside ETD2** — no outer Picard loop.
+
+        ETD2 (Cox-Matthews) is an exponential integrator for the SEMILINEAR
+        system ``dn/dt = D·n + F(n)``: the stiff linear **diagonal** D (lepton
+        cooling self-loss + escape; photon escape + γγ absorption) is treated
+        exactly via ``exp(h·D)``, and the **nonlinear remainder** F(n) — lepton
+        advection gain, primary+γγ e± injection, and the e±→γ synchrotron+IC
+        EMISSION + γγ pair production, all **convolved with the CURRENT in-source
+        photon field** ``n_γ`` (the nonlinearity) — is evaluated per stage. So
+        the IC target and the γγ kernels see the self-consistent field as it
+        evolves, exactly as in a time-dependent code.
+
+        The field-dependent diagonal (IC cooling rate, τ_γγ) is refrozen at the
+        start of each step from the current state; the field convolutions in F
+        use each stage's field. ``lepton_injection(field)`` / optional
+        ``photon_injection(field)`` are the same callbacks as :meth:`solve`."""
+        from prince_cr.solvers.etd2 import etd2_step, _step_buffers, split_operator
+
+        Ng = self.sze.g.size
+        NE = self.E_ph.size
+        dim = Ng + NE
+        bufs = _step_buffers(dim, np)
+        state = (np.zeros(dim) if n0 is None else np.asarray(n0, float).copy())
+
+        def _set_field(n_g):
+            self.field.set_internal(self.E_ph, np.clip(n_g, 0.0, None))
+
+        def _field_ops(n_g):
+            """(M_lep, tgg) at the photon field ``n_g`` — the field-dependent
+            operators. ``M_lep`` is the lepton cooling+escape operator WITH IC
+            at this field; ``tgg`` the γγ absorption rate. Recomputed per stage
+            so IC cooling and IC emission always see the SAME field (the fix for
+            the frozen-field IC inconsistency)."""
+            _set_field(n_g)
+            self.sze.set_ic_target(self._u_rad())
+            M = self.sze.cooling_operator().tocsr()
+            tgg = gamma_gamma_abs_inv(self.E_ph, self.field, self._eps_soft)
+            return M, tgg
+
+        def _full_rhs(x):
+            """The complete nonlinear RHS  dn/dt = [lepton ; photon]  at the
+            field carried by ``x`` (stage-consistent)."""
+            n_e = x[:Ng]
+            n_g = x[Ng:]
+            M, tgg = _field_ops(n_g)
+            Q_e = np.asarray(lepton_injection(self.field), float)
+            Q_e = Q_e + self._pair_injection(n_g, tgg)        # γγ→e± at stage field
+            rhs_e = M @ n_e + Q_e                             # IC cooling: stage field
+            Q_g = self._sum_on_Eph(self._lepton_photon_production(n_e))  # IC emission: stage field
+            if photon_injection is not None:
+                extra = photon_injection(self.field)
+                if extra is not None:
+                    Q_g = Q_g + self._sum_on_Eph([extra])
+            rhs_g = Q_g - (1.0 / self.t_esc + tgg) * n_g      # escape + γγ sink
+            return np.concatenate([rhs_e, rhs_g])
+
+        # ETD2 semilinear split: D = frozen diagonal (per step), F(x) = full
+        # nonlinear RHS(x) − D·x. Because F carries the WHOLE field-dependent RHS
+        # at the stage field, IC cooling (in M) and IC emission (in Q_g) are
+        # always mutually consistent → no frozen-field IC offset.
+        if dt is None:
+            dt = self.t_esc                                   # ETD handles faster modes exactly
+        hist = []
+        prev = state.copy()
+        n_done = 0
+        for k in range(n_steps):
+            M0, tgg0 = _field_ops(state[Ng:])                 # frozen diagonal @ step start
+            d = np.concatenate([np.asarray(M0.diagonal()),
+                                -(1.0 / self.t_esc + tgg0)])
+
+            def apply_F(x, out, _d=d):
+                out[:] = _full_rhs(x)
+                out -= _d * x
+
+            etd2_step(state, dt, d, apply_F, bufs, np)
+            np.clip(state, 0.0, None, out=state)              # guard tiny negative undershoot
+            n_done = k + 1
+            if (k % check_every) == 0:
+                denom = max(float(np.abs(state).max()), 1e-300)
+                res = float(np.abs(state - prev).max()) / denom
+                hist.append(res)
+                if verbose:
+                    Ug = float(np.trapezoid(self.E_ph * state[Ng:], self.E_ph))
+                    print(f"  etd2 it{k:04d}  U_γ={Ug:.4e} GeV/cm³  resid={res:.3e}")
+                if res < rtol and k >= check_every:
+                    break
+                prev = state.copy()
+
+        n_e = state[:Ng]
+        n_gamma = state[Ng:]
+        _set_field(n_gamma)
+        tgg_inv = gamma_gamma_abs_inv(self.E_ph, self.field, self._eps_soft)
+        return {"field": self.field, "n_e": n_e, "gamma_e": self.sze.g,
+                "E_ph": self.E_ph, "n_gamma": n_gamma, "tgg_inv": tgg_inv,
+                "history": hist, "n_steps": n_done}

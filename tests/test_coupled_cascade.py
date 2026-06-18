@@ -118,3 +118,35 @@ def test_high_energy_photon_injection_cascades_down():
     # and the regenerated cascade must add power at lower (MeV–GeV) energies too
     low = (E > 1e-4) & (E < 1.0)
     assert np.sum(n_casc[low] * E[low]) > np.sum(n_base[low] * E[low])
+
+
+def test_solve_etd2_matches_converged_picard_full_sed():
+    """The coupled nonlinear-ETD2 march (solve_etd2, design b) must reproduce the
+    TIGHTLY-converged Picard solve() across the full SED — synchrotron AND IC.
+    (A loosely-converged Picard under-builds the sub-dominant IC bump by ~7/8;
+    ETD2 reaches the true self-consistent fixed point.)"""
+    import numpy as np
+    from prince_cr.source.coupled_cascade import CoupledCascadeSolver
+    c = 2.99792458e10
+    R, B = 1e15, 3.0
+
+    def mk():
+        ccs = CoupledCascadeSolver(R_cm=R, B_Gauss=B, t_esc_s=R / c,
+                                   gamma_e=(1.0, 1e7, 120), E_ph_GeV=(1e-12, 1e5, 120))
+        g = ccs.sze.g
+        Qe = np.where((g >= 2) & (g <= 1e4), g ** -2.0, 0.0) * 1e-5
+        return ccs, (lambda f: Qe)
+
+    ccs, lep = mk()
+    fp = ccs.solve(lep, n_iter=2000, tol=1e-9, relax=1.0, verbose=False)["n_gamma"]
+    ccs2, lep2 = mk()
+    fe = ccs2.solve_etd2(lep2, dt=R / c, n_steps=4000, rtol=1e-8,
+                         check_every=20, verbose=False)["n_gamma"]
+    E = ccs.E_ph
+    # energy density
+    Up = np.trapezoid(E * fp, E); Ue = np.trapezoid(E * fe, E)
+    assert abs(Ue / Up - 1.0) < 1e-3, f"U_gamma ratio {Ue/Up:.4f}"
+    # full-SED shape incl. IC bump (where both are well above peak/1e6)
+    m = (fp > fp.max() * 1e-6) & (fe > 0)
+    rel = np.abs(fe[m] - fp[m]) / fp[m]
+    assert np.median(rel) < 2e-2, f"median SED rel.diff {np.median(rel):.3e}"
