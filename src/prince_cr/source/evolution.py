@@ -1,26 +1,31 @@
 """prince_cr.source.evolution — single-zone time-domain evolution (Phase 2).
 
-A minimal, correctness-first ETD2 single-zone solver for in-source
-multi-messenger physics (the AM3-equivalent). The independent variable is
-**time t** (no cosmology / Hubble), the operator M carries units of s^-1, and
-continuous energy losses (synchrotron, IC, adiabatic) enter as a
-**conservative upwind advection** operator in M — validated in
-`runs/2026-06-15_am3-insource` (iteration 1) to be positivity-preserving and
-number-conserving for pure cooling, with Chang-Cooper reducing to upwind in
-that limit; ETD2's exponential step handles the cooling-stiffness, so no
-implicit tridiagonal solve is needed.
+Single-zone in-source multi-messenger solver (the AM3-equivalent). The
+independent variable is **time t** (no cosmology / Hubble), the operator M
+carries units of s^-1, and continuous energy losses (synchrotron, IC,
+adiabatic) enter as a **conservative upwind advection** operator in M —
+validated in `runs/2026-06-15_am3-insource` to be positivity-preserving and
+number-conserving for pure cooling (Chang-Cooper reduces to upwind in that
+limit).
+
+Three ways to reach steady state are provided, in increasing fidelity to the
+production stack:
+  * :meth:`SingleZoneSolver.steady_state`        — direct sparse solve, ``spsolve(M, -Q)``.
+  * :meth:`SingleZoneSolver.evolve`              — ETD1 (exponential Euler) t-march.
+  * :meth:`SingleZoneSolver.steady_state_etd2`   — the GENUINE ETD2: marches with
+    PriNCe's production stepper :func:`prince_cr.solvers.etd2.etd2_step`
+    (Cox-Matthews exponential RK2, the same integrator the propagation solver
+    uses). Validated to match ``steady_state`` to machine precision and the
+    analytic cooling break.
+
+(Historical note: earlier revisions of this docstring called the whole module an
+"ETD2 solver" while only ETD1 + spsolve were implemented — corrected 2026-06-18
+when the real ETD2 path was wired to `solvers.etd2`.)
 
 Phase-2 scope (this file, growing):
-  it3  electrons: synchrotron + (external) IC cooling, injection, escape;
-       steady state + ETD2 march. Validated vs the analytic cooling break.
+  it3  electrons: synchrotron + (external) IC cooling, injection, escape.
   it4  synchrotron *emission* -> self-consistent photon field (SSC).
   it5  energy-dependent escape spectrum.
-
-The solver reuses the ETD2 phi-function *formulation* (n_{k+1} = e^{Mh} n_k +
-h phi1(Mh) (M n_k + Q) for the constant-coefficient step; phi1(z)=(e^z-1)/z)
-but is implemented standalone here — the single-zone system is small (~few
-species x energy grid), so we favour a clean dense/sparse expm over the
-production propagation solver's z-coupled, MKL/cupy-optimised machinery.
 """
 from __future__ import annotations
 
@@ -475,4 +480,60 @@ class SingleZoneSolver:
         phi1 = np.where(np.abs(z) > 1e-8, np.expm1(z) / np.where(z == 0, 1.0, z), 1.0)
         for _ in range(nsteps):
             n = eL * n + phi1 * h * (Noff @ n + Q)
+        return n
+
+    def steady_state_etd2(self, Q, M=None, n0=None, dt=None, n_steps=600,
+                          rtol=1e-7, check_every=5, return_info=False):
+        """Steady state via PriNCe's PRODUCTION ETD2 stepper
+        (:func:`prince_cr.solvers.etd2.etd2_step`, Cox-Matthews exponential
+        RK2 — the SAME integrator the propagation solver uses), marching
+        ``dn/dt = M n + Q`` to its fixed point.
+
+        This is the genuine ETD2 path (the module's earlier `evolve` is only
+        ETD1, `steady_state` is a direct spsolve). The stiff cooling+escape
+        diagonal ``D = diag(M)`` is treated EXACTLY via ``exp(h·D)``; the upwind
+        off-diagonal advection is the explicit SpMV (2 per stage). Because the
+        fast high-γ modes are damped exactly, a step ``dt`` of order the slowest
+        relaxation time (≈ escape time) is stable and reaches steady state in a
+        handful of steps.
+
+        Returns ``n`` (or ``(n, info)`` with the residual history if
+        ``return_info``). Validated to match :meth:`steady_state` (spsolve) and
+        the analytic cooling break (see tests)."""
+        from prince_cr.solvers.etd2 import etd2_step, _step_buffers, split_operator
+
+        if M is None:
+            M = self.cooling_operator()
+        M = M.tocsr()
+        d, L_off = split_operator(M)
+        Q = np.asarray(Q, dtype=float)
+        n = (np.zeros_like(self.g) if n0 is None
+             else np.asarray(n0, dtype=float).copy())
+        bufs = _step_buffers(n.size, np)
+
+        def apply_F(x, out):
+            out[:] = L_off @ x
+            out += Q
+
+        if dt is None:
+            # slowest relaxation ≈ 1/min|diag| (the escape floor at low γ); ETD
+            # handles the faster diagonal modes exactly, so this step is stable.
+            nz = np.abs(d[d != 0.0])
+            dt = (1.0 / nz.min()) if nz.size else 1.0
+
+        hist = []
+        n_prev = n.copy()
+        n_iter = 0
+        for k in range(n_steps):
+            etd2_step(n, dt, d, apply_F, bufs, np)
+            n_iter = k + 1
+            if (k % check_every) == 0 or k == n_steps - 1:
+                denom = max(float(np.abs(n).max()), 1e-300)
+                res = float(np.abs(n - n_prev).max()) / denom
+                hist.append(res)
+                if res < rtol and k >= check_every:
+                    break
+                n_prev = n.copy()
+        if return_info:
+            return n, {"residuals": hist, "dt": dt, "n_steps": n_iter}
         return n

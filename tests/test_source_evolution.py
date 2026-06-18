@@ -243,3 +243,25 @@ def test_source_blackbody_energy_density_and_peak():
     bb2 = SourceBlackBody(kT_eV, L_erg_s=1e45, R_cm=1e16)
     U_expect = 1e45 / (4 * np.pi * 1e16 ** 2 * PRINCE_UNITS.c) * PRINCE_UNITS.erg2GeV
     assert abs(bb2.U_gamma_GeV_cm3 / U_expect - 1.0) < 1e-6
+
+
+def test_steady_state_etd2_matches_spsolve_and_analytic():
+    """The genuine ETD2 march (prince_cr.solvers.etd2.etd2_step) must reproduce
+    the direct spsolve steady state to ~machine precision and the analytic
+    fast-cooling slope n∝γ^-(p+1)."""
+    c = 2.99792458e10
+    sze = SingleZoneSolver(gamma_lo=1.0, gamma_hi=1e9, n_bins=256,
+                           B_Gauss=10.0, t_esc_s=1e15 / c)
+    g = sze.g
+    p = 2.0
+    Q = np.where((g > 1e2) & (g < 1e6), g ** -p, 0.0)
+    n_ref = sze.steady_state(Q)                         # direct spsolve
+    n_etd, info = sze.steady_state_etd2(Q, return_info=True)
+    m = (g > 2e2) & (g < 5e5) & (n_ref > 0)
+    rel = np.abs(n_etd[m] - n_ref[m]) / np.abs(n_ref[m])
+    assert np.max(rel) < 1e-8, f"ETD2 vs spsolve max rel {np.max(rel):.2e}"
+    assert info["residuals"][-1] < 1e-6
+    # fast-cooling slope n ∝ γ^-(p+1) = γ^-3
+    mm = (g > 1e3) & (g < 1e5) & (n_etd > 0)
+    slope = np.median(np.gradient(np.log(n_etd), np.log(g))[mm])
+    assert -3.2 < slope < -2.8, f"slope {slope:.2f}"
