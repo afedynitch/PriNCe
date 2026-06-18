@@ -202,6 +202,21 @@ class SingleZoneSolver:
         # extra (non-∝γ²) energy-loss terms at interfaces, e.g. pγ / BH (it6b)
         self._gdot_extra_if = np.zeros_like(self.g_if)
 
+    @classmethod
+    def on_grid(cls, g, g_if, dg, **kw):
+        """Construct on an EXPLICIT cell-centre / interface / width grid instead
+        of the internal log ``_trapz_grid``. Used to put the validated radiative
+        kernels onto the PriNCe ``em_grid`` (γ_e = E_e/m_e c² on its bin centres)
+        so they assemble into the native combined operator. ``g``/``g_if``/``dg``
+        are the centres (len N), interfaces (len N+1), and widths (len N) in γ_e.
+        All physics (cooling, synchrotron/IC emission, SSA) is grid-agnostic."""
+        g = np.asarray(g, float); g_if = np.asarray(g_if, float); dg = np.asarray(dg, float)
+        self = cls(gamma_lo=float(g[0]), gamma_hi=float(g[-1]), n_bins=g.size, **kw)
+        self.g, self.g_if, self.dg = g, g_if, dg
+        self.n_bins = g.size
+        self._gdot_extra_if = np.zeros_like(self.g_if)
+        return self
+
     # --- cooling rate at interfaces (Thomson syn+IC ∝γ² + extra terms) ---
     def gdot_if(self):
         """γ̇ at cell interfaces [1/s], negative (energy loss).
