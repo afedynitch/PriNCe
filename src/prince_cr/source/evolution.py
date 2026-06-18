@@ -39,8 +39,13 @@ _H_ERG_S = 6.62607015e-27        # Planck (erg s)
 _NU_B_PER_G = _E_ESU / (2.0 * np.pi * _ME_G * _C)   # ν_B / B  [Hz/Gauss]
 
 
-def _build_fsync_table(n_t=4000, x_lo=1e-5, x_hi=60.0):
-    """Tabulate the synchrotron function F(x) = x ∫_x^∞ K_{5/3}(t) dt."""
+def _build_fsync_table(n_t=6000, x_lo=1e-5, x_hi=300.0):
+    """Tabulate the synchrotron function F(x) = x ∫_x^∞ K_{5/3}(t) dt.
+
+    ``x_hi`` reaches deep into the exp tail (F∝x^{1/2}e^{-x}; F(300)~1e-128) so
+    the kernel does NOT hard-zero in any realistic SED. A short x_hi (was 60)
+    truncated the tail and put a derivative DISCONTINUITY in synchrotron cutoffs
+    (the emitter crossing x_hi drops to 0); extending it makes the rolloff smooth."""
     t = np.logspace(np.log10(x_lo), np.log10(x_hi), n_t)
     k = kv(5.0 / 3.0, t)
     dI = 0.5 * (k[1:] + k[:-1]) * np.diff(t)          # trapz per interval
@@ -62,11 +67,15 @@ def synchrotron_F(x):
     return out
 
 
-def _build_gavg_table(n_y=400, y_lo=1e-4, y_hi=20.0, n_alpha=128):
+def _build_gavg_table(n_y=600, y_lo=1e-4, y_hi=100.0, n_alpha=128):
     """Pitch-angle-averaged synchrotron kernel for an ISOTROPIC electron
     distribution:  G(y) = ∫_0^{π/2} sin²α F(y/sinα) dα,  y = ν/ν_c0,
     ν_c0 = (3/2)γ²ν_B (the sinα=1 critical frequency).  The extra sinα (from
-    B_perp = B sinα) and the (½ sinα)dα solid-angle weight combine to sin²α."""
+    B_perp = B sinα) and the (½ sinα)dα solid-angle weight combine to sin²α.
+
+    ``y_hi`` extended (was 20) so G(y) carries the smooth exp tail to where it is
+    negligible (G(100)~1e-43) instead of hard-zeroing — removes the derivative
+    discontinuity in synchrotron-cutoff SEDs (see _build_fsync_table)."""
     y = np.logspace(np.log10(y_lo), np.log10(y_hi), n_y)
     a = np.linspace(1e-3, np.pi / 2, n_alpha)
     sa = np.sin(a)

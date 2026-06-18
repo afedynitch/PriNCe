@@ -54,15 +54,21 @@ def sigma_gg(s):
     out = np.zeros_like(s)
     thr = s > 4.0 * M_E**2
     if np.any(thr):
-        beta = np.sqrt(1.0 - 4.0 * M_E**2 / s[thr])
-        b2 = beta * beta
+        # w = 1 - beta^2 = 4 m_e^2 / s. At s >> 4 m_e^2, beta -> 1 and the naive
+        # (1+beta)/(1-beta) divides by an underflowed (1-beta)=0 -> inf/NaN. Use
+        # the stable identity 1-beta = w/(1+beta) ⇒ (1+beta)/(1-beta) =
+        # (1+beta)^2 / w. The cross section then -> 0 as w -> 0 (high-s tail),
+        # as it should, with no division by zero.
+        w = 4.0 * M_E**2 / s[thr]
+        beta = np.sqrt(1.0 - w)
+        b2 = 1.0 - w
         out[thr] = (
             3.0
             / 16.0
             * SIGMA_THOMSON
-            * (1.0 - b2)
+            * w
             * (
-                (3.0 - b2 * b2) * np.log((1.0 + beta) / (1.0 - beta))
+                (3.0 - b2 * b2) * np.log((1.0 + beta) ** 2 / w)
                 - 2.0 * beta * (2.0 - b2)
             )
         )
