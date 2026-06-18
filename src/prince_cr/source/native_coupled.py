@@ -74,8 +74,25 @@ class NativeCoupledSolver:
     """
 
     def __init__(self, run, R_cm, B_Gauss, t_esc_s=None, external_field=None,
-                 hadronic=True, bethe_heitler=True):
+                 hadronic=True, bethe_heitler=True, loss_stencil=None):
         self.run = run
+        # Cooling-loss stencil for the e± advection.
+        #   None      → conservative FV 1st-order upwind (DEFAULT, robust): ALL the
+        #               stiff cooling self-loss is on the diagonal → ETD2-stable for
+        #               the full lepto-hadronic system (pairs to γ~1e9). But
+        #               O(h)-diffusive → inflates the leptonic synchrotron SED
+        #               ~12-40% at em16 (it48); the HADRONIC observables (field/ν)
+        #               are barely affected (it46 field 0.99×, ν 1.30× vs AM3).
+        #   "upwind2" → MCEq 2nd-order (it49: syn 0.99/SSC 1.04 at em16). ETD2-STABLE
+        #               ONLY when high-γ is UNPOPULATED (pure leptonic, e± ≤ γ_max):
+        #               its i+2 off-diagonal carries stiff cooling → with hadronic
+        #               pairs at γ~1e9 the explicit ETD2 stage diverges (h·|L_off|≫1).
+        #   "upwind"  → MCEq 1st-order FD (bidiagonal; syn 1.01 leptonic). Like FV in
+        #               structure → may be hadronic-stable; less diffusive than FV.
+        #   "expfit"  → most accurate (spsolve 0.975) but ETD2-unstable (7-pt).
+        # A robust higher-order fix for the ETD2 march needs a CONSERVATIVE 2nd-order
+        # FV flux (stiff loss stays on the diagonal). See lesson cooling-stencil-diffusion.
+        self.loss_stencil = loss_stencil
         self.sm = run.spec_man
         self.em = run.em_grid
         self.cr = run.cr_grid
@@ -333,7 +350,7 @@ class NativeCoupledSolver:
             rhs += L_had @ state
 
         # --- e± radiative cooling + escape (advection on em_grid) ---
-        M_e = self.sze.cooling_operator().tocsr()
+        M_e = self.sze.cooling_operator(loss_stencil=self.loss_stencil).tocsr()
         rhs[self.sl_ep] += M_e @ n_ep
         rhs[self.sl_em] += M_e @ n_em
 
@@ -380,7 +397,7 @@ class NativeCoupledSolver:
         if self.hadronic:
             self._L_had_frozen = self._hadr_matrix()
 
-        M_e = self.sze.cooling_operator().tocsr()
+        M_e = self.sze.cooling_operator(loss_stencil=self.loss_stencil).tocsr()
         diag_e = np.asarray(M_e.diagonal())
         d[self.sl_ep] += diag_e
         d[self.sl_em] += diag_e
@@ -431,6 +448,14 @@ class NativeCoupledSolver:
         n_done = 0
         for k in range(n_steps):
             d = self._diagonal(state)
+            # Every diagonal entry is physically a LOSS (cooling, escape, γγ, pγ);
+            # production is off-diagonal. A positive d is a discretisation artefact
+            # (e.g. the higher-order loss stencil's one-sided high-γ boundary row in
+            # the empty region) and would make exp(dt·d) overflow → NaN. Clamp ≤0;
+            # the (true_diag−0)·x for those cells stays explicit in apply_F (safe —
+            # those cells carry ~no mass). ETD2 stays consistent: apply_F uses the
+            # SAME clamped d.
+            np.minimum(d, 0.0, out=d)
 
             def apply_F(x, out, _d=d):
                 r, _ = self._full_rhs(x, Qp, Qe_prim)

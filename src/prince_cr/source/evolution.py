@@ -165,6 +165,76 @@ class CompositePhotonField:
         return out
 
 
+def _loss_deriv_op(g_if, method="expfit", alpha0=3.0):
+    """d/d(ln γ) banded derivative operator on a log grid — ported verbatim from
+    MCEq ``core._construct_differential_operator`` (the continuous-loss stencil).
+
+    The 1st-order upwind cooling FV operator is O(h)-diffusive: on a coarse log
+    grid it smears the cooled spectrum, inflating the high-γ tail (and hence the
+    synchrotron/IC SED) by ~10-40% at 16/dec (see runs it48). MCEq solves this
+    with a HIGHER-ORDER loss stencil — near-exact for power-law spectra E^{-α} on
+    a coarse grid, no fine bins. ``method``:
+      * ``"expfit"`` (MCEq default): 7-pt exponentially-fitted stencil anchored at
+        ``alpha0`` (exact for γ^{-α}, α≈alpha0).
+      * ``"upwind2"``: 2nd-order forward-biased upwind (monotone, full-matrix).
+      * ``"centered"``: symmetric 6th-order centred FD.
+      * ``"biased"``: legacy 7-pt biased stencil.
+      * ``"upwind"``: 1st-order upwind (diffusive; for the convergence study).
+    The continuous-loss operator is then ``M = -diag(1/γ)·D_u·diag(γ̇_centre)``
+    (≡ MCEq ``-diag(1/E)·op_matrix·diag(dEdX)``), see :meth:`cooling_operator`."""
+    g_if = np.asarray(g_if, float)
+    h = np.log(g_if[1:] / g_if[:-1])              # log-bin widths (per centre)
+    dim_e = h.size
+    last = dim_e - 1
+    op = np.zeros((dim_e, dim_e))
+
+    if method in ("upwind", "upwind2"):
+        if method == "upwind":
+            for r in range(dim_e - 1):
+                op[r, r] = -1.0 / h[r]; op[r, r + 1] = 1.0 / h[r]
+            op[last, last - 1] = -1.0 / h[last - 1]; op[last, last] = 1.0 / h[last - 1]
+        else:
+            for r in range(dim_e - 2):
+                op[r, r] = -1.5 / h[r]; op[r, r + 1] = 2.0 / h[r]; op[r, r + 2] = -0.5 / h[r]
+            for r in (dim_e - 2, last):
+                hh = h[r - 2]
+                op[r, r - 2] = 0.5 / hh; op[r, r - 1] = -2.0 / hh; op[r, r] = 1.5 / hh
+        return op
+
+    # high-order interior + one-sided polynomial boundary rows (MCEq layout)
+    diags_lm = [0, 1, 2, 3]; coef_lm = [-11, 18, -9, 2]; den_lm = 6
+    diags_l1 = [-1, 0, 1, 2, 3]; coef_l1 = [-3, -10, 18, -6, 1]; den_l1 = 12
+    diags_l2 = [-2, -1, 0, 1, 2, 3]; coef_l2 = [3, -30, -20, 60, -15, 2]; den_l2 = 60
+    diags_r2 = [-d for d in diags_l2[::-1]]; coef_r2 = [-d for d in coef_l2[::-1]]; den_r2 = den_l2
+    diags_r1 = [-d for d in diags_l1[::-1]]; coef_r1 = [-d for d in coef_l1[::-1]]; den_r1 = den_l1
+    diags_rm = [-d for d in diags_lm[::-1]]; coef_rm = [-d for d in coef_lm[::-1]]; den_rm = den_lm
+
+    if method == "biased":
+        diags_int = np.asarray(diags_l2); coeffs_int = np.asarray(coef_l2, float) / 60.0
+    elif method == "centered":
+        diags_int = np.asarray([-3, -2, -1, 1, 2, 3])
+        coeffs_int = np.asarray([-1, 9, -45, 45, -9, 1], float) / 60.0
+    elif method == "expfit":
+        diags_int = np.arange(-3, 4)
+        h_avg = float(np.mean(h))
+        deltas = np.array([-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0])
+        a = -float(alpha0) + deltas
+        Aexp = np.exp(np.outer(a, diags_int) * h_avg)
+        coeffs_int = np.linalg.solve(Aexp, a * h_avg)
+    else:
+        raise ValueError(f"Unknown loss stencil {method!r}")
+
+    op[0, np.asarray(diags_lm)] = np.asarray(coef_lm) / (den_lm * h[0])
+    op[1, 1 + np.asarray(diags_l1)] = np.asarray(coef_l1) / (den_l1 * h[1])
+    op[2, 2 + np.asarray(diags_l2)] = np.asarray(coef_l2) / (den_l2 * h[2])
+    op[last, last + np.asarray(diags_rm)] = np.asarray(coef_rm) / (den_rm * h[last])
+    op[last - 1, last - 1 + np.asarray(diags_r1)] = np.asarray(coef_r1) / (den_r1 * h[last - 1])
+    op[last - 2, last - 2 + np.asarray(diags_r2)] = np.asarray(coef_r2) / (den_r2 * h[last - 2])
+    for r in range(3, dim_e - 3):
+        op[r, r + diags_int] = coeffs_int / h[r]
+    return op
+
+
 class SingleZoneSolver:
     """Single-zone electron (γ) evolution under continuous cooling + injection
     + escape.  γ = E/m_e c² (dimensionless Lorentz factor).
@@ -224,6 +294,13 @@ class SingleZoneSolver:
         beta = self._beta_syn + self._beta_ic
         return -beta * self.g_if ** 2 + self._gdot_extra_if
 
+    def gdot_c(self):
+        """γ̇ at cell CENTRES [1/s], negative — for the higher-order (MCEq-stencil)
+        loss operator. Extra (pγ/BH) terms are averaged from the interfaces."""
+        beta = self._beta_syn + self._beta_ic
+        extra_c = 0.5 * (self._gdot_extra_if[:-1] + self._gdot_extra_if[1:])
+        return -beta * self.g ** 2 + extra_c
+
     def add_pgamma_cooling(self, photon_field, sigma_eps_GeV, A_mass_GeV=None):
         """Add proton/nucleus pγ photo-meson continuous cooling to the operator,
         computed from the validated `rates.photonuclear_cool_inv` on a source
@@ -264,12 +341,28 @@ class SingleZoneSolver:
         return self.g, np.asarray(n_e, dtype=float) / self.t_esc_arr()
 
     # --- operator assembly: conservative upwind advection (cooling) + escape ---
-    def cooling_operator(self):
+    def cooling_operator(self, loss_stencil=None, alpha0=3.0):
         """Sparse M [1/s] with dn/dt = M n for the cooling advection (+escape).
 
-        Conservative finite-volume, upwind flux (γ̇<0 ⇒ donor = upper cell),
-        open outflow at the low-γ boundary. Positivity- and number-preserving
-        (iteration-1 result)."""
+        ``loss_stencil=None`` (default): conservative finite-volume, 1st-order
+        upwind flux (γ̇<0 ⇒ donor = upper cell), open outflow at the low-γ
+        boundary. Positivity- and number-preserving — but O(h)-DIFFUSIVE on a
+        coarse log grid (inflates the cooled high-γ tail / synchrotron SED ~12-40%
+        at 16/dec, see it48).
+
+        ``loss_stencil`` ∈ {"expfit","upwind2","centered","biased","upwind"}:
+        the MCEq higher-order continuous-loss operator
+        ``M = -diag(1/γ)·D_u·diag(γ̇_centre)`` with ``D_u`` = d/d(ln γ) from
+        :func:`_loss_deriv_op` — near-exact for power-law spectra on a coarse grid
+        (cures the diffusion without fine bins). Not manifestly conservative/
+        positivity-preserving (the ETD2 march clips tiny undershoot)."""
+        if loss_stencil is not None:
+            D_u = _loss_deriv_op(self.g_if, method=loss_stencil, alpha0=alpha0)
+            M = -(1.0 / self.g)[:, None] * D_u * self.gdot_c()[None, :]
+            M = sp.csr_matrix(M)
+            if self.t_esc is not None:
+                M = M - sp.diags(1.0 / self.t_esc_arr())
+            return M
         N = self.n_bins
         g, dg = self.g, self.dg
         gdot = self.gdot_if()
