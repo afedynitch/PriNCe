@@ -340,8 +340,75 @@ class SingleZoneSolver:
         propagation solver consumes as injection. Returns (γ, rate)."""
         return self.g, np.asarray(n_e, dtype=float) / self.t_esc_arr()
 
+    def _cooling_operator_fv2(self, n_state=None):
+        """Conservative 2nd-order MUSCL FV cooling operator (van Leer limiter).
+
+        Flux at interface k (= lower edge g_if[k] of cell k); γ̇<0 ⇒ flow toward
+        lower γ ⇒ donor = cell k. MUSCL reconstruction of the donor to its lower
+        face:  n_face[k] = n_k − ½·φ(r_k)·(n_{k+1} − n_k),
+        r_k = (n_k − n_{k−1})/(n_{k+1} − n_k),  φ = van Leer = (r+|r|)/(1+|r|).
+        With φ frozen from ``n_state`` this is LINEAR in n; the donor (n_k) term
+        gives the diagonal (1+½φ)·γ̇/dg — stiff loss on the diagonal, ETD2-safe.
+        1st-order at the boundaries (k=0 outflow, top face = no inflow)."""
+        N = self.n_bins
+        g_if, dg = self.g_if, self.dg
+        gdot = self.gdot_if()                       # (N+1,) at interfaces, <0
+        n = (np.ones(N) if n_state is None
+             else np.clip(np.asarray(n_state, float), 0.0, None))
+        # van Leer limiter weight φ_k per cell (frozen); 0 at the end cells.
+        phi = np.zeros(N)
+        if n_state is not None:
+            dn_up = n[2:] - n[1:-1]                  # n_{k+1}-n_k, k=1..N-2
+            dn_dn = n[1:-1] - n[:-2]                 # n_k-n_{k-1}
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r = np.where(np.abs(dn_up) > 0, dn_dn / dn_up, 0.0)
+            phi[1:-1] = (r + np.abs(r)) / (1.0 + np.abs(r))   # van Leer ∈[0,2)
+            phi[~np.isfinite(phi)] = 0.0
+        # Stiffness (CFL) cap: ETD2 treats the 2nd-order correction EXPLICITLY, so
+        # where the cooling is ultra-stiff vs the step (dt·|γ̇|/dγ ≫ 1 — the very
+        # high-γ pairs in a lepto-hadronic run, γ~1e9) the explicit correction
+        # diverges. Revert those cells to 1st-order (φ→0): they are fast-cooling
+        # (steep, diffusion-insensitive) and feed the GeV–PeV band, not the SED
+        # peak. 2nd-order is retained for the slowly-cooling synchrotron-emitting
+        # electrons that set the SED. Cap ~3e4 keeps the pure-leptonic range
+        # (γ≤γ_max~1e7, CFL≲3e4) fully 2nd-order.
+        dt = getattr(self, "_fv2_dt", None)
+        if dt is not None:
+            cfl = dt * np.abs(self.gdot_c()) / np.maximum(dg, 1e-300)
+            phi = np.where(cfl > 3.0e4, 0.0, phi)
+        # face value at the lower edge of cell k (donor=k): n_face[k]
+        # = n_k − ½ φ_k (n_{k+1}-n_k) = n_k(1+½φ_k) − ½φ_k n_{k+1}, interior only.
+        rows, cols, vals = [], [], []
+
+        def add(i, j, v):
+            rows.append(i); cols.append(j); vals.append(v)
+
+        # interior interfaces k = 1..N-1 carry the MUSCL flux F[k]=gdot[k]·n_face[k];
+        # n_face[k] uses n_{k+1} only when k ≤ N-2 (else 1st order).
+        for k in range(1, N):
+            a = gdot[k]
+            if k <= N - 2:
+                c_k = a * (1.0 + 0.5 * phi[k])        # coeff of n_k in F[k]
+                c_kp1 = a * (-0.5 * phi[k])           # coeff of n_{k+1} in F[k]
+            else:                                     # top donor cell: 1st order
+                c_k, c_kp1 = a, 0.0
+            # cell k: interface k is its LOWER face → dn_k/dt += F[k]/dg[k]
+            add(k, k, c_k / dg[k])
+            if c_kp1:
+                add(k, k + 1, c_kp1 / dg[k])
+            # cell k-1: interface k is its UPPER face → dn_{k-1}/dt −= F[k]/dg[k-1]
+            add(k - 1, k, -c_k / dg[k - 1])
+            if c_kp1:
+                add(k - 1, k + 1, -c_kp1 / dg[k - 1])
+        # outflow at the lowest interface (k=0): F[0]=gdot[0]·n_0 leaves the domain
+        add(0, 0, gdot[0] / dg[0])
+        M = sp.csr_matrix((vals, (rows, cols)), shape=(N, N))
+        if self.t_esc is not None:
+            M = M - sp.diags(1.0 / self.t_esc_arr())
+        return M
+
     # --- operator assembly: conservative upwind advection (cooling) + escape ---
-    def cooling_operator(self, loss_stencil=None, alpha0=3.0):
+    def cooling_operator(self, loss_stencil=None, alpha0=3.0, n_state=None):
         """Sparse M [1/s] with dn/dt = M n for the cooling advection (+escape).
 
         ``loss_stencil=None`` (default): conservative finite-volume, 1st-order
@@ -350,12 +417,22 @@ class SingleZoneSolver:
         coarse log grid (inflates the cooled high-γ tail / synchrotron SED ~12-40%
         at 16/dec, see it48).
 
+        ``loss_stencil="fv2"``: CONSERVATIVE 2nd-order MUSCL FV flux (van Leer
+        limiter) — the ETD2-safe higher-order scheme. Keeps ALL the stiff cooling
+        self-loss on the diagonal (donor term, ENHANCED by the reconstruction →
+        exp(h·d) damps it exactly) with only a BOUNDED limited off-diagonal
+        correction; TVD ⇒ monotone, positivity-preserving, and stable in ETD2 for
+        the full lepto-hadronic system (unlike the MCEq FD stencils whose stiff
+        off-diagonal diverges at γ~1e9). ``n_state`` supplies the spectrum the
+        limiter weights are frozen from (per ETD2 step); None ⇒ no limiting (≈1st).
+
         ``loss_stencil`` ∈ {"expfit","upwind2","centered","biased","upwind"}:
-        the MCEq higher-order continuous-loss operator
+        the MCEq higher-order FD continuous-loss operator
         ``M = -diag(1/γ)·D_u·diag(γ̇_centre)`` with ``D_u`` = d/d(ln γ) from
         :func:`_loss_deriv_op` — near-exact for power-law spectra on a coarse grid
-        (cures the diffusion without fine bins). Not manifestly conservative/
-        positivity-preserving (the ETD2 march clips tiny undershoot)."""
+        but ETD2-stable only when high-γ is unpopulated (off-diagonal stiffness)."""
+        if loss_stencil == "fv2":
+            return self._cooling_operator_fv2(n_state)
         if loss_stencil is not None:
             D_u = _loss_deriv_op(self.g_if, method=loss_stencil, alpha0=alpha0)
             M = -(1.0 / self.g)[:, None] * D_u * self.gdot_c()[None, :]

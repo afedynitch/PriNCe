@@ -158,6 +158,8 @@ class NativeCoupledSolver:
 
         self._J_cache = None                 # last hadronic jacobian (debug)
         self._L_had_frozen = None             # c·J frozen for the current ETD2 step
+        self._n_e_frozen = None               # step-start e± total for the fv2 limiter
+        self._dt = self.t_esc                 # ETD2 step (for the fv2 CFL stiffness cap)
 
     # ---------------- field bookkeeping ----------------
     def _proton_synch_density(self, n_p):
@@ -350,7 +352,8 @@ class NativeCoupledSolver:
             rhs += L_had @ state
 
         # --- e± radiative cooling + escape (advection on em_grid) ---
-        M_e = self.sze.cooling_operator(loss_stencil=self.loss_stencil).tocsr()
+        M_e = self.sze.cooling_operator(loss_stencil=self.loss_stencil,
+                                        n_state=self._n_e_frozen).tocsr()
         rhs[self.sl_ep] += M_e @ n_ep
         rhs[self.sl_em] += M_e @ n_em
 
@@ -388,6 +391,8 @@ class NativeCoupledSolver:
         escape; ν escape. Field-dependent pieces frozen at step start."""
         n_ep = state[self.sl_ep]; n_em = state[self.sl_em]; n_g = state[self.sl_g]
         n_p = state[self.sl_p] if self.sl_p is not None else None
+        self._n_e_frozen = n_ep + n_em        # freeze fv2 limiter weights @ step start
+        self.sze._fv2_dt = self._dt           # CFL stiffness cap for the fv2 limiter
         self._set_field(n_ep + n_em, n_g, n_p)
         self.sze.set_ic_target(self._u_rad())
         d = np.zeros_like(state)
@@ -397,7 +402,8 @@ class NativeCoupledSolver:
         if self.hadronic:
             self._L_had_frozen = self._hadr_matrix()
 
-        M_e = self.sze.cooling_operator(loss_stencil=self.loss_stencil).tocsr()
+        M_e = self.sze.cooling_operator(loss_stencil=self.loss_stencil,
+                                        n_state=self._n_e_frozen).tocsr()
         diag_e = np.asarray(M_e.diagonal())
         d[self.sl_ep] += diag_e
         d[self.sl_em] += diag_e
@@ -439,6 +445,7 @@ class NativeCoupledSolver:
         state = (np.zeros(self.dim) if n0 is None else np.asarray(n0, float).copy())
         if dt is None:
             dt = self.t_esc
+        self._dt = dt
 
         snapshots = []
         rec = sorted(record_times) if record_times else []
