@@ -74,8 +74,13 @@ class NativeCoupledSolver:
     """
 
     def __init__(self, run, R_cm, B_Gauss, t_esc_s=None, external_field=None,
-                 hadronic=True, bethe_heitler=True, loss_stencil=None):
+                 hadronic=True, bethe_heitler=True, loss_stencil=None,
+                 gg_pairs=True):
         self.run = run
+        # gg_pairs: inject γγ→e± pairs (the cascade source). Photons are still
+        # γγ-ABSORBED (γ sink) regardless; gg_pairs=False only suppresses the e±
+        # re-injection, isolating the cascade-feedback contribution (diagnostic).
+        self.gg_pairs = gg_pairs
         # Cooling-loss stencil for the e± advection.
         #   None      → conservative FV 1st-order upwind (DEFAULT, robust): ALL the
         #               stiff cooling self-loss is on the diagonal → ETD2-stable for
@@ -388,7 +393,18 @@ class NativeCoupledSolver:
         # --- hadronic: c·J @ state (proton loss + secondary injection) ---
         if self.hadronic:
             L_had = self._hadr_matrix()
-            rhs += L_had @ state
+            inj_had = L_had @ state
+            # UNITS: the c·J secondaries come out as dN/dE on each species' energy
+            # grid (PriNCe's transport convention, like p/ν/γ). The e± state lives
+            # on the em_grid in dN/dγ_e (γ_e=E_e/m_ec², the SingleZoneSolver/cooling
+            # convention used by M_e, Q_pair, Qe_prim). Convert the e± rows:
+            # dN/dE_e → dN/dγ_e = ×(dE/dγ)=×m_ec². WITHOUT this the photo-pion e±
+            # were over-injected by 1/m_ec²≈1957× — the high-γ pair over-production
+            # / 39× high-E synchrotron (γ/p/ν stay dN/dE, consistent with their
+            # states → field 0.99× and ν 1.30× were unaffected).
+            inj_had[self.sl_ep] *= _ME_C2_GeV
+            inj_had[self.sl_em] *= _ME_C2_GeV
+            rhs += inj_had
 
         # --- e± radiative cooling + escape (advection on em_grid) ---
         M_e = self.sze.cooling_operator(loss_stencil=self.loss_stencil,
@@ -398,7 +414,8 @@ class NativeCoupledSolver:
 
         # --- γγ absorption rate + pair injection (γ→e±) ---
         tgg = gamma_gamma_abs_inv(self.Eg, self.field, self._eps_soft)
-        Q_pair = self._pair_injection(n_g, tgg)         # dN/dγ_e, shared e+/e-
+        Q_pair = (self._pair_injection(n_g, tgg) if self.gg_pairs
+                  else np.zeros_like(self.sze.g))      # dN/dγ_e, shared e+/e-
         if self.bethe_heitler and self.sl_p is not None:
             Q_pair = Q_pair + self._bh_pair_injection(state[self.sl_p])
         rhs[self.sl_ep] += 0.5 * Q_pair
