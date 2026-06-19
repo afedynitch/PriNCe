@@ -115,6 +115,15 @@ class NativeCoupledSolver:
         self.sl_em = self.sl[11]
         self.sl_p = self.sl.get(2212)
         self.nu_sls = [self.sl[p] for p in _NU_PDGS if p in self.sl]
+        # All cr-grid CR species FREE-STREAM / escape at R/c (p, p̄, n, n̄, ν…) —
+        # everything except the radiatively-handled em species (e±, γ). With a
+        # finite config.tau_dec_threshold the NEUTRON (2112) is tracked (not
+        # chain-reduced) so it ESCAPES here instead of β-decaying in-zone — fixing
+        # the spurious low-E e⁻/ν̄_e (n→p e⁻ ν̄_e); high-γ neutrons physically leave
+        # (decay length γcτ_n ≫ R). See lesson in-source-neutron-beta-decay.
+        _em_pdgs = (11, -11, 22)
+        self.sl_cr_escape = [self.sl[pdg] for pdg in self.sm.known_species
+                             if pdg not in _em_pdgs]
 
         # --- e± radiative solver ON the em_grid (γ_e = E_e/m_e c²) ---
         gC = self.em.grid / _ME_C2_GeV
@@ -403,14 +412,14 @@ class NativeCoupledSolver:
         Q_g_emit = self._emission_onto_emgrid(n_e_tot, n_p)
         rhs[self.sl_g] += Q_g_emit - (1.0 / self.t_esc + tgg) * n_g
 
-        # --- proton injection + escape (pγ loss already in c·J diagonal) ---
-        if self.sl_p is not None:
-            if Qp is not None:
-                rhs[self.sl_p] += Qp
-            rhs[self.sl_p] -= state[self.sl_p] / self.t_esc
+        # --- proton injection (pγ loss + secondary coupling already in c·J) ---
+        if self.sl_p is not None and Qp is not None:
+            rhs[self.sl_p] += Qp
 
-        # --- neutrinos: free-stream escape (injection already in c·J) ---
-        for sl in self.nu_sls:
+        # --- escape of ALL cr-grid CR species (p, p̄, n, n̄, ν): free-stream R/c.
+        # Neutron escapes here (tracked under finite tau_dec_threshold) instead of
+        # β-decaying in-zone — the n→p e⁻ ν̄_e fix.
+        for sl in self.sl_cr_escape:
             rhs[sl] -= state[sl] / self.t_esc
 
         return rhs, tgg
@@ -441,16 +450,11 @@ class NativeCoupledSolver:
         tgg = gamma_gamma_abs_inv(self.Eg, self.field, self._eps_soft)
         d[self.sl_g] += -(1.0 / self.t_esc + tgg)
 
-        if self.hadronic:
-            L_had = self._L_had_frozen
-            dh = np.asarray(L_had.diagonal())
-            # proton pγ-loss diagonal (γ/e±/ν hadronic diagonals are ~0)
-            if self.sl_p is not None:
-                d[self.sl_p] += dh[self.sl_p]
-        if self.sl_p is not None:
-            d[self.sl_p] += -1.0 / self.t_esc
-        for sl in self.nu_sls:
-            d[sl] += -1.0 / self.t_esc
+        # cr-grid species: c·J self-loss diagonal (pγ/nγ loss; ν≈0) + escape R/c
+        dh = (np.asarray(self._L_had_frozen.diagonal()) if self.hadronic
+              else np.zeros_like(state))
+        for sl in self.sl_cr_escape:
+            d[sl] += dh[sl] - 1.0 / self.t_esc
         return d
 
     # ---------------- the ETD2 march ----------------
