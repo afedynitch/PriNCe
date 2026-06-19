@@ -199,14 +199,44 @@ class NativeCoupledSolver:
         keep = ntot > 0
         return Eb[keep], ntot[keep]
 
-    def _set_field(self, n_e_tot, n_g, n_p=None):
+    def _ic_subMeV(self, n_e_tot):
+        """Sub-em-floor inverse-Compton (SSC) photon density (E_GeV, n_GeV),
+        reconstructed from the e± on the CURRENT field as IC target. The em_grid
+        γ-state holds only the ≥0.5 MeV IC; for low-γ_max leptonic SSC the whole
+        IC hump sits below the floor (e.g. ~600 eV for γ_max=1e3) — this recovers
+        it for the OUTPUT field/SED. (Not used as a solve target — 2nd-order IC is
+        negligible at the relevant Compton dominance.)"""
+        eps_t = self._eps_soft * _ERG_GeV
+        n_t = self.field.get_photon_density(self._eps_soft) / _ERG_GeV
+        sel = n_t > 0
+        if sel.sum() < 3:
+            return np.empty(0), np.empty(0)
+        eps_out = np.logspace(np.log10(1e-10 * _ERG_GeV),
+                              np.log10(self.Eg[-1] * _ERG_GeV), 220)
+        Q_ic = self.sze.ic_sed(n_e_tot, eps_t[sel], n_t[sel], eps_out) * _ERG_GeV
+        E_ic = eps_out / _ERG_GeV
+        n_ic = Q_ic * self.t_esc                       # in-zone density (sub-MeV: γγ≈0)
+        below = (E_ic < self.Eg[0]) & (n_ic > 0) & np.isfinite(n_ic)
+        return E_ic[below], n_ic[below]
+
+    def _set_field(self, n_e_tot, n_g, n_p=None, include_ic=False):
         """Common field = external + [sub-MeV e±+proton synchrotron target]
-        + [γ-state ≥0.5 MeV]."""
+        + [γ-state ≥0.5 MeV]. ``include_ic`` (OUTPUT only): also fold the sub-MeV
+        IC/SSC into the field so the emergent SED carries the full Compton hump
+        (the solve leaves it off — synchrotron is the dominant IC/γγ target)."""
         Esub, nsub = self._synch_target(n_e_tot, n_p)
         ng = np.clip(n_g, 0.0, None)
-        E_comb = np.concatenate([Esub, self.Eg])
-        n_comb = np.concatenate([nsub, ng])
-        self.field.set_internal(E_comb, n_comb)
+        self.field.set_internal(np.concatenate([Esub, self.Eg]),
+                                np.concatenate([nsub, ng]))
+        if include_ic and Esub.size:
+            E_ic, n_ic = self._ic_subMeV(n_e_tot)      # uses the synchrotron target just set
+            if E_ic.size >= 2:
+                add = np.exp(np.interp(np.log(Esub), np.log(E_ic),
+                                       np.log(np.clip(n_ic, 1e-300, None)),
+                                       left=-np.inf, right=-np.inf))
+                add = np.where((Esub >= E_ic.min()) & (Esub <= E_ic.max()), add, 0.0)
+                self.field.set_internal(np.concatenate([Esub, self.Eg]),
+                                        np.concatenate([nsub + add, ng]))
 
     def _u_rad(self):
         """Field energy density [erg/cm³] over the full target span (for IC cooling)."""
@@ -497,7 +527,8 @@ class NativeCoupledSolver:
         """Per-block views of the state vector + the converged common field."""
         n_g = state[self.sl_g]
         n_p = state[self.sl_p] if self.sl_p is not None else None
-        self._set_field(state[self.sl_ep] + state[self.sl_em], n_g, n_p)
+        # OUTPUT field carries the full SSC (sub-MeV IC folded in); solve unaffected
+        self._set_field(state[self.sl_ep] + state[self.sl_em], n_g, n_p, include_ic=True)
         nu_tot = sum(state[sl] for sl in self.nu_sls) if self.nu_sls else None
         return {
             "state": state,
