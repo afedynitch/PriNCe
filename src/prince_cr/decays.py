@@ -11,6 +11,8 @@ from prince_cr.data import spec_data
 # numbering scheme.
 _PDG_PI_PLUS = 211
 _PDG_PI_MINUS = -211
+_PDG_PI_ZERO = 111
+_PDG_GAMMA = 22
 _PDG_MU_PLUS = -13
 _PDG_MU_MINUS = 13
 _PDG_NU_E = 12
@@ -112,6 +114,12 @@ def get_decay_matrix(mo, da, x_grid):
     info(10, "Generating decay redistribution for", mo, da)
 
     # --------------------------------
+    # pi0 → gamma gamma (analytic lab-frame box; see pi0_to_gamma)
+    # --------------------------------
+    if mo == _PDG_PI_ZERO and da == _PDG_GAMMA:
+        return pi0_to_gamma(x_grid)
+
+    # --------------------------------
     # pi+ → nu_mu, pi- → nu_mubar
     # --------------------------------
     if mo == _PDG_PI_PLUS and da == _PDG_NU_MU:
@@ -200,13 +208,27 @@ def get_decay_matrix_bin_average(mo, da, x_lower, x_upper):
     result = None
 
     # --------------------------------
+    # pi0 → gamma gamma : analytic lab-frame box, OVERRIDES the tabulated kernel.
+    # The tabulated π⁰→γγ entry is the rest-frame spike at x=½ (see the comment in
+    # _tabulated_decay_avg); used as a lab-frame redistribution it pins every γ at
+    # half the π⁰ energy and loses the broad low-E box tail (verified vs AM3:
+    # native π⁰→γγ caught ~8% of the photon number below 1e14 eV). The correct
+    # lab-frame distribution is analytic (massless daughter, ultra-relativistic
+    # parent) so we use it directly. See pi0_to_gamma_avg.
+    # --------------------------------
+    if mo == _PDG_PI_ZERO and da == _PDG_GAMMA:
+        result = pi0_to_gamma_avg(x_lower, x_upper)
+
+    # --------------------------------
     # Tabulated FLUKA / Pythia (preferred — populated at module load by
     # data._merge_tabulated_decays from /decays/FLUKA_DECAY_2025/ and
     # /decays/PYTHIA_HADRON_2025/). Both groups share PriNCe's per-nucleon
     # x convention: nuclei -> x = E_d_rest/m_N, hadrons -> x = E_d_rest/m_mo.
     # --------------------------------
     from prince_cr.data import _TABULATED_DECAY_DX, _TABULATED_DECAY_XBINS
-    if (mo, da) in _TABULATED_DECAY_DX and _TABULATED_DECAY_XBINS is not None:
+    if result is not None:
+        pass
+    elif (mo, da) in _TABULATED_DECAY_DX and _TABULATED_DECAY_XBINS is not None:
         result = _tabulated_decay_avg(
             _TABULATED_DECAY_DX[(mo, da)], _TABULATED_DECAY_XBINS,
             x_lower, x_upper,
@@ -275,6 +297,51 @@ def get_decay_matrix_bin_average(mo, da, x_lower, x_upper):
         result = res_mat
 
     return result
+
+
+#: photon multiplicity of the π⁰ → γγ channel (INCLUSIVE 2-photon spectrum).
+#: The chain reducer (_DecayChainReducer) records the (111, 22) channel ONCE
+#: (the [22, 22] daughter loop overwrites in _record_stable), so the kernel must
+#: carry both photons — matching the tabulated FLUKA/Pythia (111,22) kernel,
+#: which integrates to ≈2. Per-photon density is 1 on [0,1]; ×2 gives the box.
+_PI0_GAMMA_MULTIPLICITY = 2.0
+
+
+def pi0_to_gamma(x):
+    """Lab-frame INCLUSIVE 2-photon energy distribution of π⁰ → γγ.
+
+    Two-body decay into massless daughters: in the π⁰ rest frame each photon
+    carries E* = m_π0/2; boosting an ultra-relativistic π⁰ (β→1, as for the
+    photo-meson secondaries) spreads each lab photon uniformly over
+    x = E_γ/E_π0 ∈ [0, 1] (the r→0 limit of `pion_to_numu`). The inclusive
+    spectrum of the two photons is therefore a box dN/dx = 2 on [0,1], with
+    ∫dN/dx dx = 2 (two photons) and ∫x dN/dx dx = 1 → E_π0 total (energy-
+    conserving). Replaces the tabulated rest-frame spike at x=½, which used as
+    a lab redistribution pins every γ at E_π0/2 and loses the low-E box tail.
+    """
+    res = np.zeros(x.shape)
+    res[np.logical_and(0.0 < x, x <= 1.0)] = _PI0_GAMMA_MULTIPLICITY
+    return res
+
+
+def pi0_to_gamma_avg(x_lower, x_upper):
+    """Bin-averaged `pi0_to_gamma`: box on [0,1] with inclusive density 2."""
+    if x_lower.shape != x_upper.shape:
+        raise Exception("different grids for xmin, xmax provided")
+
+    bins_width = x_upper - x_lower
+    res = np.zeros(x_lower.shape)
+    xmin, xmax = 0.0, 1.0
+
+    # upper bin edge not contained (x_lower < 1 < x_upper)
+    cond = np.where(np.logical_and(x_lower < xmax, x_upper > xmax))
+    res[cond] = _PI0_GAMMA_MULTIPLICITY * (xmax - x_lower[cond]) / bins_width[cond]
+
+    # bins fully contained in [0, 1]
+    cond = np.where(np.logical_and(xmin <= x_lower, x_upper <= xmax))
+    res[cond] = _PI0_GAMMA_MULTIPLICITY
+
+    return res
 
 
 def pion_to_numu(x):
