@@ -299,25 +299,31 @@ def get_decay_matrix_bin_average(mo, da, x_lower, x_upper):
     return result
 
 
-#: photon multiplicity of the π⁰ → γγ channel (INCLUSIVE 2-photon spectrum).
-#: The chain reducer (_DecayChainReducer) records the (111, 22) channel ONCE
-#: (the [22, 22] daughter loop overwrites in _record_stable), so the kernel must
-#: carry both photons — matching the tabulated FLUKA/Pythia (111,22) kernel,
-#: which integrates to ≈2. Per-photon density is 1 on [0,1]; ×2 gives the box.
-_PI0_GAMMA_MULTIPLICITY = 2.0
+#: PER-PHOTON density of the π⁰ → γγ channel box (dN/dx = 1 on [0,1]).
+#: CRITICAL: the chain reducer's ``new_dec_diff_tab`` is an AdditiveDictionary
+#: (util.py), so each of the TWO daughters in the (111, [22,22]) branching loop
+#: (_recurse_into_daughters) ACCUMULATES — the box is applied twice. The kernel
+#: must therefore be PER-PHOTON (∫dN/dx=1, ∫x dN/dx=½); the two accumulated
+#: applications give 2 photons total carrying ∫x = 1 → E_π0 (energy-conserving).
+#: An earlier value of 2.0 (mistaking the AdditiveDictionary for overwrite)
+#: DOUBLED the π⁰→γγ photon energy (γ_reduced = 2×π⁰_raw), breaking c·J energy
+#: conservation (Σx 1.15→0.94) and inflating the in-source γ ~2× vs AM3. See
+#: lesson pi0-gamma-box-double-count. (Verified it87: γ→π⁰ energy at mult=1.)
+_PI0_GAMMA_MULTIPLICITY = 1.0
 
 
 def pi0_to_gamma(x):
-    """Lab-frame INCLUSIVE 2-photon energy distribution of π⁰ → γγ.
+    """Lab-frame PER-PHOTON energy distribution of one γ from π⁰ → γγ.
 
     Two-body decay into massless daughters: in the π⁰ rest frame each photon
     carries E* = m_π0/2; boosting an ultra-relativistic π⁰ (β→1, as for the
     photo-meson secondaries) spreads each lab photon uniformly over
-    x = E_γ/E_π0 ∈ [0, 1] (the r→0 limit of `pion_to_numu`). The inclusive
-    spectrum of the two photons is therefore a box dN/dx = 2 on [0,1], with
-    ∫dN/dx dx = 2 (two photons) and ∫x dN/dx dx = 1 → E_π0 total (energy-
-    conserving). Replaces the tabulated rest-frame spike at x=½, which used as
-    a lab redistribution pins every γ at E_π0/2 and loses the low-E box tail.
+    x = E_γ/E_π0 ∈ [0, 1] (the r→0 limit of `pion_to_numu`). Per photon the
+    density is dN/dx = 1 on [0,1] (∫x dN/dx = ½). The reducer's
+    AdditiveDictionary accumulates the two [22,22] daughters → 2 photons,
+    ∫x = 1 → E_π0 total (energy-conserving). Replaces the tabulated rest-frame
+    spike at x=½, which used as a lab redistribution pins every γ at E_π0/2 and
+    loses the low-E box tail.
     """
     res = np.zeros(x.shape)
     res[np.logical_and(0.0 < x, x <= 1.0)] = _PI0_GAMMA_MULTIPLICITY
@@ -325,7 +331,7 @@ def pi0_to_gamma(x):
 
 
 def pi0_to_gamma_avg(x_lower, x_upper):
-    """Bin-averaged `pi0_to_gamma`: box on [0,1] with inclusive density 2."""
+    """Bin-averaged `pi0_to_gamma`: box on [0,1] with per-photon density 1."""
     if x_lower.shape != x_upper.shape:
         raise Exception("different grids for xmin, xmax provided")
 
