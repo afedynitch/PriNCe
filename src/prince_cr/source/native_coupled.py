@@ -75,12 +75,27 @@ class NativeCoupledSolver:
 
     def __init__(self, run, R_cm, B_Gauss, t_esc_s=None, external_field=None,
                  hadronic=True, bethe_heitler=True, loss_stencil=None,
-                 gg_pairs=True):
+                 gg_pairs=True, gg_reservoir_sink=False):
         self.run = run
         # gg_pairs: inject γγ→e± pairs (the cascade source). Photons are still
         # γγ-ABSORBED (γ sink) regardless; gg_pairs=False only suppresses the e±
         # re-injection, isolating the cascade-feedback contribution (diagnostic).
         self.gg_pairs = gg_pairs
+        # gg_reservoir_sink (DEFAULT OFF): also deplete the SUB-m_e synchrotron
+        # reservoir by γγ pair-production against the hard (≥0.5 MeV) γ-state.
+        # The reservoir (radio→X-ray synch below the em floor) is normally a passive
+        # target+escape population — its γγ loss is negligible because n_soft ≫ n_hard,
+        # and each γγ event's pair energy is already booked from the absorbed HARD
+        # photon (the soft photon only adds E_soft ≪ E_hard). For γγ-THICK / pair-
+        # runaway regimes where the reprocessed hard field approaches n_soft this is no
+        # longer negligible; enabling this applies the soft-photon γγ sink
+        #   n_soft(ε) → n_soft(ε) / (1 + t_esc · t_γγ⁻¹(ε))
+        # using the SAME gamma_gamma_abs_inv kernel (evaluated at the reservoir energies
+        # against the γ-state). Pairs are NOT re-injected here (already counted from the
+        # hard side). A guard warns when the depletion is non-negligible. See
+        # lessons/em-cascade-reservoir-gg-sink.
+        self.gg_reservoir_sink = bool(gg_reservoir_sink)
+        self._gg_sink_warned = False
         # Cooling-loss stencil for the e± advection.
         #   None      → conservative FV 1st-order upwind (DEFAULT, robust): ALL the
         #               stiff cooling self-loss is on the diagonal → ETD2-stable for
@@ -242,6 +257,12 @@ class NativeCoupledSolver:
         ng = np.clip(n_g, 0.0, None)
         self.field.set_internal(np.concatenate([Esub, self.Eg]),
                                 np.concatenate([nsub, ng]))
+        # OPTIONAL γγ depletion of the sub-m_e synch reservoir (γγ-thick regimes).
+        # Needs the field just set (to read the hard γ-state as the γγ target).
+        if self.gg_reservoir_sink and Esub.size:
+            nsub = self._reservoir_gg_sink(Esub, nsub)
+            self.field.set_internal(np.concatenate([Esub, self.Eg]),
+                                    np.concatenate([nsub, ng]))
         if include_ic and Esub.size:
             E_ic, n_ic = self._ic_subMeV(n_e_tot)      # uses the synchrotron target just set
             if E_ic.size >= 2:
@@ -251,6 +272,35 @@ class NativeCoupledSolver:
                 add = np.where((Esub >= E_ic.min()) & (Esub <= E_ic.max()), add, 0.0)
                 self.field.set_internal(np.concatenate([Esub, self.Eg]),
                                         np.concatenate([nsub + add, ng]))
+
+    def _reservoir_gg_sink(self, Esub, nsub):
+        """Deplete the sub-m_e synchrotron reservoir by γγ pair-production against the
+        hard (≥0.5 MeV) γ-state, for γγ-thick / pair-runaway regimes (opt-in via
+        gg_reservoir_sink). Steady state with escape + γγ loss:
+            n_soft(ε) → n_soft(ε) · (1 + t_esc·t_γγ⁻¹(ε))⁻¹ ,
+        where t_γγ⁻¹(ε) is the SAME `gamma_gamma_abs_inv` kernel evaluated at the soft
+        reservoir energies ``Esub`` with the γ-state grid ``self.Eg`` as the (hard)
+        target. Pairs from these events are already injected from the absorbed hard
+        photon (the soft side only contributes E_soft ≪ E_hard), so they are NOT
+        re-injected here. Emits a one-shot guard warning when the depletion is
+        non-negligible (the n_soft ≫ n_hard assumption being stressed). Returns the
+        depleted reservoir density."""
+        rate = np.asarray(gamma_gamma_abs_inv(Esub, self.field, self.Eg), dtype=float)
+        rate = np.where(np.isfinite(rate) & (rate > 0), rate, 0.0)
+        supp = 1.0 / (1.0 + self.t_esc * rate)             # escape / (escape + γγ)
+        max_depl = float(1.0 - np.min(supp)) if supp.size else 0.0
+        if max_depl > 0.1 and not self._gg_sink_warned:    # >10% reservoir depletion
+            import warnings
+            i = int(np.argmin(supp))
+            warnings.warn(
+                "NativeCoupledSolver: γγ depletion of the sub-m_e synchrotron reservoir "
+                f"reaches {max_depl:.0%} (at ε≈{Esub[i]*1e9:.2e} eV). The reservoir "
+                "(n_soft ≫ n_hard) approximation is being stressed — results in this "
+                "regime carry an extra systematic; consider a full sub-m_e photon "
+                "treatment. (gg_reservoir_sink partially corrects the soft-photon loss.)",
+                RuntimeWarning, stacklevel=2)
+            self._gg_sink_warned = True
+        return nsub * supp
 
     def _u_rad(self):
         """Field energy density [erg/cm³] over the full target span (for IC cooling)."""
