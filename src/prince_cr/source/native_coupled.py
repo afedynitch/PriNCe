@@ -258,6 +258,13 @@ class NativeCoupledSolver:
         n = self.field.get_photon_density(e)
         return float(np.trapezoid(e * n, e)) * _ERG_GeV
 
+    def _set_ic_cooling_target(self):
+        """Set the e± IC-cooling target to the current field SPECTRUM so the cooling is
+        Klein-Nishina-corrected (γ-dependent), not Thomson. eps[erg], n_ph[cm^-3 erg^-1]."""
+        eps_t = self._eps_soft * _ERG_GeV                                  # erg
+        n_t = self.field.get_photon_density(self._eps_soft) / _ERG_GeV     # cm^-3 erg^-1
+        self.sze.set_ic_target_spectrum(eps_t, n_t)
+
     # ---------------- rebin a production component onto em.grid ----------------
     def _sum_on_Eg(self, comps):
         """comps = [(E_GeV, Q[GeV⁻¹cm⁻³s⁻¹]), …] → summed Q on the em γ-grid."""
@@ -386,7 +393,7 @@ class NativeCoupledSolver:
 
         # refresh the common field from this stage's state (e±+proton synch target)
         self._set_field(n_e_tot, n_g, n_p)
-        self.sze.set_ic_target(self._u_rad())
+        self._set_ic_cooling_target()
 
         rhs = np.zeros_like(state)
 
@@ -450,7 +457,7 @@ class NativeCoupledSolver:
         self._n_e_frozen = n_ep + n_em        # freeze fv2 limiter weights @ step start
         self.sze._fv2_dt = self._dt           # CFL stiffness cap for the fv2 limiter
         self._set_field(n_ep + n_em, n_g, n_p)
-        self.sze.set_ic_target(self._u_rad())
+        self._set_ic_cooling_target()
         d = np.zeros_like(state)
 
         # rebuild + freeze the (expensive) hadronic pfield fold once per step

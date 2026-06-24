@@ -271,6 +271,10 @@ class SingleZoneSolver:
         self._nu_B = charge * _E_ESU * B_Gauss / (2.0 * np.pi * mass_g * _C)
         # extra (non-∝γ²) energy-loss terms at interfaces, e.g. pγ / BH (it6b)
         self._gdot_extra_if = np.zeros_like(self.g_if)
+        # optional KN-corrected IC cooling target SPECTRUM (eps[erg], n_ph[cm^-3 erg^-1]);
+        # None ⇒ Thomson IC via the scalar _beta_ic (back-compatible default).
+        self._ic_eps = None
+        self._ic_nph = None
 
     @classmethod
     def on_grid(cls, g, g_if, dg, **kw):
@@ -287,19 +291,39 @@ class SingleZoneSolver:
         self._gdot_extra_if = np.zeros_like(self.g_if)
         return self
 
-    # --- cooling rate at interfaces (Thomson syn+IC ∝γ² + extra terms) ---
+    def _ic_U_eff(self, gamma):
+        """Klein-Nishina-effective IC target energy density seen by electrons of
+        Lorentz factor γ [erg/cm³]:  U_eff(γ) = ∫ n_ph(ε) ε f_KN(4γε/m_ec²) dε,
+        with the Moderski et al. (2005) suppression f_KN(b)=1/(1+b)^1.5 (as used by
+        LeHa-Paris). Thomson limit b≪1 ⇒ f_KN→1 ⇒ U_eff→u_rad. Requires the target
+        SPECTRUM set via set_ic_target_spectrum; else returns the scalar u_rad."""
+        if self._ic_eps is None:
+            return np.full(np.shape(gamma), self.u_rad, dtype=float)
+        eps = self._ic_eps; nph = self._ic_nph
+        b = 4.0 * np.asarray(gamma, dtype=float)[..., None] * eps / _ME_C2_ERG
+        fkn = 1.0 / (1.0 + b) ** 1.5
+        return np.trapezoid(nph * eps * fkn, eps, axis=-1)
+
+    # --- cooling rate at interfaces (syn ∝γ² + IC [Thomson or KN] + extra) ---
+    def _gdot_ic(self, gamma):
+        """IC energy-loss γ̇_IC(γ) [1/s], negative. KN-corrected (γ-dependent) when a
+        target spectrum is set; otherwise Thomson -β_ic γ²."""
+        if self._ic_eps is None:
+            return -self._beta_ic * np.asarray(gamma, dtype=float) ** 2
+        pref = (4.0 / 3.0) * self._sigma_T * _C / self._mc2
+        return -pref * np.asarray(gamma, dtype=float) ** 2 * self._ic_U_eff(gamma)
+
     def gdot_if(self):
         """γ̇ at cell interfaces [1/s], negative (energy loss).
-        = -(β_syn+β_ic)γ²  +  Σ extra γ̇ terms (pγ, BH, ...)."""
-        beta = self._beta_syn + self._beta_ic
-        return -beta * self.g_if ** 2 + self._gdot_extra_if
+        = -β_syn γ²  +  γ̇_IC(γ) [Thomson or KN]  +  Σ extra γ̇ terms (pγ, BH, ...)."""
+        return (-self._beta_syn * self.g_if ** 2 + self._gdot_ic(self.g_if)
+                + self._gdot_extra_if)
 
     def gdot_c(self):
         """γ̇ at cell CENTRES [1/s], negative — for the higher-order (MCEq-stencil)
         loss operator. Extra (pγ/BH) terms are averaged from the interfaces."""
-        beta = self._beta_syn + self._beta_ic
         extra_c = 0.5 * (self._gdot_extra_if[:-1] + self._gdot_extra_if[1:])
-        return -beta * self.g ** 2 + extra_c
+        return -self._beta_syn * self.g ** 2 + self._gdot_ic(self.g) + extra_c
 
     def add_pgamma_cooling(self, photon_field, sigma_eps_GeV, A_mass_GeV=None):
         """Add proton/nucleus pγ photo-meson continuous cooling to the operator,
@@ -316,8 +340,11 @@ class SingleZoneSolver:
         return self
 
     def t_cool(self, gamma):
-        beta = self._beta_syn + self._beta_ic
-        return 1.0 / (beta * np.asarray(gamma))
+        """Radiative (syn+IC) cooling time γ/|γ̇| [s]; KN-aware when an IC target
+        spectrum is set (else Thomson)."""
+        g = np.asarray(gamma, dtype=float)
+        gdot = -self._beta_syn * g ** 2 + self._gdot_ic(g)   # negative
+        return g / np.abs(gdot)
 
     # --- escape (it5): energy-dependent t_esc(γ) + the escape spectrum ---
     def set_escape(self, t_esc):
@@ -598,9 +625,30 @@ class SingleZoneSolver:
         return (R_cm / _C) * L_vol
 
     def set_ic_target(self, u_rad_erg_cm3):
-        """Set/replace the (Thomson) IC target radiation energy density."""
+        """Set/replace the (Thomson) IC target radiation energy density. Clears any
+        KN target spectrum → pure Thomson IC cooling (-β_ic γ²)."""
         self.u_rad = u_rad_erg_cm3
-        self._beta_ic = (4.0 / 3.0) * _SIGMA_T * _C * u_rad_erg_cm3 / _ME_C2_ERG
+        self._beta_ic = (4.0 / 3.0) * self._sigma_T * _C * u_rad_erg_cm3 / self._mc2
+        self._ic_eps = None
+        self._ic_nph = None
+
+    def set_ic_target_spectrum(self, eps_t_erg, n_ph_t_erg):
+        """KN-corrected IC cooling: supply the target photon SPECTRUM
+        (``eps_t_erg`` [erg], ``n_ph_t_erg`` [cm^-3 erg^-1]). The IC energy-loss rate
+        becomes γ-dependent, γ̇_IC = -(4/3)(σ_T c/mc²) γ² ∫ n_ph(ε) ε f_KN(4γε/mc²) dε,
+        f_KN(b)=1/(1+b)^1.5 (Moderski+2005). Thomson limit recovers -β_ic γ². Also sets
+        the scalar u_rad/_beta_ic (= ∫ε n dε) so Thomson-only callers are unaffected."""
+        eps = np.asarray(eps_t_erg, dtype=float)
+        nph = np.asarray(n_ph_t_erg, dtype=float)
+        m = (eps > 0) & np.isfinite(nph) & (nph > 0)
+        if m.sum() < 2:
+            self.set_ic_target(0.0)
+            return
+        order = np.argsort(eps[m])
+        self._ic_eps = eps[m][order]
+        self._ic_nph = nph[m][order]
+        self.u_rad = float(np.trapezoid(self._ic_nph * self._ic_eps, self._ic_eps))
+        self._beta_ic = (4.0 / 3.0) * self._sigma_T * _C * self.u_rad / self._mc2
 
     @property
     def u_B(self):
