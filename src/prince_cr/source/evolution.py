@@ -275,6 +275,13 @@ class SingleZoneSolver:
         # None ⇒ Thomson IC via the scalar _beta_ic (back-compatible default).
         self._ic_eps = None
         self._ic_nph = None
+        self._ic_K_cache = {}     # pre-folded BG1970 inner kernel, keyed by id(γ-array)
+        # KN cooling prescription when a target spectrum is set:
+        #   "bg1970" (default) — exact Blumenthal-Gould 1970 Eq 2.56 (same kernel as
+        #                        ATHEvA/B13; integrates the Jones G(q,Γ) cross section).
+        #   "moderski"         — Moderski+2005 continuous-loss fit f_KN=1/(1+b)^1.5
+        #                        (overestimates cooling in deep KN; kept for comparison).
+        self._ic_kn_mode = "bg1970"
 
     @classmethod
     def on_grid(cls, g, g_if, dg, **kw):
@@ -304,12 +311,86 @@ class SingleZoneSolver:
         fkn = 1.0 / (1.0 + b) ** 1.5
         return np.trapezoid(nph * eps * fkn, eps, axis=-1)
 
+    @staticmethod
+    def _bg1970_inner_kernel(g, eps, Nq=64):
+        """Field-INDEPENDENT inner kernel I(γ,ε) = ∫dε₁ (ε₁−ε) G(q,Γ) on the grids
+        ``g`` (Ng) and ``eps`` (Ne) [erg]. Depends only on the energy grids (not on the
+        photon-field amplitude), so it can be PRE-FOLDED once and reused — exactly how
+        AM³ precomputes its IC cross-section kernel (``KER_IC``/``KER_IC_s_tot`` in
+        InverseCompton.cc) and then folds the current photon field through it each step.
+        The scattered-photon integral is done in q (ε₁=qΓγmc²/(1+qΓ),
+        dε₁/dq=Γγmc²/(1+qΓ)², 1/(4γ²)≤q≤1). Returns (Ng,Ne)."""
+        mc2 = _ME_C2_ERG
+        u = np.linspace(0.0, 1.0, Nq)
+        K = np.empty((g.size, eps.size), dtype=float)
+        for s in range(0, g.size, 256):                       # γ-chunk (bounds memory)
+            gc = g[s:s + 256]; gmc = gc * mc2
+            qmin = (1.0 / (4.0 * gc * gc))[:, None]
+            q = qmin ** (1.0 - u[None, :])                     # log q ∈ [1/(4γ²),1] (Ng,Nq)
+            Gam = (4.0 / mc2) * gc[:, None] * eps[None, :]     # (Ng,Ne)
+            G3 = Gam[:, :, None]; q3 = q[:, None, :]; Gq = G3 * q3
+            e1 = q3 * G3 * gmc[:, None, None] / (1.0 + Gq)
+            de1dq = G3 * gmc[:, None, None] / (1.0 + Gq) ** 2
+            with np.errstate(divide="ignore", invalid="ignore"):
+                G = (2.0 * q3 * np.log(q3) + (1.0 + 2.0 * q3) * (1.0 - q3)
+                     + 0.5 * Gq ** 2 * (1.0 - q3) / (1.0 + Gq))
+            dE = e1 - eps[None, :, None]
+            integ = dE * G * de1dq
+            integ = np.where((G > 0.0) & (dE > 0.0) & np.isfinite(integ), integ, 0.0)
+            qb = np.broadcast_to(q[:, None, :], integ.shape)
+            K[s:s + 256] = np.trapezoid(integ, qb, axis=2)     # (Ng,Ne)
+        return K
+
+    def _gdot_ic_bg1970(self, gamma):
+        """Exact Klein-Nishina IC energy loss γ̇_IC(γ) [1/s] via the
+        Blumenthal & Gould (1970) Eq 2.56 / Jones (1968) differential cross section
+        — the SAME ``G(q,Γ)`` kernel used in :meth:`ic_sed`, so emission and cooling
+        are consistent. Energy conservation: the electron loses (ε₁−ε) per scatter, so
+
+            -γ̇ mc² = (3 σ_T c)/(4 γ²) ∫dε (n(ε)/ε) ∫dε₁ (ε₁−ε) G(q,Γ),
+            Γ = 4 ε γ / (m_e c²),  q = ε₁ / [Γ(γ m_e c² − ε₁)],  1/(4γ²) ≤ q ≤ 1.
+
+        Recovers the Thomson -(4/3)(σ_T c/mc²)γ² u_rad for Γ≪1 (∫₀¹ q G dq = 1/9). The
+        prescription used by ATHEvA and B13; cools deep-KN electrons less than Moderski,
+        moving the steady-state cutoff to higher γ.
+
+        Implementation: the inner q-integral is field-independent (see
+        :meth:`_bg1970_inner_kernel`), so it is PRE-FOLDED once per (γ-grid, ε-grid) and
+        cached; each call is then just the fold γ̇ = -(3σ_T c/4γ²mc²) Σ_ε K(γ,ε) n(ε)/ε Δε
+        (a fast mat-vec — the per-ETD2-step cost when the field n(ε) changes but the grids
+        do not). Cache hits on the persistent ``self.g`` / ``self.g_if`` arrays."""
+        if self._ic_eps is None:
+            return -self._beta_ic * np.asarray(gamma, dtype=float) ** 2
+        g_in = np.asarray(gamma, dtype=float)
+        g = np.atleast_1d(g_in).ravel()
+        eps = self._ic_eps; nph = self._ic_nph                 # (Ne,) erg, cm^-3 erg^-1
+        # downsample the target to ≤64 log points for the loss integral (≲0.1% on γ̇).
+        if eps.size > 64:
+            idx = np.linspace(0, eps.size - 1, 64).round().astype(int)
+            eps = eps[idx]; nph = nph[idx]
+        # pre-folded inner kernel K(γ,ε), cached for the persistent hot-path grids and
+        # reused while the ε-grid is unchanged (only the field amplitude n(ε) varies).
+        sig = (g.size, eps.size, float(eps[0]), float(eps[-1]), float(eps.sum()))
+        ent = self._ic_K_cache.get(id(gamma))
+        if ent is not None and ent[0] == sig:
+            K = ent[1]
+        else:
+            K = self._bg1970_inner_kernel(g, eps)
+            if gamma is self.g or gamma is self.g_if:          # persistent → safe to cache
+                self._ic_K_cache[id(gamma)] = (sig, K)
+        pref = 0.75 * self._sigma_T * _C                       # (3 σ_T c)/4
+        gdot = -(pref / (g * g) / self._mc2) * np.trapezoid((nph / eps)[None, :] * K, eps, axis=1)
+        return gdot.reshape(g_in.shape) if np.ndim(g_in) else float(gdot[0])
+
     # --- cooling rate at interfaces (syn ∝γ² + IC [Thomson or KN] + extra) ---
     def _gdot_ic(self, gamma):
         """IC energy-loss γ̇_IC(γ) [1/s], negative. KN-corrected (γ-dependent) when a
-        target spectrum is set; otherwise Thomson -β_ic γ²."""
+        target spectrum is set; otherwise Thomson -β_ic γ². The KN prescription is
+        ``self._ic_kn_mode`` ∈ {"bg1970" (default, exact), "moderski"}."""
         if self._ic_eps is None:
             return -self._beta_ic * np.asarray(gamma, dtype=float) ** 2
+        if self._ic_kn_mode == "bg1970":
+            return self._gdot_ic_bg1970(gamma)
         pref = (4.0 / 3.0) * self._sigma_T * _C / self._mc2
         return -pref * np.asarray(gamma, dtype=float) ** 2 * self._ic_U_eff(gamma)
 
@@ -631,13 +712,24 @@ class SingleZoneSolver:
         self._beta_ic = (4.0 / 3.0) * self._sigma_T * _C * u_rad_erg_cm3 / self._mc2
         self._ic_eps = None
         self._ic_nph = None
+        self._ic_kn_mode = "bg1970"
 
-    def set_ic_target_spectrum(self, eps_t_erg, n_ph_t_erg):
+    def set_ic_target_spectrum(self, eps_t_erg, n_ph_t_erg, kn_mode="bg1970"):
         """KN-corrected IC cooling: supply the target photon SPECTRUM
         (``eps_t_erg`` [erg], ``n_ph_t_erg`` [cm^-3 erg^-1]). The IC energy-loss rate
-        becomes γ-dependent, γ̇_IC = -(4/3)(σ_T c/mc²) γ² ∫ n_ph(ε) ε f_KN(4γε/mc²) dε,
-        f_KN(b)=1/(1+b)^1.5 (Moderski+2005). Thomson limit recovers -β_ic γ². Also sets
-        the scalar u_rad/_beta_ic (= ∫ε n dε) so Thomson-only callers are unaffected."""
+        becomes γ-dependent. ``kn_mode`` selects the prescription:
+
+          * ``"bg1970"`` (default): exact Blumenthal-Gould 1970 Eq 2.56 — integrates the
+            Jones G(q,Γ) differential cross section (the same kernel as :meth:`ic_sed`;
+            the prescription used by ATHEvA & B13). See :meth:`_gdot_ic_bg1970`.
+          * ``"moderski"``: Moderski+2005 continuous-loss fit
+            γ̇_IC = -(4/3)(σ_T c/mc²) γ² ∫ n_ph(ε) ε f_KN(4γε/mc²) dε, f_KN=1/(1+b)^1.5
+            (as used by LeHa-Paris; overestimates cooling in deep KN — kept for comparison).
+
+        Both recover Thomson -β_ic γ² for b≪1. Also sets the scalar u_rad/_beta_ic
+        (= ∫ε n dε) so Thomson-only callers are unaffected."""
+        if kn_mode not in ("moderski", "bg1970"):
+            raise ValueError(f"kn_mode must be 'moderski' or 'bg1970', got {kn_mode!r}")
         eps = np.asarray(eps_t_erg, dtype=float)
         nph = np.asarray(n_ph_t_erg, dtype=float)
         m = (eps > 0) & np.isfinite(nph) & (nph > 0)
@@ -647,6 +739,7 @@ class SingleZoneSolver:
         order = np.argsort(eps[m])
         self._ic_eps = eps[m][order]
         self._ic_nph = nph[m][order]
+        self._ic_kn_mode = kn_mode
         self.u_rad = float(np.trapezoid(self._ic_nph * self._ic_eps, self._ic_eps))
         self._beta_ic = (4.0 / 3.0) * self._sigma_T * _C * self.u_rad / self._mc2
 

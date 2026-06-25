@@ -123,6 +123,33 @@ def test_ic_thomson_slope_and_kn_suppression():
     assert slk < sl                                       # KN suppresses high-E
 
 
+def test_kn_bg1970_thomson_limit_and_deep_kn_vs_moderski():
+    """Exact BG1970 KN loss: (1) recovers Thomson -(4/3)(σ_T c/mc²)γ² u_rad for b≪1;
+    (2) in DEEP KN (b≫1) cools LESS than the Moderski 1/(1+b)^1.5 fit — the regime
+    that controls the steady-state cutoff (BG1970 pushes it to higher γ; the Moderski
+    fit overestimates cooling at the highest energies, cf. Cerruti+2026 App B.1)."""
+    _EV = 1.602176634e-12
+    _SIG_T = 6.6524587321e-25; _C = 2.99792458e10; _MEC2 = 8.1871057769e-7
+    sz = SingleZoneSolver(gamma_lo=1.0, gamma_hi=1e8, n_bins=400, B_Gauss=1e-20,
+                          t_esc_s=1e4)
+    # (1) Thomson limit: narrow soft target (1 eV) ⇒ b=4γε/mc²≪1 for γ≲1e3
+    eps_s = np.logspace(np.log10(0.3 * _EV), np.log10(3.0 * _EV), 121)
+    nph_s = np.exp(-0.5 * ((np.log(eps_s) - np.log(_EV)) / (0.15 * np.log(10))) ** 2)
+    u_rad = float(np.trapezoid(nph_s * eps_s, eps_s))
+    beta = (4.0 / 3.0) * _SIG_T * _C * u_rad / _MEC2
+    gtest = np.array([10.0, 30.0, 100.0])      # γ≫1 and b≪1 ⇒ ultrarelativistic Thomson
+    sz.set_ic_target_spectrum(eps_s, nph_s, kn_mode="bg1970")
+    assert np.allclose(sz._gdot_ic(gtest), -beta * gtest ** 2, rtol=0.02)
+    # (2) deep KN: hard target (1 keV) ⇒ b≫1 at γ=1e6 (b~8e3); BG1970 cools < Moderski
+    eps_h = np.logspace(np.log10(0.3e3 * _EV), np.log10(3.0e3 * _EV), 121)
+    nph_h = np.exp(-0.5 * ((np.log(eps_h) - np.log(1e3 * _EV)) / (0.15 * np.log(10))) ** 2)
+    ghi = np.array([1e6, 1e7])
+    sz.set_ic_target_spectrum(eps_h, nph_h, kn_mode="bg1970"); bg_hi = sz._gdot_ic(ghi)
+    sz.set_ic_target_spectrum(eps_h, nph_h, kn_mode="moderski"); mod_hi = sz._gdot_ic(ghi)
+    assert np.all(np.abs(bg_hi) < np.abs(mod_hi))         # |γ̇_BG| < |γ̇_Moderski| in deep KN
+    assert np.all(bg_hi < 0)                               # genuine energy loss
+
+
 def test_escape_spectrum_recovers_injection_when_escape_dominated():
     """Escape-dominated (t_esc ≪ t_cool over the injected range): steady state
     n ≈ Q·t_esc, so the escape spectrum n/t_esc ≈ Q."""
