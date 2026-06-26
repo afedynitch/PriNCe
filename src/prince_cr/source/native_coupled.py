@@ -471,12 +471,20 @@ class NativeCoupledSolver:
 
         # --- γγ absorption rate + pair injection (γ→e±) ---
         tgg = gamma_gamma_abs_inv(self.Eg, self.field, self._eps_soft)
+        # γγ pair injection is the TOTAL pair spectrum (both leptons) → split 0.5/0.5.
         Q_pair = (self._pair_injection(n_g, tgg) if self.gg_pairs
                   else np.zeros_like(self.sze.g))      # dN/dγ_e, shared e+/e-
-        if self.bethe_heitler and self.sl_p is not None:
-            Q_pair = Q_pair + self._bh_pair_injection(state[self.sl_p])
         rhs[self.sl_ep] += 0.5 * Q_pair
         rhs[self.sl_em] += 0.5 * Q_pair
+        # Bethe-Heitler: _bh_pair_injection returns the SINGLE-lepton kernel_BH_elec spectrum, so
+        # the e+ AND e- EACH follow it (a BH event makes a pair). Inject it fully into both species
+        # — do NOT lump it into the γγ Q_pair and 0.5-split, which would drop the second lepton and
+        # halve the BH pair power (energy-balance: P_inj/P_loss 0.47→~0.94). See
+        # wiki lessons/native-bh-single-lepton-half.
+        if self.bethe_heitler and self.sl_p is not None:
+            Q_bh = self._bh_pair_injection(state[self.sl_p])
+            rhs[self.sl_ep] += Q_bh
+            rhs[self.sl_em] += Q_bh
 
         # --- primary lepton injection (into e-) ---
         if Qe_prim is not None:
