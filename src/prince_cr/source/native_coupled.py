@@ -74,7 +74,7 @@ class NativeCoupledSolver:
     """
 
     def __init__(self, run, R_cm, B_Gauss, t_esc_s=None, external_field=None,
-                 hadronic=True, bethe_heitler=True, loss_stencil=None,
+                 hadronic=True, bethe_heitler=True, loss_stencil="fv2",
                  gg_pairs=True, gg_reservoir_sink=False):
         self.run = run
         # gg_pairs: inject γγ→e± pairs (the cascade source). Photons are still
@@ -97,7 +97,14 @@ class NativeCoupledSolver:
         self.gg_reservoir_sink = bool(gg_reservoir_sink)
         self._gg_sink_warned = False
         # Cooling-loss stencil for the e± advection.
-        #   None      → conservative FV 1st-order upwind (DEFAULT, robust): ALL the
+        #   "fv2"     → conservative 2nd-order MUSCL FV (van Leer TVD limiter) — the
+        #               DEFAULT. ETD2-safe (stiff loss stays on the diagonal, bounded
+        #               limited off-diagonal, CFL cap reverts ultra-stiff high-γ cells
+        #               to 1st-order), positivity-preserving (0 neg bins). Kills the
+        #               1st-order upwind numerical diffusion WITHOUT more bins: PS
+        #               leptonic synch 1.14×→1.02× vs AM3 at em16 (was the em16→em32
+        #               workaround). See lesson cooling-stencil-diffusion-vs-etd2.
+        #   None      → conservative FV 1st-order upwind (legacy default): ALL the
         #               stiff cooling self-loss is on the diagonal → ETD2-stable for
         #               the full lepto-hadronic system (pairs to γ~1e9). But
         #               O(h)-diffusive → inflates the leptonic synchrotron SED
