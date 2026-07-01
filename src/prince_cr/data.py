@@ -86,23 +86,29 @@ def _read_csr_yields(grp, name, *, channels=None):
             ([0], (indptrs_all[:, 1:] + shifts).ravel())
         )
     else:
-        # Selective path: gather only the slices we need.
+        # Selective path. When a LARGE fraction of channels is requested
+        # (tier-1 / high-max_mass propagation loads), reading the full packed
+        # buffer into RAM once and gathering in numpy is far faster than one
+        # scattered h5py slice per channel; when only a few channels survive
+        # (small max_mass), the per-channel contiguous reads still win.
+        # `src`/`indptrs_src` switch between in-memory numpy and lazy h5py.
         ch_lens = len_data[ch_indices].astype(np.int64)
         ch_offs = offsets[ch_indices].astype(np.int64)
         total_nnz = int(ch_lens.sum())
+        read_full = ch_indices.size >= 0.25 * n_ch_total
+        src = ds[:] if read_full else ds
+        indptrs_src = indptrs_ds[:] if read_full else indptrs_ds
         mat = np.empty((2, total_nnz), dtype=np.float64)
         cur = 0
-        # h5py supports cheap contiguous slices; one read per channel beats
-        # a single `ds[:]` when most channels are skipped (max_mass cap).
         for i in range(ch_indices.size):
             n = int(ch_lens[i])
             if n == 0:
                 continue
             off = int(ch_offs[i])
-            mat[:, cur:cur + n] = ds[:, off:off + n]
+            mat[:, cur:cur + n] = src[:, off:off + n]
             cur += n
-        # Indptrs: read just the requested rows.
-        indptrs_sel = indptrs_ds[ch_indices, :]
+        # Indptrs: requested rows (numpy fancy-index when full was read).
+        indptrs_sel = indptrs_src[ch_indices, :]
         # Per-channel cumulative shift in the new packed buffer.
         shifts_sel = np.concatenate(([0], np.cumsum(ch_lens[:-1])))[:, None]
         big_indptr = np.concatenate(
@@ -962,6 +968,21 @@ class PrinceDB(object):
                 bc_keep = bc_a <= max_mass
                 em_keep = em_a <= max_mass
 
+            # v6: optional lifetime-tier filter. The `mother_tier` dataset (1/2/3)
+            # is present in v6+ dbs and absent in v5/older (then no filtering).
+            # config.fluka_max_tier=None loads all tiers; otherwise drop mothers
+            # with tier > max_tier AND their boost/elementary channels.
+            max_tier = getattr(config, "fluka_max_tier", None)
+            if max_tier is not None and "mother_tier" in grp:
+                m_keep = m_keep & (grp["mother_tier"][:] <= int(max_tier))
+                kept_pdgs = set(int(p) for p in inel_mothers_all[m_keep])
+                if md_all.size:
+                    bc_keep = bc_keep & np.array(
+                        [int(p) in kept_pdgs for p in md_all[:, 0]])
+                if ed_all.size:
+                    em_keep = em_keep & np.array(
+                        [int(p) in kept_pdgs for p in ed_all[:, 0]])
+
             db_entry["inel_mothers"] = inel_mothers_all[m_keep]
             db_entry["mothers_daughters"] = md_all[bc_keep]
             db_entry["elementary_daughters"] = ed_all[em_keep]
@@ -971,9 +992,10 @@ class PrinceDB(object):
             em_idx = np.flatnonzero(em_keep)
 
             n_E_sl = len(egrid_full[sl])
-            # σ_inel: (n_m, n_E). Skip the fancy index when no mass cut so we
-            # don't pull the full block off disk just to drop nothing.
-            if max_mass is None:
+            # σ_inel: (n_m, n_E). Skip the fancy index only when NOTHING was
+            # dropped (no mass cut AND no tier cut) so we don't pull the full
+            # block off disk just to drop nothing. `m_keep.all()` covers both.
+            if m_keep.all():
                 db_entry["inelastic_cross_sctions"] = (
                     grp["inelastic_cross_sctions"][:, sl]
                 )
@@ -986,10 +1008,16 @@ class PrinceDB(object):
                     (0, n_E_sl), dtype=np.float64,
                 )
             # heavy yields: (n_ch, n_E) — stays dense (no x axis to gain on).
-            if max_mass is None:
+            if bc_keep.all():
                 db_entry["fragment_yields"] = grp["fragment_yields"][:, sl]
             elif bc_idx.size:
-                db_entry["fragment_yields"] = grp["fragment_yields"][bc_idx, :][:, sl]
+                fy = grp["fragment_yields"]
+                if bc_idx.size >= 0.25 * fy.shape[0]:
+                    # large selection: one sequential all-rows read + numpy gather
+                    # beats scattered per-row fancy indexing off the multi-GB array.
+                    db_entry["fragment_yields"] = fy[:, sl][bc_idx]
+                else:
+                    db_entry["fragment_yields"] = fy[bc_idx, :][:, sl]
             else:
                 db_entry["fragment_yields"] = np.zeros((0, n_E_sl), dtype=np.float64)
             # elementary yields: (n_em, n_E, n_x) — sparse-packed in v2 db.

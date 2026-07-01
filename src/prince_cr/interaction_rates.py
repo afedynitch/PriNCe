@@ -22,6 +22,31 @@ def _cupy_backend_active(prince_run):
     )
 
 
+def _response_integral_operator(ygr, y_grid):
+    """Fixed ``(len(y_grid), len(ygr))`` matrix M such that, for ANY response
+    ``f`` sampled on ``ygr``,
+
+        ``M @ f  ==  InterpolatedUnivariateSpline(ygr, f, k=1,
+                      ext='zeros').antiderivative()(y_grid)``
+
+    Because the k=1 interpolation + analytic antiderivative + resample is a
+    linear operator and ``ygr``/``y_grid`` are shared across all channels, one
+    matmul reproduces the per-channel loop bit-for-bit (including the
+    ext='zeros' out-of-support extrapolation, which is baked into M). Built
+    once per matrix build from the n=len(ygr) basis responses (~ms)."""
+    from scipy.interpolate import InterpolatedUnivariateSpline
+    n = len(ygr)
+    M = np.empty((len(y_grid), n))
+    e = np.zeros(n)
+    for k in range(n):
+        e[k] = 1.0
+        M[:, k] = InterpolatedUnivariateSpline(
+            ygr, e, k=1, ext="zeros"
+        ).antiderivative()(y_grid)
+        e[k] = 0.0
+    return M
+
+
 class PhotoNuclearInteractionRate(object):
     """Implementation of photo-hadronic/nuclear interaction rates.
     This Version directly writes the data into a CSC-matrix and only updates the data each time.
@@ -244,16 +269,28 @@ class PhotoNuclearInteractionRate(object):
         B_idx = (i_idx[None, :] - i_idx[:, None]) + (dcr - 1)
 
         # ----- pre-sample 1D antiderivatives once -----
-        # nonel: dict[mo] → ΔR̂_nonel of length (dcr+dph-1)
-        nonel_dR = {}
-        for mo, intp in resp.nonel_intp.items():
-            R = intp.antiderivative()(y_grid)
-            nonel_dR[mo] = np.diff(R)
-        # incl (boost-conserving): dict[(mo,da)] → ΔR̂_incl of length (dcr+dph-1)
-        incl_dR = {}
-        for key, intp in resp.incl_intp.items():
-            R = intp.antiderivative()(y_grid)
-            incl_dR[key] = np.diff(R)
+        # Fast path: the per-channel "k=1 interp -> antiderivative -> sample on
+        # y_grid" is a fixed linear operator M (shared ygrid/y_grid), so
+        # ΔR̂ = diff(f_stack @ Mᵀ) reproduces the loop bit-for-bit in one matmul.
+        # `response_ygrid`/`*_f_stack` are built in ResponseFunction.
+        fast = getattr(config, "fast_response_build", True) and hasattr(resp, "response_ygrid")
+        if fast:
+            M = _response_integral_operator(resp.response_ygrid, y_grid)
+            nonel_dR, incl_dR = {}, {}
+            if resp.nonel_f_stack.size:
+                dRn = np.diff(resp.nonel_f_stack @ M.T, axis=1)
+                nonel_dR = {mo: dRn[i] for i, mo in enumerate(resp.nonel_keys)}
+            if resp.incl_f_stack.size:
+                dRi = np.diff(resp.incl_f_stack @ M.T, axis=1)
+                incl_dR = {key: dRi[i] for i, key in enumerate(resp.incl_keys)}
+        else:
+            # Reference per-channel path (config.fast_response_build = False).
+            nonel_dR = {}
+            for mo, intp in resp.nonel_intp.items():
+                nonel_dR[mo] = np.diff(intp.antiderivative()(y_grid))
+            incl_dR = {}
+            for key, intp in resp.incl_intp.items():
+                incl_dR[key] = np.diff(intp.antiderivative()(y_grid))
 
         # ----- pre-sample 2D antiderivatives once -----
         # diff: dict[(mo,da)] → ΔΔR̂ of shape (dcr+dph-1, 2*dcr-1)

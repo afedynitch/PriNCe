@@ -1,5 +1,6 @@
 import numpy as np
 
+import prince_cr.config as config
 from prince_cr.util import (
     BilinearGrid2D,
     get_2Dinterp_object,
@@ -169,17 +170,47 @@ class ResponseFunction(object):
 
         info(2, "Computing interpolators for response functions")
 
-        info(5, "Nonelastic response functions f(y)")
-        self.nonel_intp = {}
-        for mother in self.nonel_idcs:
-            self.nonel_intp[mother] = get_interp_object(*self.get_channel(mother))
+        # All 1D channels (nonel + boost-conserving incl) share egrid, hence
+        # ygr = egrid[1:]/2. Compute their response f(y) in ONE vectorized
+        # cumulative_trapezoid (the get_channel formula f = cumtrapz(egrid*σ)
+        # /(2 y²)) instead of a per-channel get_channel call, then build the
+        # k=1 interpolators from the stack and STORE the stacks so
+        # interaction_rates._init_matrices can batch the antiderivative sampling.
+        cs = self.cross_section
+        egrid = cs.egrid
+        ygr = egrid[1:] / 2.0
+        from scipy.integrate import cumulative_trapezoid as _ctrap
 
-        info(5, "Inclusive (boost conserving) response functions g(y)")
+        def _resp_stack(keys, getter):
+            if not keys:
+                return np.zeros((0, ygr.size))
+            sig = np.array([getter(k)[1] for k in keys])     # (n_ch, n_E), shared egrid
+            return _ctrap(egrid * sig, x=egrid, axis=1) / (2.0 * ygr**2)
+
+        nonel_keys = list(self.nonel_idcs)
+        incl_keys = list(self.incl_idcs)
+        nonel_f = _resp_stack(nonel_keys, lambda mo: cs.nonel(mo))
+        incl_f = _resp_stack(incl_keys, lambda k: cs.incl(*k))
+
+        # stacks for the batched antiderivative in interaction_rates._init_matrices
+        self.response_ygrid = ygr
+        self.nonel_keys, self.nonel_f_stack = nonel_keys, nonel_f
+        self.incl_keys, self.incl_f_stack = incl_keys, incl_f
+
+        # Per-channel k=1 interpolators are needed ONLY by the reference matrix
+        # path (config.fast_response_build=False) and by get_full(). Building
+        # 50k+ spline objects is pure overhead on the fast path, where
+        # _init_matrices consumes the stacks via the response-integral operator,
+        # so skip them there. (get_full() therefore requires the reference path.)
+        self.nonel_intp = {}
         self.incl_intp = {}
-        for mother, daughter in self.incl_idcs:
-            self.incl_intp[(mother, daughter)] = get_interp_object(
-                *self.get_channel(mother, daughter)
-            )
+        if not getattr(config, "fast_response_build", True):
+            info(5, "Nonelastic response functions f(y)")
+            for i, mo in enumerate(nonel_keys):
+                self.nonel_intp[mo] = get_interp_object(ygr, nonel_f[i])
+            info(5, "Inclusive (boost conserving) response functions g(y)")
+            for i, key in enumerate(incl_keys):
+                self.incl_intp[key] = get_interp_object(ygr, incl_f[i])
 
         info(5, "Inclusive (redistributed) response functions h(y)")
         self.incl_diff_intp = {}

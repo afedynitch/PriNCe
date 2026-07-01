@@ -61,6 +61,21 @@ fluka_db_fname = "prince_db_v0.h5"
 #: ``data_dir``.
 fluka_db_path = data_dir
 
+#: Lifetime-tier ceiling for the FLUKA photo-nuclear mother set (v6+ dbs that
+#: carry the per-mother ``mother_tier`` dataset). ``None`` loads ALL mothers;
+#: 1 = main/propagation only (the legacy ~726 set + neutron), 2 = +extended,
+#: 3 = full. No effect on v5/older dbs (no tier dataset). See
+#: prince_fluka_utils.mothers.mother_tier.
+fluka_max_tier = None
+
+#: Batched response-matrix build. When True (default), the per-channel
+#: "interpolate (k=1) -> antiderivative -> sample on y_grid" used by
+#: interaction_rates._init_matrices is replaced by a single matmul against a
+#: fixed response-integral operator (bit-identical to the per-channel path,
+#: since k=1 interpolation is a linear operator on a shared grid). Set False to
+#: fall back to the per-channel loop (reference path for validation).
+fast_response_build = True
+
 #: SOPHIA photo-meson database, repacked into PDG numbering by
 #: ``scripts/repack_sophia_pdg.py`` (in the UH-UHECR project repo) from the
 #: legacy ``photo_nuclear/SOPHIA`` tables. Lives in ``data_dir``. Consumed by
