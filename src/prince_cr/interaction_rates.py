@@ -175,10 +175,37 @@ class PhotoNuclearInteractionRate(object):
                         batch_dim += int(dcr**2 / 2) + 1
 
         info(2, "Batch matrix dimensions are {0}x{1}".format(batch_dim, dph))
-        self._batch_matrix = np.zeros((batch_dim, dph))
+        # CSR build: accumulate only nonzeros as COO (data, batch-row, photon-col)
+        # in `_emit_tile`, then assemble one CSR — no dense (batch_dim, dph) buffer.
+        self._csr_build = getattr(config, "batch_matrix_format", "csr") == "csr"
+        if self._csr_build:
+            self._coo_data, self._coo_row, self._coo_col = [], [], []
+            self._batch_matrix = None
+        else:
+            self._batch_matrix = np.zeros((batch_dim, dph))
+            info(3, "Memory usage: {0} MB".format(self._batch_matrix.nbytes / 1024**2))
         self._batch_rows = []
         self._batch_cols = []
-        info(3, "Memory usage: {0} MB".format(self._batch_matrix.nbytes / 1024**2))
+        self._ibatch = 0
+
+    def _emit_tile(self, block, rows, cols):
+        """Deposit one channel's tile: `block` is (n_rows × dph), `rows`/`cols`
+        are the coupling (daughter, mother) indices for its n_rows batch entries.
+        CSR build extracts `block`'s nonzeros as COO (batch-row, photon-col, val)
+        — the all-zero rows (mother energies where the response doesn't fire)
+        cost nothing; dense build writes into the preallocated buffer."""
+        n = block.shape[0]
+        if self._csr_build:
+            ii, jj = np.nonzero(block)
+            if ii.size:
+                self._coo_data.append(np.asarray(block[ii, jj], dtype=np.float32))
+                self._coo_row.append((self._ibatch + ii).astype(np.int32))
+                self._coo_col.append(jj.astype(np.int32))
+        else:
+            self._batch_matrix[self._ibatch:self._ibatch + n, :] = block
+        self._ibatch += n
+        self._batch_rows.append(rows)
+        self._batch_cols.append(cols)
 
     def _assert_log_grids_compatible(self):
         """Verify that CR-grid centers, CR-grid bin edges, and photon-grid bin
@@ -401,7 +428,7 @@ class PhotoNuclearInteractionRate(object):
             Yflat_em, Xflat_em = Y2d_em.ravel(), X2d_em.ravel()
             shape2d_em = Y2d_em.shape
 
-        ibatch = 0
+        # batch-row cursor lives on self (_emit_tile increments self._ibatch)
         emo_idcs = np.arange(dcr)
         eda_idcs = np.arange(dcr)
         # i_mo grid for diagonal-nonel handling in diff channels
@@ -470,10 +497,9 @@ class PhotoNuclearInteractionRate(object):
                 if _msk is not None:
                     tile[:, ~_msk] = 0.0
 
-                self._batch_matrix[ibatch:ibatch + dcr, :] = tile
-                ibatch += dcr
-                self._batch_rows.append(sp_id_ref[daid].lidx() + eda_idcs)
-                self._batch_cols.append(sp_id_ref[moid].lidx() + emo_idcs)
+                self._emit_tile(tile,
+                                sp_id_ref[daid].lidx() + eda_idcs,
+                                sp_id_ref[moid].lidx() + emo_idcs)
 
             elif in_diff and daid in em_native_pdgs:
                 # ---- diff channel, EM-grid daughter (native coupling) ----
@@ -509,10 +535,7 @@ class PhotoNuclearInteractionRate(object):
                 rows = sp_id_ref[daid].lidx() + rows_em_cut
                 cols = sp_id_ref[moid].lidx() + cols_em_cut
 
-                self._batch_matrix[ibatch:ibatch + n_kept, :] = kept
-                ibatch += n_kept
-                self._batch_rows.append(rows)
-                self._batch_cols.append(cols)
+                self._emit_tile(kept, rows, cols)
 
             elif in_diff:
                 # ---- diff channel branch ----
@@ -562,26 +585,44 @@ class PhotoNuclearInteractionRate(object):
                 rows = sp_id_ref[daid].lidx() + ida_grid[cuts2d]
                 cols = sp_id_ref[moid].lidx() + imo_grid[cuts2d]
 
-                self._batch_matrix[ibatch:ibatch + n_kept, :] = kept
-                ibatch += n_kept
-                self._batch_rows.append(rows)
-                self._batch_cols.append(cols)
+                self._emit_tile(kept, rows, cols)
 
             else:
                 info(20, "Species combination not included in model", moid, daid)
 
-        self._batch_matrix = self._batch_matrix[:ibatch, :]
+        ibatch = self._ibatch
+        if self._csr_build:
+            from scipy.sparse import csr_matrix
+            data = (np.concatenate(self._coo_data) if self._coo_data
+                    else np.zeros(0, np.float32))
+            row = (np.concatenate(self._coo_row) if self._coo_row
+                   else np.zeros(0, np.int32))
+            col = (np.concatenate(self._coo_col) if self._coo_col
+                   else np.zeros(0, np.int32))
+            # Free the per-tile COO lists before scipy's coo→csr allocates, so
+            # the transient peak is ~one (COO + CSR) rather than lists too.
+            self._coo_data = self._coo_row = self._coo_col = None
+            self._batch_matrix = csr_matrix(
+                (data, (row, col)), shape=(ibatch, dph)
+            )
+            del data, row, col
+            self._batch_matrix.sum_duplicates()
+            mat_bytes = (self._batch_matrix.data.nbytes
+                         + self._batch_matrix.indices.nbytes
+                         + self._batch_matrix.indptr.nbytes)
+        else:
+            self._batch_matrix = self._batch_matrix[:ibatch, :]
+            mat_bytes = self._batch_matrix.nbytes
         self._batch_rows = np.concatenate(self._batch_rows, axis=None)
         self._batch_cols = np.concatenate(self._batch_cols, axis=None)
         self._batch_vec = np.zeros(ibatch)
 
-        info(2, f"Batch matrix shape: {self._batch_matrix.shape}")
+        info(2, f"Batch matrix shape: {self._batch_matrix.shape}"
+                f"{' (CSR nnz=' + str(self._batch_matrix.nnz) + ')' if self._csr_build else ''}")
         info(2, f"Batch rows shape: {self._batch_rows.shape}")
-        info(2, f"Batch cols shape: {self._batch_cols.shape}")
-        info(2, f"Batch vector shape: {self._batch_vec.shape}")
 
         memory = (
-            self._batch_matrix.nbytes
+            mat_bytes
             + self._batch_rows.nbytes
             + self._batch_cols.nbytes
             + self._batch_vec.nbytes
@@ -664,6 +705,10 @@ class PhotoNuclearInteractionRate(object):
         mid-process ``backend.xs_dtype`` flip changed the requested
         precision.
         """
+        if getattr(self, "_csr_build", False):
+            # CSR path folds the sparse kernel directly (already at build dtype);
+            # no dense mirror. _batch_vec_xs is (re)bound by the SpMV fold.
+            return
         xs_attr = self.prince_run.backend.xs_dtype
         dt_solver = np.dtype("float64")
         dt_xs = np.dtype(xs_attr) if xs_attr is not None else dt_solver
@@ -736,7 +781,13 @@ class PhotoNuclearInteractionRate(object):
         import cupy as cp
         import cupyx.scipy.sparse as csp
 
-        self._batch_matrix_gpu = cp.asarray(self._batch_matrix, dtype=dt_xs)
+        if self._csr_build:
+            # cupy CSR mirror of the sparse kernel; the fold is a cuSPARSE SpMV.
+            self._batch_matrix_gpu = csp.csr_matrix(
+                self._batch_matrix.astype(dt_xs, copy=False)
+            )
+        else:
+            self._batch_matrix_gpu = cp.asarray(self._batch_matrix, dtype=dt_xs)
 
         host_mat = self.coupling_mat
         nnz = host_mat.data.size
@@ -779,7 +830,12 @@ class PhotoNuclearInteractionRate(object):
         info(5, "Updating batch rate vectors (GPU).")
         photon_host = self.photon_vector(z, pfield=pfield)
         photon_gpu = cp.asarray(photon_host, dtype=self._batch_matrix_gpu.dtype)
-        cp.dot(self._batch_matrix_gpu, photon_gpu, out=self._batch_vec_gpu)
+        if self._csr_build:
+            # cuSPARSE SpMV; write into the pinned _batch_vec_gpu buffer so the
+            # (aliased or cast) coupling-data path below is unchanged.
+            self._batch_vec_gpu[:] = self._batch_matrix_gpu.dot(photon_gpu)
+        else:
+            cp.dot(self._batch_matrix_gpu, photon_gpu, out=self._batch_vec_gpu)
         # Mixed-precision: bridge xs-dtype matvec result into the
         # solver-dtype coupling-matrix data buffer. ``cp.copyto`` casts
         # element-wise on the device. No-op when buffers are aliased
@@ -815,9 +871,17 @@ class PhotoNuclearInteractionRate(object):
         if pfield is not None or self._ratemat_zcache != z or force_update:
             info(5, "Updating batch rate vectors.")
 
+            photon = self.photon_vector(z, pfield=pfield)
+            if self._csr_build:
+                # CSR path: sparse SpMV against the kernel (fp32). The result
+                # is upcast into the fp64 coupling data by _update_coupling_mat
+                # (it reads _batch_vec_xs when set). Flat in dph — the point.
+                ph = np.asarray(photon, dtype=self._batch_matrix.dtype)
+                self._batch_vec_xs = self._batch_matrix.dot(ph)
+                self._ratemat_zcache = None if pfield is not None else z
+                return True
             backend = self.prince_run.backend
             self._ensure_xs_buffers()
-            photon = self.photon_vector(z, pfield=pfield)
             use_mixed = self._batch_matrix_xs is not self._batch_matrix
             if (
                 backend.linear_algebra_backend.lower() == "mkl"

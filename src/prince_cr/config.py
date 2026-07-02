@@ -76,6 +76,16 @@ fluka_max_tier = None
 #: fall back to the per-channel loop (reference path for validation).
 fast_response_build = True
 
+#: Storage format for the photo-nuclear response kernel ``_batch_matrix`` (the
+#: rows × dph operator folded with the photon field every step). "csr" (default)
+#: builds it directly as a sparse CSR via COO accumulation — no giant dense
+#: ``(batch_dim, dph)`` buffer at construction, and a sparse SpMV fold that is
+#: flat in dph (right for long/in-source photon vectors; see
+#: wiki/results/prof-init-heavy-mass). "dense" is the legacy dense buffer +
+#: BLAS GEMV (reference path for validation). NOTE: "csr" currently supports the
+#: host (scipy/MKL) backends; the cupy CSR (cuSPARSE) fold is the follow-up.
+batch_matrix_format = "csr"
+
 #: SOPHIA photo-meson database, repacked into PDG numbering by
 #: ``scripts/repack_sophia_pdg.py`` (in the UH-UHECR project repo) from the
 #: legacy ``photo_nuclear/SOPHIA`` tables. Lives in ``data_dir``. Consumed by
