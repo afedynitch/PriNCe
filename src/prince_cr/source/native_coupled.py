@@ -194,6 +194,7 @@ class NativeCoupledSolver:
 
         self._J_cache = None                 # last hadronic jacobian (debug)
         self._L_had_frozen = None             # c·J frozen for the current ETD2 step
+        self._photon_grid_warned = False      # one-shot pγ target-grid coverage guard
         self._n_e_frozen = None               # step-start e± total for the fv2 limiter
         self._dt = self.t_esc                 # ETD2 step (for the fv2 CFL stiffness cap)
 
@@ -422,6 +423,62 @@ class NativeCoupledSolver:
         return np.where((g >= self._bh_gam[m2].min()) & (g <= self._bh_gam[m2].max()),
                         out, 0.0)
 
+    def _check_photon_grid_covers_field(self):
+        """One-shot guard: the pγ TARGET grid (``config.photon_grid`` →
+        ``int_rates.e_photon``) must cover the in-source photon field.
+
+        The PriNCe default ``photon_grid=(-15,-6,8)`` caps targets at ~875 eV
+        (the cosmological CMB+EBL range). An in-source blazar field carries
+        keV–GeV flux, and because the pγ (Δ) threshold target energy scales as
+        ε_th ∝ 1/γ_p, the *lower*-energy protons need those higher-energy
+        targets to interact at all. If the field has significant flux above the
+        grid's upper edge, the pγ fold silently drops those targets and starves
+        the low-E secondary (π⁰→γγ + ν) LEFT FLANK — energy that then shows up
+        in the γγ cascade instead. Widen ``config.photon_grid`` (before building
+        the PriNCeRun) so its upper edge covers the field."""
+        if self._photon_grid_warned:
+            return
+        self._photon_grid_warned = True
+        try:
+            self._photon_grid_guard_body()
+        except Exception:
+            pass  # the guard is purely advisory — never let it break a solve
+
+    def _photon_grid_guard_body(self):
+        eph = self.run.int_rates.e_photon.grid          # GeV
+        sed = eph ** 2 * self.field.get_photon_density(eph)
+        peak = float(np.max(sed)) if sed.size else 0.0
+        if peak <= 0:
+            return
+        # The crucial high-energy targets (keV–MeV) are tiny relative to the
+        # synchrotron SED PEAK (~1e-7), so a peak-fraction test misses them.
+        # The right discriminator is whether the field is still ALIVE and
+        # CONTINUING past the grid edge (a truncated power-law) rather than
+        # already dead (the cosmological CMB+EBL case, where the field has
+        # fallen ≳10 decades below peak well before 875 eV).
+        sed_edge = float(sed[-1])
+        if sed_edge < 1e-10 * peak:
+            return                                       # field already negligible at the edge
+        e_above = eph[-1] * 10.0 ** np.array([1.0, 2.0, 3.0])
+        sed_above = float(np.max(e_above ** 2
+                                 * self.field.get_photon_density(e_above)))
+        if sed_above > 1e-4 * sed_edge:                  # field continues past the edge → targets dropped
+            import warnings
+            warnings.warn(
+                "NativeCoupledSolver: the pγ target-photon grid upper edge "
+                "({0:.3g} GeV) sits inside a live photon field (SED there is "
+                "{1:.1e}× the field peak and still falling as a power law above "
+                "it). The photo-hadronic fold drops every target above the edge, "
+                "so lower-energy protons (which need higher-energy targets, "
+                "ε_th∝1/γ_p) cannot interact — this starves the low-E secondary "
+                "(π⁰→γγ + ν) LEFT FLANK and over-feeds the γγ cascade. Widen "
+                "config.photon_grid (e.g. (-15, 0, 8)) BEFORE building the "
+                "PriNCeRun so its upper edge covers the field.".format(
+                    eph[-1], sed_edge / peak),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     # ---------------- hadronic native coupling ----------------
     def _hadr_matrix(self):
         """c·J(pfield) [1/s] over the full state — photo-hadronic + chain-reduced
@@ -434,6 +491,7 @@ class NativeCoupledSolver:
         the current step's matrix; cleared between steps."""
         if self._L_had_frozen is not None:
             return self._L_had_frozen
+        self._check_photon_grid_covers_field()
         J = self.run.int_rates.get_hadr_jacobian(0.0, 1.0, force_update=True,
                                                  pfield=self.field)
         self._J_cache = J
