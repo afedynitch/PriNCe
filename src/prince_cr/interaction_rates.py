@@ -179,7 +179,9 @@ class PhotoNuclearInteractionRate(object):
         # in `_emit_tile`, then assemble one CSR — no dense (batch_dim, dph) buffer.
         self._csr_build = getattr(config, "batch_matrix_format", "csr") == "csr"
         if self._csr_build:
-            self._coo_data, self._coo_row, self._coo_col = [], [], []
+            # Direct CSR assembly: per tile store values, column indices, and
+            # per-row nnz counts (→ indptr via cumsum). No COO intermediate.
+            self._csr_data, self._csr_indices, self._csr_rownnz = [], [], []
             self._batch_matrix = None
         else:
             self._batch_matrix = np.zeros((batch_dim, dph))
@@ -196,11 +198,16 @@ class PhotoNuclearInteractionRate(object):
         cost nothing; dense build writes into the preallocated buffer."""
         n = block.shape[0]
         if self._csr_build:
+            # np.nonzero is C-order → rows grouped, columns sorted within each
+            # row: already CSR-canonical. Store values + column indices, and the
+            # per-row nnz counts (incl. zeros for all-zero rows) so indptr is a
+            # cumsum at the end — the finished (data, indices, indptr) arrays go
+            # straight into csr_matrix with no COO copy.
             ii, jj = np.nonzero(block)
             if ii.size:
-                self._coo_data.append(np.asarray(block[ii, jj], dtype=np.float32))
-                self._coo_row.append((self._ibatch + ii).astype(np.int32))
-                self._coo_col.append(jj.astype(np.int32))
+                self._csr_data.append(np.asarray(block[ii, jj], dtype=np.float32))
+                self._csr_indices.append(jj.astype(np.int32))
+            self._csr_rownnz.append(np.bincount(ii, minlength=n).astype(np.int32))
         else:
             self._batch_matrix[self._ibatch:self._ibatch + n, :] = block
         self._ibatch += n
@@ -593,20 +600,29 @@ class PhotoNuclearInteractionRate(object):
         ibatch = self._ibatch
         if self._csr_build:
             from scipy.sparse import csr_matrix
-            data = (np.concatenate(self._coo_data) if self._coo_data
+            data = (np.concatenate(self._csr_data) if self._csr_data
                     else np.zeros(0, np.float32))
-            row = (np.concatenate(self._coo_row) if self._coo_row
-                   else np.zeros(0, np.int32))
-            col = (np.concatenate(self._coo_col) if self._coo_col
-                   else np.zeros(0, np.int32))
-            # Free the per-tile COO lists before scipy's coo→csr allocates, so
-            # the transient peak is ~one (COO + CSR) rather than lists too.
-            self._coo_data = self._coo_row = self._coo_col = None
+            indices = (np.concatenate(self._csr_indices) if self._csr_indices
+                       else np.zeros(0, np.int32))
+            counts = (np.concatenate(self._csr_rownnz) if self._csr_rownnz
+                      else np.zeros(ibatch, np.int32))
+            self._csr_data = self._csr_indices = self._csr_rownnz = None
+            # indptr = [0, cumsum(per-row nnz)]; int64 only if nnz overflows int32.
+            idt = np.int64 if data.size >= 2**31 else np.int32
+            if idt == np.int64:
+                indices = indices.astype(np.int64)
+            indptr = np.empty(ibatch + 1, dtype=idt)
+            indptr[0] = 0
+            np.cumsum(counts, dtype=idt, out=indptr[1:])
+            del counts
+            # Direct CSR: the arrays are already row-grouped + column-sorted
+            # (np.nonzero C-order) with no duplicates, so this wraps them with
+            # NO COO intermediate and no sort.
             self._batch_matrix = csr_matrix(
-                (data, (row, col)), shape=(ibatch, dph)
+                (data, indices, indptr), shape=(ibatch, dph)
             )
-            del data, row, col
-            self._batch_matrix.sum_duplicates()
+            self._batch_matrix.has_canonical_format = True
+            del data, indices
             mat_bytes = (self._batch_matrix.data.nbytes
                          + self._batch_matrix.indices.nbytes
                          + self._batch_matrix.indptr.nbytes)
