@@ -78,12 +78,23 @@ fast_response_build = True
 
 #: Storage format for the photo-nuclear response kernel ``_batch_matrix`` (the
 #: rows × dph operator folded with the photon field every step). "csr" (default)
-#: builds it directly as a sparse CSR via COO accumulation — no giant dense
-#: ``(batch_dim, dph)`` buffer at construction, and a sparse SpMV fold that is
-#: flat in dph (right for long/in-source photon vectors; see
-#: wiki/results/prof-init-heavy-mass). "dense" is the legacy dense buffer +
-#: BLAS GEMV (reference path for validation). NOTE: "csr" currently supports the
-#: host (scipy/MKL) backends; the cupy CSR (cuSPARSE) fold is the follow-up.
+#: builds it directly as sparse CSR with NO COO intermediate — per tile,
+#: ``np.nonzero`` yields C-order (rows grouped, cols sorted) = CSR-canonical, so
+#: ``indptr`` is a single cumsum of per-row nnz. No giant dense ``(batch_dim,
+#: dph)`` buffer at construction, and a sparse SpMV fold that is flat in dph
+#: (right for long / in-source photon vectors). Fold backends: cuSPARSE (cupy,
+#: default), scipy / MKL-sparse (host). "dense" is the legacy dense buffer + BLAS
+#: GEMV — the reference path and the f64-parity fallback (CSR is built fp32,
+#: matching the default mixed-precision fold).
+#:
+#: TODO(apple-silicon): the CSR fold's per-step SpMV has NO Accelerate path — on
+#: macOS it falls back to scipy's single-threaded SpMV. Note that Apple
+#: Accelerate's Sparse BLAS re-optimizes the matrix on construction and forbids
+#: in-place data-array updates, which is exactly the per-window
+#: ``coupling_mat.data`` rewrite this fold performs (see
+#: wiki/_meta/feedback_accelerate_sparse_blas). A viable Mac path likely needs a
+#: fresh BLAS-level SpMV per window (no persisted optimized handle) or a custom
+#: kernel — to be designed.
 batch_matrix_format = "csr"
 
 #: SOPHIA photo-meson database, repacked into PDG numbering by
