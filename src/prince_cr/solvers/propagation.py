@@ -1024,57 +1024,88 @@ class ETD2SolverCPU(UHECRPropagationSolverETD2):
         """
         from .etd2 import split_operator
 
-        # scale_fac=1.0 → raw rate matrix (no dldz factor); we apply dldz later.
-        M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
-        if not self.enable_photohad_losses:
-            # Zero matrix with full sparsity preserved.
-            M = M.copy()
-            M.data[:] = 0
-
-        # Sum the EM cascade Jacobian (γ/e± couplings, 1/cm) into M. The union
-        # sparsity pattern is z-stable, so the first-window index maps stay valid.
-        if self.em_int_rates is not None:
-            M = M + self.em_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
-            M.sort_indices()
-
-        # Tier 3 note: the γ/e± daughter-row regrid (cr→em) is NOT applied to M
-        # here — doing so perturbs the matmul sparsity pattern and breaks the
-        # z-stable in-place index-map fast path below. Instead R is applied at
-        # the vector level in apply_F (R·(coupling·x), associativity), where it
-        # only touches the off-diagonal coupling rows. See _make_apply_F_*.
-
+        ir = self.had_int_rates
         first_window = self._etd2_M_raw_off is None
-        if first_window:
-            d_M, M_off = split_operator(M)
-            self._etd2_M_raw_diag = d_M
-            self._etd2_M_raw_off = M_off
-            self._etd2_M_off_to_M_idx, self._etd2_M_diag_to_M_idx = (
-                self._build_M_off_index_map(M, M_off)
-            )
-            if self._backend == "mkl" and config.has_mkl:
-                # optimize=False so update_data() can refresh values
-                # across cache windows without re-running mkl_sparse_optimize.
-                self._etd2_M_raw_off_mkl = self._build_mkl_handle(M_off, optimize=False)
+
+        # Fast path (after the first window): fold the response kernel DIRECTLY
+        # into M_off.data + the diagonal via row-subset SpMVs — skipping the full
+        # coupling.data fold, the fp32→fp64 coupling cast, AND the per-window
+        # off/diag gather (see interaction_rates.build_split_fold / fold_split).
+        # Gated to the nuclei-only host case: no EM-cascade Jacobian to sum into
+        # M (em_int_rates), photo-hadronic losses on, CPU/MKL backend, kernels
+        # built. M_off's MKL handle is optimize=False, so it reads the buffer the
+        # fold just wrote — no gather, no update_data.
+        if (
+            not first_window
+            and self._backend in ("mkl", "scipy")
+            and self.enable_photohad_losses
+            and self.em_int_rates is None
+            and getattr(ir, "_split_fold_ready", False)
+        ):
+            ir.fold_split(z, self._etd2_M_raw_off.data, self._etd2_M_raw_diag_buf)
+            self._etd2_M_raw_diag = self._etd2_M_raw_diag_buf
         else:
-            # Same sparsity pattern: refresh the values in place. The MKL
-            # handle's optimised layout is invariant under value updates.
-            M_off = self._etd2_M_raw_off
-            if not getattr(M, "has_sorted_indices", False):
-                # The index map was built against sorted M.indices, so
-                # subsequent windows must keep that invariant.
+            # scale_fac=1.0 → raw rate matrix (no dldz factor); we apply dldz later.
+            M = ir.get_hadr_jacobian(z, 1.0, force_update=True)
+            if not self.enable_photohad_losses:
+                # Zero matrix with full sparsity preserved.
+                M = M.copy()
+                M.data[:] = 0
+
+            # Sum the EM cascade Jacobian (γ/e± couplings, 1/cm) into M. The union
+            # sparsity pattern is z-stable, so the first-window index maps stay valid.
+            if self.em_int_rates is not None:
+                M = M + self.em_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
                 M.sort_indices()
-            if M_off.data.size:
-                M_off.data[:] = M.data[self._etd2_M_off_to_M_idx]
-            diag_idx = self._etd2_M_diag_to_M_idx
-            d_M = np.zeros(M.shape[0], dtype=np.float64)
-            present = diag_idx >= 0
-            d_M[present] = M.data[diag_idx[present]]
-            self._etd2_M_raw_diag = d_M
-            if self._etd2_M_raw_off_mkl is not None:
-                # Push the same data into MKL's pinned buffer (no-op if
-                # the wrapper happens to share M_off.data — keeps
-                # semantics explicit either way).
-                self._etd2_M_raw_off_mkl.update_data(M_off.data)
+
+            # Tier 3 note: the γ/e± daughter-row regrid (cr→em) is NOT applied to M
+            # here — doing so perturbs the matmul sparsity pattern and breaks the
+            # z-stable in-place index-map fast path below. Instead R is applied at
+            # the vector level in apply_F (R·(coupling·x), associativity), where it
+            # only touches the off-diagonal coupling rows. See _make_apply_F_*.
+
+            if first_window:
+                d_M, M_off = split_operator(M)
+                self._etd2_M_raw_diag = d_M
+                self._etd2_M_raw_off = M_off
+                self._etd2_M_off_to_M_idx, self._etd2_M_diag_to_M_idx = (
+                    self._build_M_off_index_map(M, M_off)
+                )
+                if self._backend == "mkl" and config.has_mkl:
+                    # optimize=False so update_data() can refresh values
+                    # across cache windows without re-running mkl_sparse_optimize.
+                    self._etd2_M_raw_off_mkl = self._build_mkl_handle(M_off, optimize=False)
+                # Build the direct-fold sub-kernels so subsequent windows skip the
+                # full fold + gather (nuclei-only host case). One-time; reused
+                # across solves. Costs ~1× the response-kernel memory (off subset).
+                if (
+                    self._backend in ("mkl", "scipy")
+                    and self.enable_photohad_losses
+                    and self.em_int_rates is None
+                ):
+                    ir.build_split_fold(
+                        self._etd2_M_off_to_M_idx, self._etd2_M_diag_to_M_idx
+                    )
+                    self._etd2_M_raw_diag_buf = np.zeros(M.shape[0], dtype=np.float64)
+            else:
+                # Same sparsity pattern: refresh the values in place. The MKL
+                # handle's optimised layout is invariant under value updates.
+                M_off = self._etd2_M_raw_off
+                if not getattr(M, "has_sorted_indices", False):
+                    # The index map was built against sorted M.indices, so
+                    # subsequent windows must keep that invariant.
+                    M.sort_indices()
+                if M_off.data.size:
+                    M_off.data[:] = M.data[self._etd2_M_off_to_M_idx]
+                diag_idx = self._etd2_M_diag_to_M_idx
+                d_M = np.zeros(M.shape[0], dtype=np.float64)
+                present = diag_idx >= 0
+                d_M[present] = M.data[diag_idx[present]]
+                self._etd2_M_raw_diag = d_M
+                if self._etd2_M_raw_off_mkl is not None:
+                    # Push the same data into MKL's pinned buffer (skipped as a
+                    # self-copy when the wrapper shares M_off.data).
+                    self._etd2_M_raw_off_mkl.update_data(M_off.data)
 
         if self.enable_pairprod_losses:
             self._etd2_kappa_pair_cached = self.pair_loss_rates_grid.loss_vector(z)
@@ -1692,6 +1723,9 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
             "_etd2_graph_exec",
             "_etd2_graph_stream",
             "_etd2_graph_state_buf",
+            "_etd2_off_to_M_gpu",
+            "_etd2_diag_rows_gpu",
+            "_etd2_diag_to_M_gpu",
         ):
             setattr(self, attr, None)
         self._etd2_graph_needs_capture = True
@@ -1699,8 +1733,56 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
     # ------------------------------------------------------------------
     # Cache-window refresh + per-step operator
     # ------------------------------------------------------------------
+    @staticmethod
+    def _build_off_structure_xp(M, xp, sparse_mod):
+        """Build the persistent off-diagonal ``M_off`` and the fold→split gather
+        indices directly from ``M``'s sparsity — NO ``split_operator`` /
+        ``eliminate_zeros``.
+
+        ``M_off`` is the NONZERO off-diagonal of ``M`` — identical structure and
+        order to scipy's ``split_operator`` (``setdiag(0)`` + ``eliminate_zeros``),
+        so the per-step cuSPARSE SpMV reduces the same terms in the same order
+        (bit-tight vs the host backends). Dropping the ~15 M structural zeros is
+        z-SAFE: ``M.data = batch_matrix @ photon(z)`` with photon > 0 and the
+        response nonnegative, so ``M.data[k] == 0`` iff ``batch_matrix`` row k is
+        identically zero — a fixed, z-independent property. So the gather
+        ``M_off.data = M.data[off_to_M]`` never misses a source at any z.
+
+        Returns ``(M_off, off_to_M, diag_rows, diag_to_M)``: gather ``M.data``
+        indices for the off-diagonal (``off_to_M``) and the diagonal
+        (``diag_to_M``, at rows ``diag_rows``).
+        """
+        n = M.shape[0]
+        nnz = int(M.nnz)
+        rows = (
+            xp.searchsorted(M.indptr, xp.arange(nnz, dtype=xp.int64), side="right")
+            - 1
+        )
+        diag_mask = M.indices == rows
+        # nonzero off-diagonal (== scipy's eliminate_zeros'd M_off); z-safe drop.
+        off_to_M = xp.flatnonzero((~diag_mask) & (M.data != 0))
+        diag_to_M = xp.flatnonzero(diag_mask)          # M.data idx, diagonal
+        diag_rows = rows[diag_mask]
+        off_per_row = xp.bincount(rows[off_to_M], minlength=n)
+        off_indptr = xp.concatenate(
+            [xp.zeros(1, dtype=xp.int64), xp.cumsum(off_per_row)]
+        ).astype(M.indptr.dtype)
+        M_off = sparse_mod.csr_matrix(
+            (M.data[off_to_M].copy(), M.indices[off_to_M].copy(), off_indptr),
+            shape=M.shape,
+        )
+        return M_off, off_to_M, diag_rows, diag_to_M
+
     def _refresh_z_caches(self, z):
-        """GPU variant: split_operator returns cupy CSR arrays directly."""
+        """GPU variant: build the off-diagonal structure once, then per-window
+        GATHER into the persistent M_off.data (not a per-window
+        ``split_operator`` rebuild — that ``M.copy``/``setdiag``/
+        ``eliminate_zeros`` on the 45 M-nnz device CSR was ~98% of the m=245
+        solve). M_off stays a persistent object so its device pointer is stable;
+        the fold already wrote ``M.data`` on-device, so
+        ``M_off.data = M.data[off_to_M]`` is a cheap GPU gather."""
+        import cupy as cp
+        import cupyx.scipy.sparse as cpsp
         from .etd2 import split_operator
 
         M = self.had_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
@@ -1712,23 +1794,58 @@ class ETD2SolverCUPY(UHECRPropagationSolverETD2):
         # the EM rate is built host-side (scipy); convert to device CSR before
         # the add. (CPU/scipy path is the validated one for the EM cascade.)
         if self.em_int_rates is not None:
-            import cupyx.scipy.sparse as _cpsp
-
-            M = M + _cpsp.csr_matrix(
+            M = M + cpsp.csr_matrix(
                 self.em_int_rates.get_hadr_jacobian(z, 1.0, force_update=True)
             )
 
-        # Re-splitting each cache window is a few ms on the GPU at
-        # production grid; we skip a host-style index-map gather (the
-        # data already lives on-device, and ``M`` is rebuilt fresh by
-        # the cupy ``_update_rates_gpu`` path each window).
-        d_M, M_off = split_operator(M)
-        self._etd2_M_raw_diag = d_M
-        self._etd2_M_raw_off = M_off
+        first_window = self._etd2_M_raw_off is None
+        gather_ok = getattr(self, "_etd2_off_to_M_gpu", None) is not None
+        # Escape hatch: PRINCE_CUPY_NO_GATHER=1 forces the legacy per-window
+        # split_operator path. The gather is bit-identical to split as an
+        # OPERATOR (M_off@x diff ~2e-15); the only end-to-end difference is fp
+        # reduction ORDER (sorted vs unsorted M_off columns), which the extreme
+        # ill-conditioning of a heavy (e.g. A=245) cascade can amplify to ~1%
+        # (0.4% L2) on trace species / an overall normalization — ⟨lnA⟩ and the
+        # flux-bearing species are unaffected (< a few %). It is a numerical
+        # artifact, not a physics change. For a bit-tight reference/validation
+        # solve, set this flag AND/OR config.xs_dtype="float64" (fp64 fold —
+        # ~no wall-time cost on the transport-bound nuclei kernel).
+        import os as _os
+        nuclei_only = (
+            self.enable_photohad_losses
+            and self.em_int_rates is None
+            and not _os.environ.get("PRINCE_CUPY_NO_GATHER")
+        )
+        if not first_window and nuclei_only and gather_ok:
+            # Fast path: GATHER into the persistent M_off.data + diagonal.
+            M_off = self._etd2_M_raw_off
+            if M_off.data.size:
+                M_off.data[:] = M.data[self._etd2_off_to_M_gpu]
+            d = self._etd2_M_raw_diag
+            d.fill(0)
+            if self._etd2_diag_rows_gpu.size:
+                d[self._etd2_diag_rows_gpu] = M.data[self._etd2_diag_to_M_gpu]
+        elif first_window and nuclei_only:
+            # Build persistent off-diagonal M_off + gather maps directly from M.
+            M_off, o2m, drows, d2m = self._build_off_structure_xp(M, cp, cpsp)
+            self._etd2_M_raw_off = M_off
+            d = cp.zeros(M.shape[0], dtype=M.data.dtype)
+            if drows.size:
+                d[drows] = M.data[d2m]
+            self._etd2_M_raw_diag = d
+            self._etd2_off_to_M_gpu = o2m
+            self._etd2_diag_rows_gpu = drows
+            self._etd2_diag_to_M_gpu = d2m
+        else:
+            # Fallback (EM cascade / photo-had off): original per-window split.
+            d_M, M_off = split_operator(M)
+            self._etd2_M_raw_diag = d_M
+            self._etd2_M_raw_off = M_off
         # The apply_F closure dereferences M_off / D_off through a
         # mutable container so we can swap pointers here without
         # rebuilding it. Triggers re-capture of the CUDA graph on the
-        # next per-step call.
+        # next per-step call. (M_off is persistent on the gather path, so
+        # this re-binds the same object — the graph re-capture is cheap.)
         self._rebind_apply_F()
 
         if self.enable_pairprod_losses:
@@ -2466,12 +2583,18 @@ class _MultiRHSETD2SolverCPU(MultiRHSPropagationSolverETD2, ETD2SolverCPU):
         self._etd2_kappa_buf = np.zeros_like(
             self.adia_loss_rates_grid.energy_vector
         )
-        # (n, K) state-shape scratch.
+        # (n, K) state-shape scratch (C-contiguous → row-major SpMM).
         self._etd2_KX_buf = np.empty(
             (self.dim_states, self._K), dtype=np.float64
         )
-        # MKL Sparse SpMM not wrapped; force scipy SpMM regardless of backend.
-        self._etd2_apply_F = self._make_apply_F_scipy()
+        # Route to MKL Sparse SpMM when the MKL backend is active and the
+        # M_off handle has been built (first _refresh_z_caches, which runs
+        # before this in _operator_at). D_off's handle comes from
+        # _ensure_D_split (called in solve()).
+        if self._backend == "mkl" and self._etd2_M_raw_off_mkl is not None:
+            self._etd2_apply_F = self._make_apply_F_mkl()
+        else:
+            self._etd2_apply_F = self._make_apply_F_scipy()
 
     def _make_apply_F_scipy(self):
         M_off = self._etd2_M_raw_off
@@ -2495,8 +2618,69 @@ class _MultiRHSETD2SolverCPU(MultiRHSPropagationSolverETD2, ETD2SolverCPU):
         return apply_F
 
     def _make_apply_F_mkl(self):
-        # MKL Sparse SpMM not wrapped; fall back to scipy SpMM.
-        return self._make_apply_F_scipy()
+        """Multi-RHS ``apply_F(X, OUT)`` via MKL Sparse SpMM (``mkl_sparse_?_mm``).
+
+        Mirrors :meth:`_make_apply_F_scipy` but replaces the scipy CSR ``@``
+        SpMMs on ``M_off`` / ``D_off`` with MKL SpMM into the pinned (n, K)
+        ``OUT`` / ``KX_buf``. ``X``, ``OUT``, ``KX_buf`` are C-contiguous
+        (n, K) fp64 → ROW_MAJOR layout, ``ldb = ldc = columns = K``. Data
+        pointers are memoised by ``id`` (the integrator's buffers live for
+        the whole solve, mirroring the single-RHS gemv path). ``M_off`` is
+        refreshed in place across windows (its handle is ``optimize=False``);
+        the closure is built once and keeps SpMM'ing the refreshed data.
+        """
+        from ctypes import POINTER, c_double, c_int
+
+        mkl_M = self._etd2_M_raw_off_mkl
+        mkl_D = self._etd2_D_off_mkl
+        K = self._K
+        alpha_box = c_double(1.0)
+        beta_zero = c_double(0.0)
+        beta_one = c_double(1.0)
+        cols_box = c_int(K)
+        ld_box = c_int(K)
+        layout_box = c_int(101)  # SPARSE_LAYOUT_ROW_MAJOR (C-contiguous (n, K))
+        M_op = mkl_M.spmm_preboxed
+        D_op = mkl_D.spmm_preboxed if mkl_D is not None else None
+        D_off_scipy = self._etd2_D_off  # fallback path if D handle is absent
+        KX_buf = self._etd2_KX_buf
+        params = self._etd2_apply_F_params
+
+        ptr_cache = {}
+
+        def get_p(arr):
+            key = id(arr)
+            p = ptr_cache.get(key)
+            if p is None:
+                if not arr.flags["C_CONTIGUOUS"]:
+                    raise ValueError(
+                        "multi-RHS MKL SpMM needs C-contiguous (n, K) buffers"
+                    )
+                p = arr.ctypes.data_as(POINTER(c_double))
+                ptr_cache[key] = p
+            return p
+
+        kx_p = get_p(KX_buf)
+
+        def apply_F(X, OUT):
+            x_p = get_p(X)
+            out_p = get_p(OUT)
+            # OUT = M_off · X
+            M_op(alpha_box, x_p, cols_box, ld_box, beta_zero, out_p, ld_box, layout_box)
+            kappa = params["kappa"]
+            if kappa is not None:
+                np.multiply(kappa[:, None], X, out=KX_buf)
+                if D_op is not None:
+                    # OUT += D_off · (κ ⊙ X)
+                    D_op(alpha_box, kx_p, cols_box, ld_box, beta_one, out_p, ld_box, layout_box)
+                else:
+                    np.add(OUT, D_off_scipy.dot(KX_buf), out=OUT)
+            np.multiply(OUT, params["dldz"], out=OUT)
+            B = params["b"]
+            if B is not None:
+                np.add(OUT, B, out=OUT)
+
+        return apply_F
 
 
 class _MultiRHSETD2SolverCUPY(MultiRHSPropagationSolverETD2, ETD2SolverCUPY):

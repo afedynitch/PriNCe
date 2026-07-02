@@ -747,6 +747,106 @@ class PhotoNuclearInteractionRate(object):
             )
 
     # ------------------------------------------------------------------
+    # MKL Sparse BLAS fold (host, CSR rate kernel)
+    # ------------------------------------------------------------------
+    def _ensure_batch_matrix_mkl(self):
+        """Lazily build an optimized MKL Sparse handle for the CSR fold.
+
+        The response kernel ``_batch_matrix`` (batch_dim × dph) is CONSTANT
+        for the whole solve — only the photon vector changes — so the
+        ``mkl_sparse_optimize`` path applies (unlike ``M_off``, which is
+        refreshed in place and must stay un-optimized). Built at most once
+        per run; ctypes handle, so it is NOT pickled — rebuilt on demand
+        after a cache load. Threads are governed by the caller's
+        ``config.set_thread_count`` / ``set_mkl_threads``.
+        """
+        if getattr(self, "_batch_matrix_mkl", None) is not None:
+            return
+        from ctypes import POINTER, c_double, c_float
+        from .mkl_sparse import MklSparseMatrix
+
+        A = self._batch_matrix                       # fp32 (default) CSR
+        self._batch_matrix_mkl = MklSparseMatrix(A, optimize=True)
+        n_rows, n_cols = A.shape
+        fl = c_float if A.dtype == np.float32 else c_double
+        self._fold_x_mkl = np.zeros(n_cols, dtype=A.dtype)   # photon (dph,)
+        self._fold_y_mkl = np.zeros(n_rows, dtype=A.dtype)   # batch_vec (batch_dim,)
+        self._fold_x_p = self._fold_x_mkl.ctypes.data_as(POINTER(fl))
+        self._fold_y_p = self._fold_y_mkl.ctypes.data_as(POINTER(fl))
+
+    # ------------------------------------------------------------------
+    # Direct fold into the ETD2 split buffers (host, CSR rate kernel)
+    # ------------------------------------------------------------------
+    def build_split_fold(self, off_to_M, diag_to_M):
+        """Build response sub-kernels that fold DIRECTLY into ``M_off.data`` and
+        the diagonal, so the ETD2 refresh skips the full coupling.data fold + the
+        per-window off/diag gather.
+
+        ``M.data[k] == (_batch_matrix @ photon)[k]`` (the fold output, in coupling
+        order — the sortidx applied in ``_init_coupling_mat``). ``off_to_M[j]`` is
+        the ``M.data`` index feeding ``M_off.data[j]``, so
+        ``M_off.data = _batch_matrix[off_to_M] @ photon`` — a row-subset fold,
+        bit-identical to fold-then-gather. Same for the diagonal via ``diag_to_M``.
+
+        One-time; caches the row-subset kernels on this instance (fixed for the
+        run) and reuses them across solves. Costs ~1× the ``_batch_matrix`` memory
+        for the off-diagonal subset.
+        """
+        bm = self._batch_matrix
+        # Backend-independent row-subset kernels: build once.
+        if getattr(self, "_sf_off_kernel", None) is None:
+            self._sf_off_kernel = bm[np.asarray(off_to_M, dtype=np.int64)]
+            present = np.asarray(diag_to_M) >= 0
+            self._sf_diag_present = present
+            self._sf_diag_kernel = bm[np.asarray(diag_to_M, dtype=np.int64)[present]]
+            self._sf_off_mkl = None
+        # MKL fold handle: (re)build iff the MKL backend is active and it is
+        # absent — so flipping backends on one PriNCeRun rebuilds it rather than
+        # silently reusing a scipy-only build (or vice versa).
+        want_mkl = (
+            self.prince_run.backend.linear_algebra_backend.lower() == "mkl"
+            and config.has_mkl and config.mkl is not None
+            and self._sf_off_kernel.nnz
+        )
+        if want_mkl and getattr(self, "_sf_off_mkl", None) is None:
+            from ctypes import POINTER, c_double, c_float
+            from .mkl_sparse import MklSparseMatrix
+            self._sf_off_mkl = MklSparseMatrix(self._sf_off_kernel, optimize=True)
+            dph = bm.shape[1]
+            noff = self._sf_off_kernel.shape[0]
+            fl = c_float if bm.dtype == np.float32 else c_double
+            self._sf_ph = np.zeros(dph, dtype=bm.dtype)
+            self._sf_off_y = np.zeros(noff, dtype=bm.dtype)
+            self._sf_ph_p = self._sf_ph.ctypes.data_as(POINTER(fl))
+            self._sf_off_y_p = self._sf_off_y.ctypes.data_as(POINTER(fl))
+        self._split_fold_ready = True
+
+    def fold_split(self, z, moff_data_out, dmg_out):
+        """Fold the response kernel directly into ``moff_data_out`` (= M_off.data,
+        fp64) and ``dmg_out`` (= diagonal vector, fp64) at redshift ``z``.
+
+        Replaces the ETD2 refresh's [full fold → coupling.data cast → off/diag
+        gather] with two row-subset SpMVs (off + diag) written straight into the
+        split buffers. scale_fac is 1.0 (the refresh's convention; dldz is applied
+        later per step). Bit-identical to the gather path modulo SpMV summation
+        order (0 on scipy, ε on MKL)."""
+        photon = self.photon_vector(z)
+        ph = np.asarray(photon, dtype=self._batch_matrix.dtype)
+        use_mkl = (
+            getattr(self, "_sf_off_mkl", None) is not None
+            and self.prince_run.backend.linear_algebra_backend.lower() == "mkl"
+        )
+        if use_mkl:
+            np.copyto(self._sf_ph, ph)
+            self._sf_off_mkl.gemv_ctargs(1.0, self._sf_ph_p, 0.0, self._sf_off_y_p)
+            np.copyto(moff_data_out, self._sf_off_y)   # fp32 -> fp64
+        elif moff_data_out.size:
+            np.copyto(moff_data_out, self._sf_off_kernel.dot(ph))
+        dmg_out.fill(0.0)
+        if self._sf_diag_kernel.shape[0]:
+            dmg_out[self._sf_diag_present] = self._sf_diag_kernel.dot(ph)
+
+    # ------------------------------------------------------------------
     # Full-GPU cupy backend (GPU dense matvec + GPU SpMV)
     # ------------------------------------------------------------------
     def _ensure_coupling_mat_gpu(self):
@@ -892,8 +992,26 @@ class PhotoNuclearInteractionRate(object):
                 # CSR path: sparse SpMV against the kernel (fp32). The result
                 # is upcast into the fp64 coupling data by _update_coupling_mat
                 # (it reads _batch_vec_xs when set). Flat in dph — the point.
-                ph = np.asarray(photon, dtype=self._batch_matrix.dtype)
-                self._batch_vec_xs = self._batch_matrix.dot(ph)
+                backend = self.prince_run.backend
+                if (
+                    backend.linear_algebra_backend.lower() == "mkl"
+                    and config.has_mkl
+                    and config.mkl is not None
+                ):
+                    # MKL Sparse BLAS fold: the response kernel is constant
+                    # for the whole solve, so an optimized handle (built once)
+                    # runs a multi-threaded SpMV ~13-36x faster than scipy's
+                    # single-thread CSR loop. Writes into the pinned fp32
+                    # output buffer, which _update_coupling_mat upcasts.
+                    self._ensure_batch_matrix_mkl()
+                    np.copyto(self._fold_x_mkl, photon)   # fp64 -> xs dtype
+                    self._batch_matrix_mkl.gemv_ctargs(
+                        1.0, self._fold_x_p, 0.0, self._fold_y_p
+                    )
+                    self._batch_vec_xs = self._fold_y_mkl
+                else:
+                    ph = np.asarray(photon, dtype=self._batch_matrix.dtype)
+                    self._batch_vec_xs = self._batch_matrix.dot(ph)
                 self._ratemat_zcache = None if pfield is not None else z
                 return True
             backend = self.prince_run.backend
